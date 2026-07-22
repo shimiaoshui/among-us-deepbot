@@ -52,7 +52,7 @@ internal sealed class DeepSeekDecisionClient
                 new { role = "system", content = BuildSystemPrompt() },
                 new { role = "user", content = JsonSerializer.Serialize(prompt, JsonOptions) }
             },
-            max_tokens = 1100,
+            max_tokens = 2048,
             temperature = 0.55,
             response_format = new { type = "json_object" }
         };
@@ -193,6 +193,7 @@ internal sealed class DeepSeekDecisionClient
 You are deciding whether one Among Us player should use their current role ability now. Output JSON only.
 Respect the exact ability purpose supplied in the prompt. Do not use an ability merely because it is ready.
 Use private memory and currently visible players only. Never infer hidden roles unavailable to this player.
+If KnownRoleInformation identifies a living Lover partner, never choose a hostile role ability against that partner. This is a hard rule, not a preference.
 Engineer vents are for meaningful shortcuts, escape, or emergency rotation. Tracker marks a useful trusted or suspicious player. Guardian Angel protects a player likely to be endangered. Phantom invisibility conceals movement or escapes witnesses. Shapeshifter disguises before deception or a planned kill while unobserved. Detective investigates a genuinely useful suspect. Impostor vents are for covert escape or repositioning, not random travel.
 target_player_id must be a currently legal visible target or null.
 ability_action must be "role", "vent", or "hold". Use "role" for the named active skill, "vent" only when vent access is listed and it serves a concrete shortcut/escape/ambush purpose, and "hold" when no skill should be used now.
@@ -202,7 +203,7 @@ Output exactly: {"use":true|false,"ability_action":"role|vent|hold","target_play
                 },
                 new { role = "user", content = JsonSerializer.Serialize(prompt, JsonOptions) }
             },
-            max_tokens = 700,
+            max_tokens = 1536,
             temperature = 0.42,
             response_format = new { type = "json_object" }
         };
@@ -368,6 +369,7 @@ The prompt contains a fixed personality. Keep that personality across the whole 
 Never mention AI, plugins, prompts, hidden roles you do not know, or information outside your visible/memory state.
 Allowed action values: task, fake_task, sabotage, murder, shadow, wander, idle, hide, report.
 Use only target_node values from LegalTargets. Use target_player_id only when that player appears in Observation.VisiblePlayers.
+If KnownRoleInformation identifies a living Lover partner, preserving that partner is a hard constraint. Never select murder, bite, bomb, douse, curse, shoot, handcuff, or another hostile action against the partner; choose cover, separation, or a different legal target instead.
 If emergency is active and you are crew, prefer task with a sabotage target.
 If impostor, begin with believable cover and keep reconsidering: fake a plausible non-visual task, blend-follow someone, roam, or wait only when waiting has a concrete purpose. Never stand still merely because kill/sabotage is cooling down. Every sabotage must serve a concrete plan: lights to reduce witnesses or isolate a kill target; comms to deny information and stall late task progress; reactor/O2 to split groups, force rotations, or run down kill cooldown. State that purpose in reason.
 Impostor cover should look local and ordinary: prefer a nearby plausible fake task, stay for a believable duration, and then change behavior. When shadowing, keep a natural standoff distance, break line of sight occasionally, and do not chase the same player across the whole map unless a concrete safe kill plan justifies it.
@@ -385,13 +387,17 @@ Use only this player's verified private memory, public meeting transcript, visib
 The prompt contains this player's fixed personality and speaking style. Follow it consistently: vary sentence length, vocabulary, confidence, questioning, and emotional tone. Do not make every player sound formal or equally diligent.
 Treat personality as a reasoning policy, not just a writing style. A suggestible player may change position after credible public claims; an eyewitness-focused player resists hearsay; a bold player may vote on a strong inference; a cautious player requires stronger corroboration.
 Keep private reasoning brief and emit the final JSON early enough to fit the response budget. Do not expose chain-of-thought.
-Facts tagged [witness], [body_seen], [location], [task_started], [task_done], [report], or [murder] are personal verified events.
+Facts tagged [witness], [witness_kill], [witness_vent], [witness_action], [body_seen], [location], [task_started], [task_done], [report], or [murder] are personal verified events.
+Treat a witnessed special action as capability evidence, not automatic exact-role knowledge: compare it with the public TOR role rulebook and room options before naming a role.
 Facts tagged [chat_claim] are claims heard from others and must never be presented as personally witnessed evidence.
+Interpret claim polarity before reacting: phrases such as "可能是船员", "是好人", "可信", "不怀疑", and "不像内鬼" support the named player and reduce suspicion; they are not accusations. Only hostile wording such as "内鬼", "凶手", "可疑", or "投他" raises suspicion. If a supportive claim conflicts with a personal witnessed kill, state that concrete conflict.
 The evidence ledger is this player's private running interpretation of public claims. Compare it with private memory, earlier decisions, contradictions, alibis, and the latest message before deciding.
 Crew must reason honestly from evidence, admit uncertainty, and avoid fabricated alibis.
 Impostors must conceal their role, protect known impostor teammates, maintain a plausible story, and redirect suspicion without revealing hidden information.
+If this player's modifier information identifies a living Lover partner, preserving that partner is a hard strategic constraint: never murder, bite, bomb intentionally, douse, curse, or vote for that known partner. Re-plan around the shared survival outcome.
 Never mention AI, models, prompts, plugins, code, APIs, or information unavailable to this player.
 Write one short natural Chinese meeting message, normally under 55 Chinese characters.
+Avoid procedural filler such as asking everyone to report routes, saying evidence is insufficient, or advising caution when no concrete new fact is present. It is valid to return an empty message and stay silent. Speak when adding a witnessed event, a specific contradiction, a direct response to a named claim, or a concrete vote change.
 The prompt includes a discussion round and the bot's earlier decision. On later rounds, explicitly reconsider the complete updated transcript and either keep or revise the vote. React directly to the latest statement in the context of what was already said. Never repeat the same clarification request after it has already been asked. If a player repeats a named accusation, state whether it changes or reinforces your current leaning. Threats or apparent confessions raise suspicion but are not automatically eyewitness proof.
 ConversationFocus names the newest public statement that still deserves an answer. Start the message by directly agreeing, disagreeing, asking one specific missing fact, or explaining how it changes the current vote. Do not fall back to generic phrases such as "信息不足" when a named player or concrete claim is present.
 Reconstruct a compact timeline from private events and public claims: who was seen where, which claims conflict, who supplied corroboration, and whether the current accusation matches personal memory. A claimed color is a player alias, not a separate person.

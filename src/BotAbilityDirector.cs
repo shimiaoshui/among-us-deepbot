@@ -95,7 +95,13 @@ internal sealed class BotAbilityDirector
 
     private void RequestAbilityDecision(PlayerControl bot, AbilityState state)
     {
-        var hasTorRole = TorRoleAdapter.TryGetAbilityRole(bot, out var torRole);
+        var availableTorRoles = TorRoleAdapter.GetAbilityRoles(bot);
+        var hasTorRole = TrySelectTorAbilityRole(bot, state, out var torRole);
+        if (availableTorRoles.Count > 0 && !hasTorRole)
+        {
+            state.NextAbilityAt = Time.time + 1f;
+            return;
+        }
         var torVentReady = hasTorRole && TorRoleAdapter.CanUseVents(bot, torRole);
         if ((hasTorRole && !TorRoleAdapter.IsAbilityReady(bot, torRole) && !torVentReady) ||
             (!hasTorRole && IsRoleCoolingDown(bot.Data.Role)))
@@ -107,7 +113,11 @@ internal sealed class BotAbilityDirector
         state.DecisionInFlight = true;
         state.RequestedRole = bot.Data.RoleType;
         state.RequestedTorRole = hasTorRole ? torRole.Name : null;
-        var prompt = BuildAbilityPrompt(bot);
+        if (hasTorRole)
+        {
+            state.AbilityRoleCursor++;
+        }
+        var prompt = BuildAbilityPrompt(bot, hasTorRole ? torRole : null);
         _log.LogInfo(
             $"DeepBot ability brain queued: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
             $"role={prompt.Role}, purpose={prompt.AbilityPurpose}.");
@@ -137,7 +147,9 @@ internal sealed class BotAbilityDirector
     private void ApplyAbilityDecision(PlayerControl bot, AbilityState state)
     {
         state.DecisionCompleted = false;
-        var hasTorRole = TorRoleAdapter.TryGetAbilityRole(bot, out var torRole);
+        var torRole = default(TorRoleInfo);
+        var hasTorRole = !string.IsNullOrWhiteSpace(state.RequestedTorRole) &&
+                         TorRoleAdapter.TryGetAbilityRole(bot, state.RequestedTorRole!, out torRole);
         var currentTorRole = hasTorRole ? torRole.Name : null;
         if (!string.Equals(state.RequestedTorRole, currentTorRole, StringComparison.Ordinal))
         {
@@ -165,7 +177,7 @@ internal sealed class BotAbilityDirector
 
         state.RequestedTorRole = null;
         state.RequestedRole = null;
-        var decision = state.PendingDecision ?? BuildStrategicFallback(bot);
+        var decision = state.PendingDecision ?? BuildStrategicFallback(bot, hasTorRole ? torRole : null);
         state.PendingDecision = null;
         var torVentReady = hasTorRole && TorRoleAdapter.CanUseVents(bot, torRole);
         if ((hasTorRole && !TorRoleAdapter.IsAbilityReady(bot, torRole) && !torVentReady) ||
@@ -189,6 +201,10 @@ internal sealed class BotAbilityDirector
             _log.LogInfo(
                 $"DeepBot ability held for strategy: bot={bot.Data?.PlayerName}, role={(hasTorRole ? torRole.Name : bot.Data?.RoleType.ToString())}, " +
                 $"confidence={decision.Confidence:0.00}, urgentBodyReview={urgentBodyReview}, reason={decision.Reason ?? "no useful purpose"}.");
+            if (hasTorRole && torRole.Name == "Arsonist" && !TorRoleAdapter.IsArsonistReadyToIgnite(bot))
+            {
+                _actions.TryRouteToRoleSearch(bot, torRole.Name);
+            }
             return;
         }
 
@@ -225,6 +241,20 @@ internal sealed class BotAbilityDirector
 
         if (hasTorRole)
         {
+            if (torRole.Name is "Sheriff" or "Deputy")
+            {
+                var requiredConfidence = torRole.Name == "Sheriff" ? 0.78f : 0.62f;
+                var evidenceTarget = FindEvidenceBackedSuspect(bot, requiredConfidence);
+                if (evidenceTarget is null || !targetId.HasValue || evidenceTarget.PlayerId != targetId.Value)
+                {
+                    state.NextAbilityAt = Time.time + 4f;
+                    _log.LogInfo(
+                        $"DeepBot evidence-gated ability rejected: bot={bot.Data?.PlayerName}, role={torRole.Name}, " +
+                        $"requestedTarget={targetId?.ToString() ?? "none"}, reason=no matching high-confidence meeting suspect.");
+                    return;
+                }
+            }
+
             if (torRole.Name == "Vulture" &&
                 !TorRoleAdapter.HasNearbyUsableBody(bot) &&
                 TorRoleAdapter.FindVisibleUsableBody(bot) is { } visibleBody)
@@ -244,9 +274,54 @@ internal sealed class BotAbilityDirector
                 return;
             }
 
+            if (torRole.Name == "Medium" &&
+                TorRoleAdapter.TryGetNearestMediumSoulPosition(bot, out var soulPosition) &&
+                Vector2.Distance(bot.GetTruePosition(), soulPosition) > 1.15f)
+            {
+                var routed = _actions.TryRouteToRoleAbility(
+                    bot,
+                    soulPosition,
+                    "ABILITY_MEDIUM_SOUL",
+                    0.95f);
+                state.NextAbilityAt = Time.time + (routed ? 1f : 4f);
+                _memory.RecordAction(bot, "ability_route", $"Medium routed to a personally usable soul; routed={routed}");
+                return;
+            }
+
+            if (targetId.HasValue && FindPlayer(targetId.Value) is { } roleTarget && roleTarget && roleTarget.Data is not null &&
+                !roleTarget.Data.IsDead && !roleTarget.Data.Disconnected)
+            {
+                var useRange = TorRoleAdapter.GetAbilityUseRange(torRole.Name);
+                var distance = Vector2.Distance(bot.GetTruePosition(), roleTarget.GetTruePosition());
+                var blocked = PhysicsHelpers.AnythingBetween(
+                    bot.GetTruePosition(),
+                    roleTarget.GetTruePosition(),
+                    Constants.ShipAndObjectsMask,
+                    false);
+                if (distance > useRange * 0.85f || blocked)
+                {
+                    var routed = _actions.TryRouteToRoleAbility(
+                        bot,
+                        roleTarget.GetTruePosition(),
+                        $"ABILITY_{torRole.Name.ToUpperInvariant()}_{roleTarget.PlayerId}",
+                        Mathf.Clamp(useRange * 0.72f, 0.8f, 1.5f),
+                        roleTarget.PlayerId);
+                    state.NextAbilityAt = Time.time + (routed ? 1f : 3f);
+                    _memory.RecordAction(
+                        bot,
+                        "ability_route",
+                        $"role={torRole.Name}; target={roleTarget.Data.PlayerName}({roleTarget.PlayerId}); distance={distance:0.0}; routed={routed}");
+                    _log.LogInfo(
+                        $"DeepBot target ability route: bot={bot.Data?.PlayerName}, role={torRole.Name}, " +
+                        $"target={roleTarget.Data.PlayerName}({roleTarget.PlayerId}), distance={distance:0.0}, routed={routed}.");
+                    return;
+                }
+            }
+
             if (TorRoleAdapter.TryUseAbility(bot, torRole, targetId, out var outcome))
             {
-                state.NextAbilityAt = Time.time + UnityEngine.Random.Range(24f, 42f);
+                TorRoleAdapter.RegisterConfiguredCooldown(bot, torRole);
+                state.NextAbilityAt = Time.time + 0.75f;
                 _memory.RecordAction(bot, "ability", $"TOR {torRole.Name}: {outcome}");
                 _log.LogInfo(
                     $"DeepBot TOR ability used: bot={bot.Data?.PlayerName}({bot.PlayerId}), role={torRole.Name}, outcome={outcome}.");
@@ -489,9 +564,10 @@ internal sealed class BotAbilityDirector
         }
     }
 
-    private BotAbilityPrompt BuildAbilityPrompt(PlayerControl bot)
+    private BotAbilityPrompt BuildAbilityPrompt(PlayerControl bot, TorRoleInfo? selectedTorRole = null)
     {
-        var hasTorRole = TorRoleAdapter.TryGetAbilityRole(bot, out var torRole);
+        var hasTorRole = selectedTorRole.HasValue;
+        var torRole = selectedTorRole.GetValueOrDefault();
         var position = bot.GetTruePosition();
         var visible = EnumerateLivingPlayers()
             .Where(player => player.PlayerId != bot.PlayerId)
@@ -561,9 +637,10 @@ internal sealed class BotAbilityDirector
         };
     }
 
-    private BotAbilityDecision BuildStrategicFallback(PlayerControl bot)
+    private BotAbilityDecision BuildStrategicFallback(PlayerControl bot, TorRoleInfo? selectedTorRole = null)
     {
-        var hasTorRole = TorRoleAdapter.TryGetAbilityRole(bot, out var torRole);
+        var hasTorRole = selectedTorRole.HasValue;
+        var torRole = selectedTorRole.GetValueOrDefault();
         var target = FindAbilityTarget(bot, hasTorRole ? torRole.IsImpostorTeam : bot.Data.Role.IsImpostor);
         var visibleCrew = EnumerateLivingPlayers()
             .Where(player =>
@@ -574,6 +651,9 @@ internal sealed class BotAbilityDirector
         if (hasTorRole)
         {
             var torTarget = TorRoleAdapter.FindPreferredAbilityTarget(bot, torRole) ?? target;
+            var sheriffTarget = FindEvidenceBackedSuspect(bot, 0.78f);
+            var deputyTarget = FindEvidenceBackedSuspect(bot, 0.62f);
+            var mayorTarget = FindEvidenceBackedSuspect(bot, 0.86f);
             return torRole.Name switch
             {
                 "Medic" when torTarget is not null =>
@@ -582,10 +662,18 @@ internal sealed class BotAbilityDirector
                     new BotAbilityDecision(true, null, "place a portal in a separated useful room to improve later rotations", 0.62f),
                 "Engineer" when HasActiveEmergency(bot) =>
                     new BotAbilityDecision(true, null, "spend one limited repair charge because a dangerous sabotage is active", 0.84f),
+                "Mayor" when mayorTarget is not null =>
+                    new BotAbilityDecision(true, null, "call the limited remote meeting because a personally retained high-confidence suspect is still alive", 0.88f),
+                "Mayor" =>
+                    new BotAbilityDecision(false, null, "preserve the limited remote meeting until personal evidence crosses a high threshold", 0.78f),
+                "Sheriff" when sheriffTarget is not null =>
+                    new BotAbilityDecision(true, sheriffTarget.PlayerId, "shoot the high-confidence suspect retained from the latest meeting conclusion", 0.82f),
                 "Sheriff" =>
                     new BotAbilityDecision(false, null, "do not shoot without a high-confidence meeting or witnessed-behavior case", 0.72f),
-                "Deputy" when torTarget is not null =>
-                    new BotAbilityDecision(true, torTarget.PlayerId, "temporarily handcuff a nearby player whose behavior creates meaningful danger", 0.61f),
+                "Deputy" when deputyTarget is not null =>
+                    new BotAbilityDecision(true, deputyTarget.PlayerId, "handcuff the evidence-backed suspect retained from the latest meeting", 0.70f),
+                "Deputy" =>
+                    new BotAbilityDecision(false, null, "do not handcuff a random nearby player without a meeting-backed suspicion", 0.64f),
                 "Tracker" when torTarget is not null =>
                     new BotAbilityDecision(true, torTarget.PlayerId, "track a nearby player whose route can provide evidence", 0.60f),
                 "Morphling" when torTarget is not null && visibleCrew.Length <= 1 =>
@@ -618,6 +706,12 @@ internal sealed class BotAbilityDirector
                     new BotAbilityDecision(true, null, "raise a time shield while nearby players create credible danger", 0.60f),
                 "Camouflager" when visibleCrew.Length is >= 1 and <= 3 =>
                     new BotAbilityDecision(true, null, "conceal identities before a planned hostile rotation", 0.62f),
+                "Hacker" when GameData.Instance?.AllPlayers.ToArray().Any(player => player is not null && player.IsDead) == true =>
+                    new BotAbilityDecision(true, null, "spend a vitals charge after a death to update the evidence timeline", 0.68f),
+                "Hacker" when visibleCrew.Length == 0 =>
+                    new BotAbilityDecision(true, null, "spend an admin charge while isolated to learn anonymous room occupancy", 0.61f),
+                "Medium" when TorRoleAdapter.TryGetNearestMediumSoulPosition(bot, out _) =>
+                    new BotAbilityDecision(true, null, "approach and question a recorded soul so its TOR-generated clue enters the evidence timeline", 0.67f),
                 "Cleaner" or "Janitor" or "Vulture" when TorRoleAdapter.HasNearbyUsableBody(bot) =>
                     new BotAbilityDecision(true, null, "remove a nearby unwitnessed body before it can be reported", 0.66f),
                 "Trapper" when visibleCrew.Length >= 1 =>
@@ -660,10 +754,62 @@ internal sealed class BotAbilityDirector
         };
     }
 
+    private PlayerControl? FindEvidenceBackedSuspect(PlayerControl bot, float minimumConfidence)
+    {
+        if (!_memory.TryGetPostMeetingIntent(bot.PlayerId, out var intent) ||
+            intent.FollowIntent != "suspect" ||
+            !intent.FollowPlayerId.HasValue ||
+            intent.Confidence < minimumConfidence)
+        {
+            return null;
+        }
+
+        var target = FindPlayer(intent.FollowPlayerId.Value);
+        if (!target || target!.Data is null || target.Data.IsDead || target.Data.Disconnected || target.PlayerId == bot.PlayerId)
+        {
+            return null;
+        }
+
+        var distance = Vector2.Distance(bot.GetTruePosition(), target.GetTruePosition());
+        if (distance > 6f || PhysicsHelpers.AnythingBetween(
+                bot.GetTruePosition(),
+                target.GetTruePosition(),
+                Constants.ShipAndObjectsMask,
+                false))
+        {
+            return null;
+        }
+
+        return target;
+    }
+
+    private static bool TrySelectTorAbilityRole(PlayerControl bot, AbilityState state, out TorRoleInfo role)
+    {
+        var roles = TorRoleAdapter.GetAbilityRoles(bot);
+        if (roles.Count == 0)
+        {
+            role = default;
+            return false;
+        }
+
+        for (var offset = 0; offset < roles.Count; offset++)
+        {
+            var candidate = roles[(state.AbilityRoleCursor + offset) % roles.Count];
+            if (TorRoleAdapter.IsAbilityReady(bot, candidate) || TorRoleAdapter.CanUseVents(bot, candidate))
+            {
+                role = candidate;
+                return true;
+            }
+        }
+
+        role = default;
+        return false;
+    }
+
     private static bool SupportsStrategicAbility(PlayerControl bot)
     {
-        return (TorRoleAdapter.TryGetAbilityRole(bot, out var torRole) &&
-                (torRole.ActiveAbility || TorRoleAdapter.CanUseVents(bot, torRole))) ||
+        return TorRoleAdapter.GetAbilityRoles(bot)
+                   .Any(torRole => torRole.ActiveAbility || TorRoleAdapter.CanUseVents(bot, torRole)) ||
                bot.Data?.RoleType is
                    RoleTypes.Scientist or
                    RoleTypes.Engineer or
@@ -890,5 +1036,6 @@ internal sealed class BotAbilityDirector
         public BotAbilityDecision? PendingDecision { get; set; }
         public RoleTypes? RequestedRole { get; set; }
         public string? RequestedTorRole { get; set; }
+        public int AbilityRoleCursor { get; set; }
     }
 }

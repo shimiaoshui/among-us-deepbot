@@ -159,4 +159,14 @@ public sealed class DeepBotRuntime : MonoBehaviour
             _director.ApplyPhysicsMovement(physics);
         }
     }
+
+    internal void RecordObservedMurder(PlayerControl killer, PlayerControl victim)
+    {
+        _memory.RecordObservedMurder(killer, victim);
+    }
+
+    internal void RecordObservedSpecialAction(PlayerControl actor, string action, string inference)
+    {
+        _memory.RecordObservedSpecialAction(actor, action, inference);
+    }
 }
