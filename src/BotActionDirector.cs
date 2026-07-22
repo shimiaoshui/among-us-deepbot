@@ -39,6 +39,7 @@ internal sealed class BotActionDirector
     private const float AvoidanceSideChangeCooldown = 1.8f;
     private const float StuckEscapeCommitSeconds = 1.25f;
     private const float StuckEscapeProbeDistance = 0.90f;
+    private const int MaxStuckEscapeAttemptsPerTarget = 3;
     private const int RouteLookAheadNodes = 4;
     private const float EmergencyInterruptCooldown = 0.75f;
     private const float DecisionInterval = 4.5f;
@@ -196,7 +197,7 @@ internal sealed class BotActionDirector
                 continue;
             }
 
-            if (UsesFakeTaskCover(bot) && TryAssignImpostorOpeningCover(bot, state))
+            if (IsImpostor(bot) && TryAssignImpostorOpeningCover(bot, state))
             {
                 continue;
             }
@@ -235,6 +236,7 @@ internal sealed class BotActionDirector
 
             if (IsImpostor(bot) &&
                 bot.killTimer <= 0f &&
+                !TorRoleAdapter.HasExclusiveKillAbilityPending(bot) &&
                 Time.time >= state.NextMurderPlanAt &&
                 TryAssignAutonomousMurderTarget(bot, state))
             {
@@ -313,7 +315,7 @@ internal sealed class BotActionDirector
             }
 
             RequestLlmIntent(bot, state);
-            if (IsImpostor(bot) || UsesFakeTaskCover(bot))
+            if (IsImpostor(bot))
             {
                 // The model is advisory and may be slow or unavailable. Give an
                 // impostor a believable local action immediately so it never
@@ -412,6 +414,13 @@ internal sealed class BotActionDirector
                 continue;
             }
 
+            if (state.ActionKind == BotActionKind.Ability &&
+                state.TargetPlayerId.HasValue &&
+                UpdateRoleAbilityPursuit(bot, state))
+            {
+                continue;
+            }
+
             DriveAlongRoute(bot, state, config.BotSpeedMultiplier.Value, deltaTime);
         }
     }
@@ -476,8 +485,13 @@ internal sealed class BotActionDirector
             return;
         }
 
-        if (physics.myPlayer.inVent || physics.myPlayer.walkingToVent)
+        if (!physics.myPlayer.moveable || physics.myPlayer.inVent || physics.myPlayer.walkingToVent)
         {
+            physics.SetNormalizedVelocity(Vector2.zero);
+            if (physics.body)
+            {
+                physics.body.velocity = Vector2.zero;
+            }
             return;
         }
 
@@ -492,6 +506,10 @@ internal sealed class BotActionDirector
         }
 
         var direction = state.DesiredMoveDirection.normalized;
+        if (TorRoleAdapter.IsMovementInverted(physics.myPlayer))
+        {
+            direction = -direction;
+        }
         var speedMultiplier = Mathf.Clamp(state.DesiredMoveSpeedMultiplier, 0.45f, 1f);
         physics.HandleAnimation(physics.myPlayer.Data is not null && physics.myPlayer.Data.IsDead);
         physics.SetNormalizedVelocity(direction * speedMultiplier);
@@ -505,7 +523,8 @@ internal sealed class BotActionDirector
         PlayerControl bot,
         Vector2 targetPosition,
         string targetLabel,
-        float arrivalDistance)
+        float arrivalDistance,
+        byte? targetPlayerId = null)
     {
         if (!IsHostAuthority() || !bot || bot.Data is null || bot.Data.IsDead)
         {
@@ -536,8 +555,43 @@ internal sealed class BotActionDirector
             2.5f,
             BotActionKind.Ability,
             null,
-            null,
+            targetPlayerId,
             arrivalDistance);
+        return state.ActionKind == BotActionKind.Ability && state.HasActiveRoute;
+    }
+
+    internal bool TryRouteToRoleSearch(PlayerControl bot, string roleName)
+    {
+        if (!IsHostAuthority() || !bot || bot.Data is null || bot.Data.IsDead)
+        {
+            return false;
+        }
+
+        var state = GetState(bot);
+        if (state.ActionKind is BotActionKind.Emergency or BotActionKind.Report or BotActionKind.Task or BotActionKind.Escape)
+        {
+            return false;
+        }
+
+        var targetNode = PickRoamNode();
+        var node = SkeldPathGraph.Instance.FindNode(targetNode);
+        if (!node.HasValue)
+        {
+            return false;
+        }
+
+        AssignRoute(
+            bot,
+            state,
+            node.Value.Position,
+            $"ABILITY_SEARCH_{roleName}_{targetNode}",
+            $"role-search:{roleName}",
+            0.8f,
+            1.8f,
+            BotActionKind.Ability,
+            null,
+            null,
+            1.0f);
         return state.ActionKind == BotActionKind.Ability && state.HasActiveRoute;
     }
 
@@ -745,7 +799,8 @@ internal sealed class BotActionDirector
                 player.Data is null ||
                 player.Data.IsDead ||
                 player.Data.Disconnected ||
-                !CanObservePlayer(bot, player))
+                !CanObservePlayer(bot, player) ||
+                !IsKnownThreat(bot, player))
             {
                 continue;
             }
@@ -804,6 +859,20 @@ internal sealed class BotActionDirector
                 $"streak={streak}, interrupted={interruptedAction}, target={evadeNode}.");
             return;
         }
+    }
+
+    private bool IsKnownThreat(PlayerControl observer, PlayerControl candidate)
+    {
+        if (_memory.TryGetLatestWitnessedKiller(observer.PlayerId, out var witnessedKillerId) &&
+            witnessedKillerId == candidate.PlayerId)
+        {
+            return true;
+        }
+
+        return _memory.TryGetPostMeetingIntent(observer.PlayerId, out var intent) &&
+               intent.FollowIntent == "suspect" &&
+               intent.FollowPlayerId == candidate.PlayerId &&
+               intent.Confidence >= 0.35f;
     }
 
     private static string? PickEvadeNode(Vector2 botPosition, Vector2 threatPosition)
@@ -1194,6 +1263,7 @@ internal sealed class BotActionDirector
             BeginDwell(bot, state);
             state.LastProgressPosition = position;
             state.LastProgressAt = Time.time;
+            state.StuckEscapeAttempts = 0;
             return;
         }
 
@@ -1264,6 +1334,7 @@ internal sealed class BotActionDirector
             state.LastProgressTargetDistance = state.RouteIndex < state.Route.Count
                 ? Vector2.Distance(position, state.Route[state.RouteIndex].Position)
                 : 0f;
+            state.StuckEscapeAttempts = 0;
             if (state.RouteIndex >= state.Route.Count)
             {
                 Stop(bot.MyPhysics);
@@ -1321,6 +1392,22 @@ internal sealed class BotActionDirector
                         bot,
                         "navigation_replan",
                         $"stuck on {previous.Id}->{target.Id}; displacement={progress:0.00}; targetImprovement={targetImprovement:0.00}");
+                    if (state.StuckEscapeAttempts >= MaxStuckEscapeAttemptsPerTarget)
+                    {
+                        var failedTarget = state.CurrentTargetNode ?? target.Id;
+                        _log.LogWarning(
+                            $"DeepBot abandoning repeated stuck target: bot={bot.Data?.PlayerName}, target={failedTarget}, " +
+                            $"edge={previous.Id}->{target.Id}, attempts={state.StuckEscapeAttempts}, teleport=false.");
+                        _memory.RecordAction(
+                            bot,
+                            "navigation_escape",
+                            $"abandoned target {failedTarget} after {state.StuckEscapeAttempts} physical escape attempts; teleport=false");
+                        MarkTargetUnreachable(state, failedTarget);
+                        state.RouteVariant++;
+                        state.ClearRoute();
+                        TryAssignReachableFallback(bot, state, failedTarget, "repeated-stuck", BotActionKind.Llm);
+                        return;
+                    }
                     if (TryStartStuckEscape(bot, state, offset.normalized, speedMultiplier, previous.Id, target.Id))
                     {
                         return;
@@ -1330,6 +1417,7 @@ internal sealed class BotActionDirector
                 }
 
                 state.StuckSamples = 0;
+                state.StuckEscapeAttempts = 0;
                 state.LastProgressPosition = position;
                 state.LastProgressAt = Time.time;
                 state.LastProgressRouteIndex = state.RouteIndex;
@@ -1594,6 +1682,52 @@ internal sealed class BotActionDirector
         return false;
     }
 
+    private bool UpdateRoleAbilityPursuit(PlayerControl bot, BotRuntimeState state)
+    {
+        var target = state.TargetPlayerId.HasValue
+            ? FindPlayerControl(state.TargetPlayerId.Value)
+            : null;
+        if (target is null || target.Data is null || target.Data.IsDead || target.Data.Disconnected)
+        {
+            state.ClearRoute();
+            return false;
+        }
+
+        var targetPosition = target.GetTruePosition();
+        var distance = Vector2.Distance(bot.GetTruePosition(), targetPosition);
+        if (distance <= state.ArrivalDistance)
+        {
+            Stop(bot.MyPhysics);
+            state.ClearRoute();
+            return true;
+        }
+
+        if (Time.time >= state.NextAbilityRouteRefreshAt &&
+            (!state.CurrentTargetPosition.HasValue ||
+             BotBehaviorPolicy.ShouldRefreshMovingTarget(
+                 state.CurrentTargetPosition.Value,
+                 targetPosition,
+                 MurderPursuitRefreshDistance)))
+        {
+            state.NextAbilityRouteRefreshAt = Time.time + 0.8f;
+            var label = state.CurrentTargetNode ?? $"ABILITY_TARGET_{target.PlayerId}";
+            AssignRoute(
+                bot,
+                state,
+                targetPosition,
+                label,
+                $"role-ability-target-refresh:{target.Data.PlayerName}",
+                0.5f,
+                1.0f,
+                BotActionKind.Ability,
+                null,
+                target.PlayerId,
+                state.ArrivalDistance);
+        }
+
+        return false;
+    }
+
     private void SchedulePostTaskPersonality(PlayerControl bot, BotRuntimeState state)
     {
         var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
@@ -1618,11 +1752,12 @@ internal sealed class BotActionDirector
         state.DesiredMoveDirection = direction;
         state.DesiredMoveSpeedMultiplier = speedMultiplier;
         state.DesiredMoveUntil = Time.time + Mathf.Max(0.2f, Time.fixedDeltaTime * 8f);
+        var physicsDirection = TorRoleAdapter.IsMovementInverted(bot) ? -direction : direction;
         bot.MyPhysics.HandleAnimation(bot.Data is not null && bot.Data.IsDead);
-        bot.MyPhysics.SetNormalizedVelocity(direction * Mathf.Clamp(speedMultiplier, 0.45f, 1f));
+        bot.MyPhysics.SetNormalizedVelocity(physicsDirection * Mathf.Clamp(speedMultiplier, 0.45f, 1f));
         if (bot.MyPhysics.body)
         {
-            bot.MyPhysics.body.velocity = direction * Mathf.Max(0.8f, bot.MyPhysics.TrueSpeed) * Mathf.Clamp(speedMultiplier, 0.45f, 1f);
+            bot.MyPhysics.body.velocity = physicsDirection * Mathf.Max(0.8f, bot.MyPhysics.TrueSpeed) * Mathf.Clamp(speedMultiplier, 0.45f, 1f);
         }
     }
 
@@ -1758,6 +1893,7 @@ internal sealed class BotActionDirector
             state.AvoidanceUntil = Time.time + StuckEscapeCommitSeconds;
             state.NextAvoidanceSideChangeAt = Time.time + AvoidanceSideChangeCooldown;
             state.StuckSamples = 0;
+            state.StuckEscapeAttempts++;
             state.LastProgressPosition = position;
             state.LastProgressAt = Time.time;
             DriveDirection(bot, candidate, speedMultiplier);
@@ -3338,6 +3474,12 @@ internal sealed class BotActionDirector
 
     private bool TryTriggerSabotage(PlayerControl bot, BotRuntimeState state, string? intent, string reason)
     {
+        if (TorRoleAdapter.IsHandcuffed(bot))
+        {
+            state.NextSabotageAt = Mathf.Max(state.NextSabotageAt, Time.time + 1f);
+            return false;
+        }
+
         if (!IsBotActionWindowOpen(bot))
         {
             if (Time.time >= state.NextSabotageAt && Time.time >= state.NextSabotageDiagnosticAt)
@@ -3683,7 +3825,7 @@ internal sealed class BotActionDirector
     private bool TryAssignImpostorOpeningCover(PlayerControl bot, BotRuntimeState state)
     {
         if (!BotBehaviorPolicy.ShouldUseOpeningFakeTask(
-                UsesFakeTaskCover(bot),
+                IsImpostor(bot),
                 state.ImpostorOpeningCoverCompleted))
         {
             return false;
@@ -3815,12 +3957,30 @@ internal sealed class BotActionDirector
 
     private bool TryAssignAutonomousMurderTarget(PlayerControl killer, BotRuntimeState state)
     {
+        if (TorRoleAdapter.HasExclusiveKillAbilityPending(killer))
+        {
+            state.NextMurderPlanAt = Time.time + 1f;
+            return false;
+        }
+
+        if (!TorRoleAdapter.CanUseOrdinaryMurder(killer, out var ordinaryMurderBlock))
+        {
+            state.NextMurderPlanAt = Time.time + 1f;
+            if (Time.time >= state.NextMurderDiagnosticAt)
+            {
+                state.NextMurderDiagnosticAt = Time.time + 2f;
+                _log.LogInfo($"DeepBot ordinary murder role-gated: killer={killer.Data?.PlayerName}, block={ordinaryMurderBlock}");
+            }
+            return false;
+        }
+
         var killerPosition = killer.GetTruePosition();
         var candidates = PlayerControl.AllPlayerControls
             .ToArray()
             .Where(player =>
                 player &&
                 player.PlayerId != killer.PlayerId &&
+                !TorRoleAdapter.AreLoverPartners(killer, player) &&
                 player.Data is not null &&
                 !player.Data.IsDead &&
                 !player.Data.Disconnected &&
@@ -4119,6 +4279,34 @@ internal sealed class BotActionDirector
 
     private bool TryExecuteMurder(PlayerControl killer, PlayerControl target, string reason)
     {
+        if (TorRoleAdapter.HasExclusiveKillAbilityPending(killer))
+        {
+            var state = GetState(killer);
+            state.NextMurderPlanAt = Time.time + 1f;
+            if (Time.time >= state.NextMurderDiagnosticAt)
+            {
+                state.NextMurderDiagnosticAt = Time.time + 1.25f;
+                _log.LogInfo(
+                    $"DeepBot ordinary murder suppressed by pending role ability: killer={killer.Data?.PlayerName}, " +
+                    $"target={target.Data?.PlayerName}, reason={reason}");
+            }
+            return false;
+        }
+
+        if (!TorRoleAdapter.CanUseOrdinaryMurder(killer, out var ordinaryMurderBlock))
+        {
+            var state = GetState(killer);
+            state.NextMurderPlanAt = Time.time + 1f;
+            if (Time.time >= state.NextMurderDiagnosticAt)
+            {
+                state.NextMurderDiagnosticAt = Time.time + 1.25f;
+                _log.LogInfo(
+                    $"DeepBot ordinary murder role-gated: killer={killer.Data?.PlayerName}, " +
+                    $"target={target.Data?.PlayerName}, block={ordinaryMurderBlock}, reason={reason}");
+            }
+            return false;
+        }
+
         if (!IsMurderPlayWindowOpen(killer))
         {
             var state = GetState(killer);
@@ -4424,7 +4612,7 @@ internal sealed class BotActionDirector
         // Virtual killers can remain move-locked because the native kill
         // animation coroutine is owned by another client. Release only after
         // the normal animation grace period and never during meetings/exile.
-        if (!killer.moveable)
+        if (!killer.moveable && !TorRoleAdapter.IsRuleImmobilized(killer))
         {
             killer.moveable = true;
             _log.LogInfo(
@@ -4629,6 +4817,11 @@ internal sealed class BotActionDirector
         }
 
         if (!IsImpostor(killer) || IsImpostor(target) || killer.killTimer > 0f)
+        {
+            return false;
+        }
+
+        if (TorRoleAdapter.AreLoverPartners(killer, target))
         {
             return false;
         }
@@ -4890,6 +5083,7 @@ internal sealed class BotActionDirector
         public int TaskSelectionEpoch { get; set; }
         public int RouteVariant { get; set; }
         public int StuckSamples { get; set; }
+        public int StuckEscapeAttempts { get; set; }
         public int AvoidanceSide { get; set; }
         public Vector2 AvoidanceDirection { get; set; }
         public float AvoidanceUntil { get; set; }
@@ -4925,6 +5119,7 @@ internal sealed class BotActionDirector
         public int LastConsumedMeetingSerial { get; set; }
         public float SocialFollowUntil { get; set; }
         public float NextSocialFollowRefreshAt { get; set; }
+        public float NextAbilityRouteRefreshAt { get; set; }
         public bool HasActiveRoute => Route.Count > 0 || DwellUntil > 0f;
 
         public void ClearRoute()
@@ -4950,9 +5145,11 @@ internal sealed class BotActionDirector
             DesiredMoveSpeedMultiplier = 0f;
             DesiredMoveUntil = 0f;
             StuckSamples = 0;
+            StuckEscapeAttempts = 0;
             AvoidanceDirection = Vector2.zero;
             AvoidanceUntil = 0f;
             NextAvoidanceSideChangeAt = 0f;
+            NextAbilityRouteRefreshAt = 0f;
             MurderPursuitStartedAt = 0f;
             MurderPursuitUntil = 0f;
             NextMurderPursuitRefreshAt = 0f;

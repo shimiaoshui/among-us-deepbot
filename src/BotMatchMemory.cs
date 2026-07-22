@@ -104,12 +104,83 @@ internal sealed class BotMatchMemory
         }
     }
 
+    public void RecordObservedMurder(PlayerControl killer, PlayerControl victim)
+    {
+        if (!_matchActive || !killer || !victim)
+        {
+            return;
+        }
+
+        foreach (var observer in EnumerateDeepBots())
+        {
+            if (!observer || observer.Data is null || observer.Data.IsDead || observer.Data.Disconnected ||
+                observer.PlayerId == killer.PlayerId)
+            {
+                continue;
+            }
+
+            var observerPosition = observer.GetTruePosition();
+            var killerPosition = killer.GetTruePosition();
+            if (Vector2.Distance(observerPosition, killerPosition) > GetVisionDistance(observer) ||
+                PhysicsHelpers.AnythingBetween(observerPosition, killerPosition, Constants.ShipAndObjectsMask, false))
+            {
+                continue;
+            }
+
+            var state = GetState(observer, Plugin.Settings.MaxMemoryEvents.Value);
+            state.WitnessedKillers[killer.PlayerId] = Time.time;
+            Append(
+                state,
+                "witness_kill",
+                $"personally saw {killer.Data?.PlayerName}({killer.PlayerId}) kill {victim.Data?.PlayerName}({victim.PlayerId}); this proves a kill-capable role but not automatically the base Impostor role",
+                SkeldPathGraph.Instance.NearestNode(killerPosition));
+        }
+    }
+
+    public void RecordObservedSpecialAction(PlayerControl actor, string action, string inference)
+    {
+        if (!_matchActive || !actor || actor.Data is null)
+        {
+            return;
+        }
+
+        foreach (var observer in EnumerateDeepBots())
+        {
+            if (!CanPersonallyObserveActor(observer, actor))
+            {
+                continue;
+            }
+
+            var state = GetState(observer, Plugin.Settings.MaxMemoryEvents.Value);
+            Append(
+                state,
+                "witness_action",
+                $"personally saw {actor.Data.PlayerName}({actor.PlayerId}) {action}; inference={inference}",
+                SkeldPathGraph.Instance.NearestNode(actor.GetTruePosition()));
+        }
+    }
+
     public string BuildTimeline(byte botId, int maxEvents)
     {
         var skills = _evolutionSkills.BuildPrompt();
         var timeline = BuildRawTimeline(botId, maxEvents);
         return $"CORE EVOLUTION SKILLS (generalized lessons from earlier matches):\n{skills}\n" +
                $"CURRENT PRIVATE MATCH MEMORY:\n{timeline}";
+    }
+
+    public bool TryGetLatestWitnessedKiller(byte botId, out byte killerId)
+    {
+        killerId = byte.MaxValue;
+        if (!_states.TryGetValue(botId, out var state) || state.WitnessedKillers.Count == 0)
+        {
+            return false;
+        }
+
+        var latest = state.WitnessedKillers
+            .OrderByDescending(pair => pair.Value)
+            .First();
+        killerId = latest.Key;
+        return true;
     }
 
     internal string BuildRawTimeline(byte botId, int maxEvents)
@@ -199,14 +270,15 @@ internal sealed class BotMatchMemory
 
     public string BuildKnownRoleInformation(PlayerControl bot)
     {
+        var publicRulebook = TorRoleAdapter.BuildPublicDeductionRulebook();
         if (TorRoleAdapter.TryGetRole(bot, out var torRole))
         {
-            return TorRoleAdapter.BuildKnownRoleInformation(bot, torRole);
+            return TorRoleAdapter.BuildKnownRoleInformation(bot, torRole) + "\n" + publicRulebook;
         }
 
         if (!IsImpostor(bot))
         {
-            return "You do not know any hidden roles.";
+            return "You do not know any hidden assignments.\n" + publicRulebook;
         }
 
         var allies = new List<string>();
@@ -224,9 +296,10 @@ internal sealed class BotMatchMemory
             allies.Add($"{player.Data.PlayerName}({player.PlayerId})");
         }
 
-        return allies.Count == 0
+        var privateAllies = allies.Count == 0
             ? "No living impostor teammate is known."
             : $"Known impostor teammates: {string.Join(", ", allies)}. Never accuse or vote for them unless unavoidable.";
+        return privateAllies + "\n" + publicRulebook;
     }
 
     private MemoryState GetState(PlayerControl bot, int configuredLimit)
@@ -291,6 +364,17 @@ internal sealed class BotMatchMemory
             }
 
             nowVisible.Add(player.PlayerId);
+            var venting = player.inVent || player.walkingToVent;
+            var previouslyVenting = state.ObservedVentStates.GetValueOrDefault(player.PlayerId);
+            if (venting && !previouslyVenting)
+            {
+                Append(
+                    state,
+                    "witness_vent",
+                    $"personally saw {player.Data.PlayerName}({player.PlayerId}) enter/use a vent; infer only a vent-capable current role because Engineer and some neutral/custom roles can also vent",
+                    SkeldPathGraph.Instance.NearestNode(targetPosition));
+            }
+            state.ObservedVentStates[player.PlayerId] = venting;
             var firstSeen = !state.VisiblePlayerIds.Contains(player.PlayerId);
             var refreshDue = Time.time - state.LastEncounterAt.GetValueOrDefault(player.PlayerId) >= EncounterRefreshSeconds;
             if (firstSeen || refreshDue)
@@ -399,6 +483,20 @@ internal sealed class BotMatchMemory
             GameRuleSettings.IsSkeldMap();
     }
 
+    private static bool CanPersonallyObserveActor(PlayerControl observer, PlayerControl actor)
+    {
+        if (!observer || observer.Data is null || observer.Data.IsDead || observer.Data.Disconnected ||
+            !actor || actor.Data is null || actor.Data.Disconnected || observer.PlayerId == actor.PlayerId)
+        {
+            return false;
+        }
+
+        var observerPosition = observer.GetTruePosition();
+        var actorPosition = actor.GetTruePosition();
+        return Vector2.Distance(observerPosition, actorPosition) <= GetVisionDistance(observer) &&
+               !PhysicsHelpers.AnythingBetween(observerPosition, actorPosition, Constants.ShipAndObjectsMask, false);
+    }
+
     private static bool IsDeepBot(PlayerControl player)
     {
         return player.Data is not null &&
@@ -438,6 +536,8 @@ internal sealed class BotMatchMemory
         public bool WasAlive { get; set; }
         public HashSet<byte> VisiblePlayerIds { get; } = [];
         public Dictionary<byte, float> LastEncounterAt { get; } = [];
+        public Dictionary<byte, bool> ObservedVentStates { get; } = [];
+        public Dictionary<byte, float> WitnessedKillers { get; } = [];
         public HashSet<byte> SeenBodyIds { get; } = [];
         public PostMeetingSocialIntent? PostMeetingIntent { get; set; }
     }

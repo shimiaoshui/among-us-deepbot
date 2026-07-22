@@ -248,13 +248,15 @@ internal sealed class BotSocialDirector
             $"DeepBot meeting transcript received: meeting={_meetingSerial}, source={sourceName}({sourceId}), " +
             $"human={!isBotSource}, transcriptVersion={_transcriptVersion}, humanVersion={_humanTranscriptVersion}, text={clean}");
 
-        var hasSuspicionLanguage = SuspicionWords.Any(word => clean.Contains(word, StringComparison.OrdinalIgnoreCase));
+        var supportiveClaim = IsSupportiveClaim(clean);
+        var hasSuspicionLanguage = !supportiveClaim &&
+            SuspicionWords.Any(word => clean.Contains(word, StringComparison.OrdinalIgnoreCase));
         var selfIncriminating = SelfIncriminatingWords.Any(word => clean.Contains(word, StringComparison.OrdinalIgnoreCase));
         var mentionedPlayers = EnumeratePlayers()
             .Where(player => MentionsPlayer(clean, player))
             .ToArray();
         var mentionedPlayer = mentionedPlayers.FirstOrDefault();
-        var explicitAccusation = mentionedPlayers.Length > 0 && IsExplicitAccusation(clean);
+        var explicitAccusation = !supportiveClaim && mentionedPlayers.Length > 0 && IsExplicitAccusation(clean);
         foreach (var player in EnumerateLivingPlayers())
         {
             if ((hasSuspicionLanguage || explicitAccusation) &&
@@ -274,7 +276,9 @@ internal sealed class BotSocialDirector
                 fastResponderIds.Add(addressedBot.PlayerId);
             }
 
-            var desiredResponses = mentionedPlayer is not null || hasSuspicionLanguage || clean.Contains('?') || clean.Contains('？')
+            var desiredResponses = supportiveClaim
+                ? 1
+                : mentionedPlayer is not null || hasSuspicionLanguage || clean.Contains('?') || clean.Contains('？')
                 ? 2
                 : 1;
             foreach (var responder in livingBots
@@ -297,6 +301,22 @@ internal sealed class BotSocialDirector
                 var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
                 foreach (var player in mentionedPlayers.Where(IsAlive))
                 {
+                    if (supportiveClaim && player.PlayerId != bot.PlayerId)
+                    {
+                        var personallyWitnessedKill = _memory.TryGetLatestWitnessedKiller(bot.PlayerId, out var killerId) &&
+                            killerId == player.PlayerId;
+                        if (!personallyWitnessedKill)
+                        {
+                            var trustInfluence = 0.5f * Mathf.Lerp(
+                                0.35f,
+                                1.0f,
+                                personality.SocialSuggestibility);
+                            state.BeliefScores[player.PlayerId] =
+                                state.BeliefScores.GetValueOrDefault(player.PlayerId) - trustInfluence;
+                        }
+                        continue;
+                    }
+
                     if ((!hasSuspicionLanguage && !explicitAccusation) ||
                         player.PlayerId == bot.PlayerId)
                     {
@@ -744,6 +764,13 @@ internal sealed class BotSocialDirector
             message = BuildContextualFallbackMeetingLine(bot, state);
         }
 
+        if (IsGenericMeetingFiller(message) &&
+            _lastReporterId != bot.PlayerId &&
+            !_memory.TryGetLatestWitnessedKiller(bot.PlayerId, out _))
+        {
+            message = string.Empty;
+        }
+
         if (config.MeetingChat.Value &&
             state.MessagesSent < MaxMeetingMessagesPerBot &&
             !string.Equals(message, state.LastMessage, StringComparison.Ordinal))
@@ -820,7 +847,8 @@ internal sealed class BotSocialDirector
         state.PendingHumanText = string.Empty;
         state.PendingHumanSourceId = byte.MaxValue;
         var line = BuildHumanReactionLine(bot, state, humanText, humanSourceId);
-        if (!string.Equals(line, state.LastMessage, StringComparison.Ordinal))
+        if (!IsGenericMeetingFiller(line) &&
+            !string.Equals(line, state.LastMessage, StringComparison.Ordinal))
         {
             SendMeetingLine(bot, state, line, "human-reaction-rules");
         }
@@ -843,6 +871,18 @@ internal sealed class BotSocialDirector
                     "懒散派" => $"等等，{targetName}都死了，没法投。你具体指谁？",
                     _ => $"{targetName}已经死亡，不能成为本轮投票目标。请说清你的指认依据。"
                 };
+            }
+
+            if (IsSupportiveClaim(humanText))
+            {
+                if (_memory.TryGetLatestWitnessedKiller(bot.PlayerId, out var killerId) && killerId == target.PlayerId)
+                {
+                    return $"不对，我亲眼看见{targetName}杀人，这条洗白和我的目击冲突。";
+                }
+
+                return target.PlayerId == bot.PlayerId
+                    ? "收到，但别只凭身份猜测；请说你信我的具体依据。"
+                    : $"你是把{targetName}当船员。依据是路线互证，还是亲眼看到他做事？";
             }
 
             if (target.PlayerId == bot.PlayerId)
@@ -1037,6 +1077,11 @@ internal sealed class BotSocialDirector
         try
         {
             MeetingHud.Instance.CmdCastVote(bot.PlayerId, voteId);
+            if (TorRoleAdapter.TryUseStrategicMeetingVoteAbility(bot, voteId, out var meetingAbilityOutcome))
+            {
+                _memory.RecordAction(bot, "meeting_ability", meetingAbilityOutcome);
+                _log.LogInfo($"DeepBot TOR meeting ability used: bot={bot.Data?.PlayerName}, outcome={meetingAbilityOutcome}.");
+            }
             MeetingHud.Instance.CheckForEndVoting();
             state.Voted = true;
             state.LastSubmittedVoteId = voteId == SkipVoteId ? null : voteId;
@@ -1054,6 +1099,19 @@ internal sealed class BotSocialDirector
 
     private byte ChooseVote(PlayerControl bot, SocialState state)
     {
+        if (_memory.TryGetLatestWitnessedKiller(bot.PlayerId, out var witnessedKillerId))
+        {
+            var witnessedKiller = FindPlayer(witnessedKillerId);
+            if (witnessedKiller is not null &&
+                IsAlive(witnessedKiller) &&
+                witnessedKiller.PlayerId != bot.PlayerId &&
+                !TorRoleAdapter.AreLoverPartners(bot, witnessedKiller) &&
+                (!IsImpostor(bot) || !IsImpostor(witnessedKiller)))
+            {
+                return witnessedKiller.PlayerId;
+            }
+        }
+
         var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
         var confidenceThreshold = BotBehaviorPolicy.GetMeetingVoteConfidenceThreshold(personality.VoteBoldness);
         var decision = state.MeetingDecision;
@@ -1191,6 +1249,38 @@ internal sealed class BotSocialDirector
     {
         var indicators = new[] { "投", "票", "就是", "内鬼", "凶手", "认狼", "自爆", "impostor", "sus" };
         return indicators.Any(word => text.Contains(word, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsSupportiveClaim(string text)
+    {
+        string[] hostileOverrides = ["不是船员", "不像船员", "假船员", "船员面具", "装船员"];
+        if (hostileOverrides.Any(phrase => text.Contains(phrase, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        string[] supportivePhrases =
+        [
+            "是船员", "像船员", "可能是船员", "应该是船员", "是好人", "像好人",
+            "可能是好人", "可信", "我信", "可以信", "不怀疑", "不像内鬼", "不是内鬼"
+        ];
+        return supportivePhrases.Any(phrase => text.Contains(phrase, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsGenericMeetingFiller(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return true;
+        }
+
+        string[] fillerPhrases =
+        [
+            "先把各自路线说清楚", "都直接报位置", "信息还太少", "没有硬证据",
+            "谨慎投票", "先听着", "别这么快乱票", "先区分亲眼所见",
+            "谁最后见过死者", "大家按顺序", "把路线接起来"
+        ];
+        return fillerPhrases.Any(phrase => text.Contains(phrase, StringComparison.Ordinal));
     }
 
     private static float GetRuleVoteThreshold(BotPersonalityProfile personality)

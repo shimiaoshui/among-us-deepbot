@@ -71,9 +71,14 @@ internal sealed class SafeLocalBotSpawner
             return;
         }
 
-        var targetCount = Mathf.Clamp(config.LocalBotCount.Value, 0, 10);
+        var targetCount = TorRoleAdapter.GetLobbyConfiguredBotCount(config.LocalBotCount.Value);
         CaptureHostPlayer(client);
         var existingCount = CountManagedClients(client);
+        if (client.GameState != InnerNetClient.GameStates.Started && existingCount > targetCount)
+        {
+            PruneExcessLobbyBots(client, targetCount);
+            existingCount = CountManagedClients(client);
+        }
         ConfigureTrackedClients(client);
         EnsureHostLocalPlayer(client, "spawner tick");
 
@@ -90,6 +95,42 @@ internal sealed class SafeLocalBotSpawner
 
         _nextSpawnAt = Time.time + 0.75f;
         TryCreateOne(client, FindNextBotIndex(client, targetCount));
+    }
+
+    private void PruneExcessLobbyBots(AmongUsClient client, int targetCount)
+    {
+        var managed = new List<(int ClientListIndex, ClientData Client, int BotIndex)>();
+        for (var i = 0; i < client.allClients.Count; i++)
+        {
+            var candidate = client.allClients[i];
+            if (candidate is null || candidate.Id == client.ClientId)
+            {
+                continue;
+            }
+
+            var name = candidate.Character && candidate.Character.Data is not null
+                ? candidate.Character.Data.PlayerName
+                : candidate.PlayerName;
+            if (TryParseBotIndex(name, out var botIndex))
+            {
+                managed.Add((i, candidate, botIndex));
+            }
+        }
+
+        foreach (var item in managed
+                     .OrderByDescending(item => item.BotIndex)
+                     .ThenByDescending(item => item.ClientListIndex)
+                     .Take(Math.Max(0, managed.Count - targetCount))
+                     .OrderByDescending(item => item.ClientListIndex))
+        {
+            if (item.Client.Character)
+            {
+                UnityEngine.Object.Destroy(item.Client.Character.gameObject);
+            }
+            client.allClients.RemoveAt(item.ClientListIndex);
+            _tracked.RemoveAll(tracked => tracked.ClientId == item.Client.Id);
+            _log.LogInfo($"DeepBot lobby roster reduced: removed=DeepBot {item.BotIndex + 1}, target={targetCount}.");
+        }
     }
 
     public void MaintainHostLocalView()

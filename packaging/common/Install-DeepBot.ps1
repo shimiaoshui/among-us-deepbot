@@ -9,14 +9,14 @@ if ([string]::IsNullOrWhiteSpace($GameDirectory)) {
     $GameDirectory = $candidates | Select-Object -First 1
 }
 if ([string]::IsNullOrWhiteSpace($GameDirectory)) {
-    $GameDirectory = Read-Host '请输入包含 Among Us.exe 的完整游戏目录'
+    $GameDirectory = Read-Host 'Enter the full game directory containing Among Us.exe'
 }
 $GameDirectory = [IO.Path]::GetFullPath($GameDirectory.Trim('"'))
 if (-not (Test-Path -LiteralPath (Join-Path $GameDirectory 'Among Us.exe'))) {
-    throw "目标目录中找不到 Among Us.exe：$GameDirectory"
+    throw "Among Us.exe was not found in: $GameDirectory"
 }
 if (-not (Test-Path -LiteralPath (Join-Path $GameDirectory 'BepInEx'))) {
-    throw '目标目录尚未安装 BepInEx 6 IL2CPP。请先安装并启动一次游戏。'
+    throw 'BepInEx 6 IL2CPP was not found. Install it and launch the game once first.'
 }
 
 $pluginSource = Join-Path $PSScriptRoot 'BepInEx\plugins\AmongUsDeepSeekBots.dll'
@@ -28,12 +28,22 @@ if (Test-Path -LiteralPath $pluginTarget) {
     Copy-Item -LiteralPath $pluginTarget -Destination "$pluginTarget.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
 }
 Copy-Item -LiteralPath $pluginSource -Destination $pluginTarget -Force
+# The TOR strict-rules package carries a clearly marked GPLv3 modified
+# TheOtherRoles.dll. Standalone packages do not contain this optional file.
+$torSource = Join-Path $PSScriptRoot 'BepInEx\plugins\TheOtherRoles.dll'
+$torTarget = Join-Path $GameDirectory 'BepInEx\plugins\TheOtherRoles.dll'
+if (Test-Path -LiteralPath $torSource) {
+    if (Test-Path -LiteralPath $torTarget) {
+        Copy-Item -LiteralPath $torTarget -Destination "$torTarget.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
+    }
+    Copy-Item -LiteralPath $torSource -Destination $torTarget -Force
+}
 if (-not (Test-Path -LiteralPath $configTarget)) {
     Copy-Item -LiteralPath $configSource -Destination $configTarget
 }
 foreach ($name in 'Configure-DeepBot-Key.ps1','Configure-DeepBot-Key.cmd','Start-DeepBot.ps1','Start-DeepBot.cmd') {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $GameDirectory $name) -Force
 }
-Write-Host "DeepBot 已安装到：$GameDirectory" -ForegroundColor Green
-Write-Host '房主下一步运行 Configure-DeepBot-Key.cmd；客端把 BotCount 设置为 0。' -ForegroundColor Cyan
+Write-Host "DeepBot installed to: $GameDirectory" -ForegroundColor Green
+Write-Host 'Host: run Configure-DeepBot-Key.cmd once. TOR build: set AI Bot count (1-8) in the lobby options.' -ForegroundColor Cyan
 

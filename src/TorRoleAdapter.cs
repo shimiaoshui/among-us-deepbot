@@ -25,7 +25,7 @@ internal static class TorRoleAdapter
     [
         new("Jester", "jester", "neutral", false, "Get suspected and voted out while avoiding an obvious self-report or confession."),
         new("Portalmaker", "portalmaker", "crewmate", true, "Place the two portals in separated, useful rooms so they shorten later task and emergency routes."),
-        new("Mayor", "mayor", "crewmate", false, "Use voting influence and remote meetings only when evidence justifies it."),
+        new("Mayor", "mayor", "crewmate", true, "Use voting influence and remote meetings only when evidence justifies it."),
         new("Engineer", "engineer", "crewmate", true, "Save limited instant repairs for a dangerous sabotage or a last-second rescue."),
         new("Godfather", "godfather", "impostor", false, "Coordinate kills and deception while preserving mafia cover."),
         new("Mafioso", "mafioso", "impostor", false, "Support the Godfather and kill only when the role permits it."),
@@ -40,7 +40,7 @@ internal static class TorRoleAdapter
         new("Seer", "seer", "crewmate", false, "Use soul information to strengthen later deductions without inventing sightings."),
         new("Morphling", "morphling", "impostor", true, "Copy a credible target while unseen before a planned frame, escape, or kill."),
         new("Camouflager", "camouflager", "impostor", true, "Camouflage players to conceal a planned kill or break reliable visual identification."),
-        new("Hacker", "hacker", "crewmate", false, "Spend limited information charges when room occupancy or vitals resolves uncertainty."),
+        new("Hacker", "hacker", "crewmate", true, "Spend limited information charges when room occupancy or vitals resolves uncertainty."),
         new("Tracker", "tracker", "crewmate", true, "Track a trusted or suspicious player whose later route will provide useful evidence."),
         new("Vampire", "vampire", "impostor", true, "Delay-kill an isolated target when the bite will not immediately expose the attacker."),
         new("Snitch", "snitch", "crewmate", false, "Finish tasks while managing the danger created when hostile roles learn your identity."),
@@ -57,7 +57,7 @@ internal static class TorRoleAdapter
         new("NiceGuesser", "niceGuesser", "crewmate", false, "Guess a role in a meeting only with strong evidence."),
         new("EvilGuesser", "evilGuesser", "impostor", false, "Use role knowledge to remove a dangerous opponent without exposing teammates."),
         new("Vulture", "vulture", "neutral", true, "Consume a nearby body only when it is safe and advances the independent win condition."),
-        new("Medium", "medium", "crewmate", false, "Question a soul when its information can resolve an important uncertainty."),
+        new("Medium", "medium", "crewmate", true, "Question a soul when its information can resolve an important uncertainty."),
         new("Prosecutor", "lawyer", "neutral", false, "Build an evidence-based case that gets the assigned target voted out without exposing the objective too early."),
         new("Lawyer", "lawyer", "neutral", false, "Defend the assigned client while building plausible alternative explanations."),
         new("Pursuer", "pursuer", "neutral", true, "Survive until a non-impostor victory; blank a dangerous nearby player's next kill or ability to protect survival."),
@@ -102,8 +102,34 @@ internal static class TorRoleAdapter
     private static readonly Dictionary<byte, float> PendingYoyoReturns = [];
     private static readonly Dictionary<(byte PlayerId, string Role), float> NextRoleAbilityAt = [];
     private static readonly Dictionary<(byte PlayerId, string Role), List<Vector2>> StrategicPlacements = [];
+    private static Type? _trapType;
 
     internal static bool IsAvailable => EnsureLoaded();
+
+    internal static int GetLobbyConfiguredBotCount(int fallback)
+    {
+        if (!EnsureLoaded() || _assembly is null)
+        {
+            return Mathf.Clamp(fallback, 1, 8);
+        }
+
+        try
+        {
+            var holder = _assembly.GetType("TheOtherRoles.CustomOptionHolder", false);
+            var option = holder?.GetField("deepBotCount", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+            var getFloat = option?.GetType().GetMethod("getFloat", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (getFloat?.Invoke(option, null) is float value)
+            {
+                return Mathf.Clamp(Mathf.RoundToInt(value), 1, 8);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning($"DeepBot lobby bot-count option read failed; using config fallback: {ex.GetBaseException().Message}");
+        }
+
+        return Mathf.Clamp(fallback, 1, 8);
+    }
 
     /// <summary>
     /// Routes an ordinary bot kill through TOR's own murder validator.  This
@@ -116,7 +142,8 @@ internal static class TorRoleAdapter
         PlayerControl killer,
         PlayerControl target,
         out bool killed,
-        out string outcome)
+        out string outcome,
+        bool showAnimation = true)
     {
         killed = false;
         outcome = "TOR unavailable";
@@ -136,7 +163,7 @@ internal static class TorRoleAdapter
 
             var result = method.Invoke(
                 null,
-                new object[] { killer, target, false, true, false, false });
+                new object[] { killer, target, false, showAnimation, false, false });
             var resultName = result?.ToString() ?? "unknown";
             killed = string.Equals(resultName, "PerformKill", StringComparison.Ordinal) ||
                      target.Data?.IsDead == true;
@@ -249,24 +276,42 @@ internal static class TorRoleAdapter
 
     internal static bool TryGetAbilityRole(PlayerControl? player, out TorRoleInfo role)
     {
-        role = default;
+        var roles = GetAbilityRoles(player);
+        role = roles.Count > 0 ? roles[0] : default;
+        return roles.Count > 0;
+    }
+
+    internal static IReadOnlyList<TorRoleInfo> GetAbilityRoles(PlayerControl? player)
+    {
         if (!player || !EnsureLoaded())
         {
-            return false;
+            return Array.Empty<TorRoleInfo>();
+        }
+
+        var roles = new List<TorRoleInfo>(2);
+        if (TryGetRole(player, out var primary) && primary.ActiveAbility)
+        {
+            roles.Add(primary);
         }
 
         if (HasModifier(player!, "Shifter") && GetStaticField("Shifter", "futureShift") is null)
         {
-            role = new TorRoleInfo(
+            roles.Add(new TorRoleInfo(
                 "Shifter",
                 "modifier",
                 true,
                 BuildWinCondition("Shifter", "modifier"),
-                "Schedule a shift only when the target role is worth the risk and fits the current primary objective.");
-            return true;
+                "Schedule a shift only when the target role is worth the risk and fits the current primary objective."));
         }
 
-        return TryGetRole(player, out role);
+        return roles;
+    }
+
+    internal static bool TryGetAbilityRole(PlayerControl? player, string roleName, out TorRoleInfo role)
+    {
+        role = GetAbilityRoles(player)
+            .FirstOrDefault(candidate => string.Equals(candidate.Name, roleName, StringComparison.Ordinal));
+        return !string.IsNullOrWhiteSpace(role.Name);
     }
 
     internal static IReadOnlyList<TorModifierInfo> GetModifiers(PlayerControl? player)
@@ -328,7 +373,7 @@ internal static class TorRoleAdapter
 
     internal static bool IsAbilityReady(PlayerControl bot, TorRoleInfo role)
     {
-        if (!role.ActiveAbility || !bot || bot.Data is null || bot.Data.IsDead)
+        if (!role.ActiveAbility || !bot || bot.Data is null || bot.Data.IsDead || IsHandcuffed(bot))
         {
             return false;
         }
@@ -346,6 +391,9 @@ internal static class TorRoleAdapter
         return role.Name switch
         {
             "Engineer" => GetStaticInt("Engineer", "remainingFixes") > 0 && HasRepairableEmergency(bot),
+            "Mayor" => GetStaticBool("Mayor", "meetingButton") &&
+                       GetStaticInt("Mayor", "remoteMeetingsLeft") > 0 &&
+                       !HasRepairableEmergency(bot),
             "Portalmaker" => GetStaticField("Portal", "secondPortal") is null,
             "Medic" => !GetStaticBool("Medic", "usedShield"),
             "Deputy" => GetStaticFloat("Deputy", "remainingHandcuffs") > 0.05f,
@@ -368,8 +416,160 @@ internal static class TorRoleAdapter
             "Yoyo" => true,
             "Warlock" => true,
             "Ninja" => true,
+            "Hacker" => GetStaticInt("Hacker", "chargesAdminTable") > 0 ||
+                        GetStaticInt("Hacker", "chargesVitals") > 0,
+            "Medium" => GetStaticCollectionCount("Medium", "deadBodies") > 0,
             _ => true
         };
+    }
+
+    internal static bool HasExclusiveKillAbilityPending(PlayerControl? bot)
+    {
+        return bot && PendingVampireBites.ContainsKey(bot!.PlayerId);
+    }
+
+    internal static bool CanUseOrdinaryMurder(PlayerControl? bot, out string reason)
+    {
+        reason = string.Empty;
+        if (!bot || !EnsureLoaded())
+        {
+            return true;
+        }
+
+        if (IsHandcuffed(bot))
+        {
+            reason = "player is handcuffed by the Deputy and all action buttons are disabled";
+            return false;
+        }
+
+        if (IsRoleOwner(bot!, "Vampire"))
+        {
+            reason = "vampire must use the TOR bite button and delayed resolution";
+            return false;
+        }
+
+        if (IsRoleOwner(bot!, "Janitor"))
+        {
+            reason = "janitor has no ordinary kill button under TOR rules";
+            return false;
+        }
+
+        if (IsRoleOwner(bot!, "Mafioso"))
+        {
+            var godfather = GetStaticField("Godfather", "godfather") as PlayerControl;
+            if (godfather && godfather!.Data is not null && !godfather.Data.IsDead && !godfather.Data.Disconnected)
+            {
+                reason = "mafioso kill button remains locked while the godfather is alive";
+                return false;
+            }
+        }
+
+        if (IsRuleImmobilized(bot))
+        {
+            reason = "player is immobilized by a TOR trap or role rule";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsRoleOwner(PlayerControl bot, string roleName)
+    {
+        var spec = RoleSpecs.FirstOrDefault(candidate => string.Equals(candidate.Name, roleName, StringComparison.Ordinal));
+        if (spec is null)
+        {
+            return false;
+        }
+
+        var owner = GetStaticField(spec.TypeName, spec.OwnerField) as PlayerControl;
+        return owner && owner!.PlayerId == bot.PlayerId;
+    }
+
+    internal static float GetAbilityUseRange(string roleName)
+    {
+        return roleName == "Arsonist" ? 2f : 3.5f;
+    }
+
+    internal static bool IsRuleImmobilized(PlayerControl? player)
+    {
+        if (!player || !EnsureLoaded())
+        {
+            return false;
+        }
+
+        var map = GetStaticField("Trap", "trapPlayerIdMap") as IDictionary;
+        return map?.Contains(player!.PlayerId) == true;
+    }
+
+    internal static bool IsMovementInverted(PlayerControl? player)
+    {
+        if (!player || GetStaticInt("Invert", "meetings") <= 0 ||
+            GetStaticField("Invert", "invert") is not IEnumerable invertedPlayers)
+        {
+            return false;
+        }
+
+        return invertedPlayers.Cast<object>()
+            .OfType<PlayerControl>()
+            .Any(candidate => candidate && candidate.PlayerId == player!.PlayerId);
+    }
+
+    internal static bool IsHandcuffed(PlayerControl? player)
+    {
+        if (!player)
+        {
+            return false;
+        }
+
+        var id = player!.PlayerId;
+        if (GetStaticField("Deputy", "handcuffedKnows") is IDictionary active && active.Contains(id))
+        {
+            return true;
+        }
+
+        return GetStaticField("Deputy", "handcuffedPlayers") is IEnumerable pending &&
+               pending.Cast<object>().Any(value => Convert.ToByte(value) == id);
+    }
+
+    internal static bool AreLoverPartners(PlayerControl? first, PlayerControl? second)
+    {
+        if (!first || !second)
+        {
+            return false;
+        }
+
+        var lover1 = GetStaticField("Lovers", "lover1") as PlayerControl;
+        var lover2 = GetStaticField("Lovers", "lover2") as PlayerControl;
+        if (!lover1 || !lover2)
+        {
+            return false;
+        }
+        var firstPlayer = first!;
+        var secondPlayer = second!;
+        var firstLover = lover1!;
+        var secondLover = lover2!;
+        return (firstLover.PlayerId == firstPlayer.PlayerId && secondLover.PlayerId == secondPlayer.PlayerId) ||
+               (secondLover.PlayerId == firstPlayer.PlayerId && firstLover.PlayerId == secondPlayer.PlayerId);
+    }
+
+    internal static void RegisterConfiguredCooldown(PlayerControl bot, TorRoleInfo role)
+    {
+        if (!bot)
+        {
+            return;
+        }
+
+        var field = role.Name switch
+        {
+            "Deputy" => "handcuffCooldown",
+            "Trickster" => GetStaticBool("JackInTheBox", "boxesConvertedToVents") ? "lightsOutCooldown" : "placeBoxCooldown",
+            "Yoyo" => "markCooldown",
+            "Bomber" => "bombCooldown",
+            _ => "cooldown"
+        };
+        var configured = Mathf.Max(0.05f, GetStaticFloat(role.Name, field));
+        var key = (bot.PlayerId, role.Name);
+        NextRoleAbilityAt[key] = Mathf.Max(NextRoleAbilityAt.GetValueOrDefault(key), Time.time + configured);
     }
 
     internal static bool HasNearbyUsableBody(PlayerControl bot)
@@ -384,6 +584,64 @@ internal static class TorRoleAdapter
                 DeadBodyPerception.IsVisibleAndReportable(body) &&
                 Vector2.Distance(bot.GetTruePosition(), body.TruePosition) <= DeadBodyPerception.GetReportDistance(bot) &&
                 !PhysicsHelpers.AnythingBetween(bot.GetTruePosition(), body.TruePosition, Constants.ShipAndObjectsMask, false));
+    }
+
+    internal static bool TryUseStrategicMeetingVoteAbility(PlayerControl bot, byte desiredVoteId, out string outcome)
+    {
+        outcome = string.Empty;
+        if (!bot || !MeetingHud.Instance || desiredVoteId == 253 || !IsRoleOwner(bot, "Swapper"))
+        {
+            return false;
+        }
+
+        if (GetStaticInt("Swapper", "charges") <= 0 ||
+            GetStaticInt("Swapper", "playerId1") != byte.MaxValue)
+        {
+            return false;
+        }
+
+        var voteAreas = MeetingHud.Instance.playerStates
+            .ToArray()
+            .Where(area => area is not null && !area.AmDead)
+            .ToArray();
+        var desiredArea = voteAreas.FirstOrDefault(area => area.TargetPlayerId == desiredVoteId);
+        if (desiredArea is null)
+        {
+            return false;
+        }
+
+        var counts = voteAreas
+            .Where(area => area.VotedFor >= 0 && area.VotedFor < 253)
+            .GroupBy(area => (byte)area.VotedFor)
+            .ToDictionary(group => group.Key, group => group.Count());
+        var desiredCount = counts.GetValueOrDefault(desiredVoteId);
+        var source = counts
+            .Where(pair => pair.Key != desiredVoteId)
+            .OrderByDescending(pair => pair.Value)
+            .ThenBy(pair => pair.Key)
+            .FirstOrDefault();
+        if (source.Value <= desiredCount || source.Value <= 0)
+        {
+            return false;
+        }
+
+        var sourceArea = voteAreas.FirstOrDefault(area => area.TargetPlayerId == source.Key);
+        if (sourceArea is null ||
+            GetStaticBool("Swapper", "canOnlySwapOthers") &&
+            (source.Key == bot.PlayerId || desiredVoteId == bot.PlayerId))
+        {
+            return false;
+        }
+
+        SendRpc(bot, 129, writer =>
+        {
+            writer.Write(source.Key);
+            writer.Write(desiredVoteId);
+        });
+        InvokeProcedure("swapperSwap", source.Key, desiredVoteId);
+        SetStaticField("Swapper", "charges", GetStaticInt("Swapper", "charges") - 1);
+        outcome = $"swapped current vote leader playerId={source.Key} with evidence-backed target playerId={desiredVoteId}";
+        return true;
     }
 
     internal static DeadBody? FindVisibleUsableBody(PlayerControl bot)
@@ -417,7 +675,7 @@ internal static class TorRoleAdapter
 
     internal static bool CanUseVents(PlayerControl bot, TorRoleInfo role)
     {
-        if (!bot || bot.Data is null) return false;
+        if (!bot || bot.Data is null || IsHandcuffed(bot)) return false;
         return role.Name switch
         {
             "Engineer" => true,
@@ -493,6 +751,33 @@ internal static class TorRoleAdapter
             : $"Your hidden crew role is {role.Name}. You do not automatically know anyone else's hidden role.");
     }
 
+    internal static string BuildPublicDeductionRulebook()
+    {
+        var crew = string.Join(", ", RoleSpecs.Where(role => role.Alignment == "crewmate").Select(role => role.Name));
+        var impostor = string.Join(", ", RoleSpecs.Where(role => role.Alignment == "impostor").Select(role => role.Name));
+        var neutral = string.Join(", ", RoleSpecs.Where(role => role.Alignment == "neutral").Select(role => role.Name));
+        var modifiers = string.Join(", ", ModifierSpecs.Select(modifier => modifier.Name).Distinct(StringComparer.Ordinal));
+        return
+            $"Public TOR role rulebook (possible roles, never secret assignments): crew=[{crew}]; impostor=[{impostor}]; neutral=[{neutral}]; modifiers=[{modifiers}]. " +
+            "Deduction constraints: a witnessed vent proves only a vent-capable role (ordinary impostor, Engineer, or a room-enabled Jackal/Sidekick/Spy/Vulture/Thief); " +
+            "a witnessed kill proves a kill-capable role, which can also be Sheriff, Jackal faction, Vampire, Warlock, Ninja, Thief, Bomber, Arsonist, or another hostile custom role, so use target legality and aftermath to narrow it; " +
+            "a disappearing body can indicate Janitor, Cleaner, Vulture, or another explicit body-removal skill; fake-task standing and task-bar motion alone do not prove crew; " +
+            "Jester wants exile, Arsonist must douse everyone then ignite, Vulture must consume bodies, Lawyer/Prosecutor act around their assigned target, Pursuer prioritizes survival, and Jackal/Sidekick have an independent faction objective. " +
+            "Only infer from personally visible actions and public claims; never read another player's hidden role from engine state.";
+    }
+
+    internal static bool TryGetNearestMediumSoulPosition(PlayerControl bot, out Vector2 position)
+    {
+        if (TryFindMediumSoul(bot, false, out _, out _, out var soulPosition))
+        {
+            position = soulPosition;
+            return true;
+        }
+
+        position = default;
+        return false;
+    }
+
     internal static string BuildStrategicRoleBrief(PlayerControl bot, TorRoleInfo role)
     {
         var live = role.Name switch
@@ -533,6 +818,9 @@ internal static class TorRoleAdapter
 
     internal static void Update()
     {
+        UpdateVirtualBotHandcuffs();
+        UpdateVirtualBotTrapTriggers();
+
         foreach (var pair in PendingDouses.ToArray())
         {
             var bot = FindPlayer(pair.Key);
@@ -562,7 +850,7 @@ internal static class TorRoleAdapter
 
             AddDousedPlayer(target);
             PendingDouses.Remove(pair.Key);
-            NextRoleAbilityAt[(pair.Key, "Arsonist")] = Time.time + Mathf.Max(8f, GetStaticFloat("Arsonist", "cooldown"));
+            NextRoleAbilityAt[(pair.Key, "Arsonist")] = Time.time + Mathf.Max(0.05f, GetStaticFloat("Arsonist", "cooldown"));
             _log?.LogInfo($"DeepBot Arsonist douse completed: bot={Describe(bot)}, target={Describe(target)}, {BuildArsonistProgress(bot)}");
         }
 
@@ -579,7 +867,7 @@ internal static class TorRoleAdapter
                 !bot.Data.IsDead && !target.Data.IsDead && !target.Data.Disconnected &&
                 TryGetRole(bot, out var vampireRole) && vampireRole.Name == "Vampire")
             {
-                if (!TryExecuteRuleAwareMurder(bot, target, out killed, out result))
+                if (!TryExecuteRuleAwareMurder(bot, target, out killed, out result, showAnimation: false))
                 {
                     result = "TOR murder validator unavailable; delayed bite was safely cancelled";
                 }
@@ -594,7 +882,7 @@ internal static class TorRoleAdapter
                 });
                 InvokeProcedure("vampireSetBitten", byte.MaxValue, byte.MaxValue);
                 NextRoleAbilityAt[(bot!.PlayerId, "Vampire")] =
-                    Time.time + Mathf.Max(8f, GetStaticFloat("Vampire", "cooldown"));
+                    Time.time + Mathf.Max(0.05f, GetStaticFloat("Vampire", "cooldown"));
             }
             _log?.LogInfo($"DeepBot Vampire delayed bite resolved: bot={Describe(bot)}, target={Describe(target)}, killed={killed}, result={result}.");
         }
@@ -626,7 +914,7 @@ internal static class TorRoleAdapter
                 .FirstOrDefault();
             if (!forcedTarget) continue;
 
-            var handled = TryExecuteRuleAwareMurder(bot, forcedTarget!, out var killed, out var result);
+            var handled = TryExecuteRuleAwareMurder(bot, forcedTarget!, out var killed, out var result, showAnimation: false);
             ClearWarlockCurse(pair.Key, $"redirected target={Describe(forcedTarget)}, handled={handled}, killed={killed}, result={result}");
         }
 
@@ -663,8 +951,116 @@ internal static class TorRoleAdapter
             });
             InvokeProcedure("yoyoBlink", false, buffer);
             NextRoleAbilityAt[(bot.PlayerId, "Yoyo")] =
-                Time.time + Mathf.Max(8f, GetStaticFloat("Yoyo", "markCooldown"));
+                Time.time + Mathf.Max(0.05f, GetStaticFloat("Yoyo", "markCooldown"));
             _log?.LogInfo($"DeepBot Yoyo strategic return completed: bot={Describe(bot)}.");
+        }
+    }
+
+    private static void UpdateVirtualBotHandcuffs()
+    {
+        if (!EnsureLoaded() || GetStaticField("Deputy", "handcuffedKnows") is not IDictionary active)
+        {
+            return;
+        }
+
+        var pending = GetStaticField("Deputy", "handcuffedPlayers") as IEnumerable;
+        foreach (var bot in PlayerControl.AllPlayerControls.ToArray().Where(player =>
+                     player && player.Data is not null &&
+                     player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal)))
+        {
+            var id = bot.PlayerId;
+            var newlyPending = pending?.Cast<object>().Any(value => Convert.ToByte(value) == id) == true;
+            if (newlyPending && !active.Contains(id))
+            {
+                InvokeRoleMethod("Deputy", "setHandcuffedKnows", true, id);
+                _log?.LogInfo($"DeepBot Deputy handcuff activated: bot={Describe(bot)}, duration={GetStaticFloat("Deputy", "handcuffDuration"):0.0}s.");
+            }
+
+            if (!active.Contains(id))
+            {
+                continue;
+            }
+
+            var remaining = Convert.ToSingle(active[id]) - Time.deltaTime;
+            if (remaining > 0f)
+            {
+                active[id] = remaining;
+                continue;
+            }
+
+            active.Remove(id);
+            InvokeRoleMethod("Deputy", "setHandcuffedKnows", false, id);
+            _log?.LogInfo($"DeepBot Deputy handcuff expired: bot={Describe(bot)}.");
+        }
+    }
+
+    private static void UpdateVirtualBotTrapTriggers()
+    {
+        if (!EnsureLoaded() || AmongUsClient.Instance is null || !AmongUsClient.Instance.AmHost)
+        {
+            return;
+        }
+
+        try
+        {
+            _trapType ??= _assembly?.GetType("TheOtherRoles.Objects.Trap");
+            var traps = _trapType?.GetField("traps", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null) as IEnumerable;
+            if (traps is null)
+            {
+                return;
+            }
+
+            var trapper = GetStaticField("Trapper", "trapper") as PlayerControl;
+            var triggerDistance = UnityEngine.Object.FindObjectsOfType<Vent>()
+                .Where(vent => vent)
+                .Select(vent => vent.UsableDistance * 0.5f)
+                .DefaultIfEmpty(0.7f)
+                .First();
+
+            foreach (var bot in PlayerControl.AllPlayerControls.ToArray().Where(player =>
+                         player && player.Data is not null &&
+                         player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal)))
+            {
+                if (!bot || bot.Data is null || bot.Data.IsDead || bot.Data.Disconnected || bot.inVent || !bot.moveable ||
+                    trapper && trapper!.PlayerId == bot.PlayerId || IsRuleImmobilized(bot))
+                {
+                    continue;
+                }
+
+                foreach (var trap in traps)
+                {
+                    if (trap is null)
+                    {
+                        continue;
+                    }
+
+                    var type = trap.GetType();
+                    var revealed = (bool?)type.GetField("revealed", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(trap) == true;
+                    var triggerable = (bool?)type.GetField("triggerable", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(trap) == true;
+                    var gameObject = type.GetField("trap", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(trap) as GameObject;
+                    var trappedPlayers = type.GetField("trappedPlayer", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(trap) as IEnumerable;
+                    var alreadyTriggered = trappedPlayers?.Cast<object>().OfType<PlayerControl>().Any(player => player && player.PlayerId == bot.PlayerId) == true;
+                    if (revealed || !triggerable || !gameObject || alreadyTriggered ||
+                        Vector2.Distance(bot.GetTruePosition(), gameObject!.transform.position) > triggerDistance)
+                    {
+                        continue;
+                    }
+
+                    var instanceId = Convert.ToByte(type.GetField("instanceId", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(trap) ?? 0);
+                    SendRpc(bot, 163, writer =>
+                    {
+                        writer.Write(bot.PlayerId);
+                        writer.Write(instanceId);
+                    });
+                    InvokeProcedure("triggerTrap", bot.PlayerId, instanceId);
+                    _log?.LogInfo($"DeepBot TOR trap triggered: bot={Describe(bot)}, trap={instanceId}, duration={GetStaticFloat("Trapper", "trapDuration"):0.0}s.");
+                    break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning($"DeepBot TOR virtual trap scan failed safely: {ex.GetBaseException().Message}");
         }
     }
 
@@ -705,6 +1101,8 @@ internal static class TorRoleAdapter
             {
                 case "Engineer":
                     return TryUseEngineerRepair(bot, out outcome);
+                case "Mayor":
+                    return TryUseMayorMeeting(bot, out outcome);
                 case "Portalmaker":
                     return TryPlacePortal(bot, out outcome);
                 case "Medic":
@@ -743,7 +1141,7 @@ internal static class TorRoleAdapter
                     SendRpc(bot, 135, writer => writer.Write(target!.PlayerId));
                     InvokeProcedure("deputyUsedHandcuffs", target!.PlayerId);
                     NextRoleAbilityAt[(bot.PlayerId, role.Name)] =
-                        Time.time + Mathf.Max(8f, GetStaticFloat("Deputy", "handcuffCooldown"));
+                        Time.time + Mathf.Max(0.05f, GetStaticFloat("Deputy", "handcuffCooldown"));
                     outcome = $"handcuffed suspicious nearby player {Describe(target)}";
                     return true;
                 case "Tracker":
@@ -766,6 +1164,10 @@ internal static class TorRoleAdapter
                     InvokeProcedure("camouflagerCamouflage");
                     outcome = "activated camouflage for a planned concealment";
                     return true;
+                case "Hacker":
+                    return TryUseHacker(bot, out outcome);
+                case "Medium":
+                    return TryUseMedium(bot, out outcome);
                 case "Vampire":
                     return TryUseVampireBite(bot, target!, out outcome);
                 case "Warlock":
@@ -783,11 +1185,10 @@ internal static class TorRoleAdapter
                     {
                         if (!TryExecuteRuleAwareMurder(bot, target!, out var killed, out var killOutcome))
                         {
-                            PerformUncheckedMurder(bot, target!);
-                            killed = target!.Data?.IsDead == true;
-                            killOutcome = "unchecked fallback";
+                            outcome = "Jackal attack safely cancelled because TOR's rule validator was unavailable";
+                            return false;
                         }
-                        NextRoleAbilityAt[(bot.PlayerId, role.Name)] = Time.time + Mathf.Max(10f, GetStaticFloat("Jackal", "cooldown"));
+                        NextRoleAbilityAt[(bot.PlayerId, role.Name)] = Time.time + Mathf.Max(0.05f, GetStaticFloat("Jackal", "cooldown"));
                         outcome = killed
                             ? $"Jackal eliminated isolated opponent {Describe(target)} ({killOutcome})"
                             : $"Jackal attack on {Describe(target)} was blocked ({killOutcome})";
@@ -796,11 +1197,10 @@ internal static class TorRoleAdapter
                 case "Sidekick":
                     if (!TryExecuteRuleAwareMurder(bot, target!, out var sidekickKilled, out var sidekickOutcome))
                     {
-                        PerformUncheckedMurder(bot, target!);
-                        sidekickKilled = target!.Data?.IsDead == true;
-                        sidekickOutcome = "unchecked fallback";
+                        outcome = "Sidekick attack safely cancelled because TOR's rule validator was unavailable";
+                        return false;
                     }
-                    NextRoleAbilityAt[(bot.PlayerId, role.Name)] = Time.time + Mathf.Max(10f, GetStaticFloat("Sidekick", "cooldown"));
+                    NextRoleAbilityAt[(bot.PlayerId, role.Name)] = Time.time + Mathf.Max(0.05f, GetStaticFloat("Sidekick", "cooldown"));
                     outcome = sidekickKilled
                         ? $"Sidekick eliminated isolated opponent {Describe(target)} ({sidekickOutcome})"
                         : $"Sidekick attack on {Describe(target)} was blocked ({sidekickOutcome})";
@@ -820,7 +1220,7 @@ internal static class TorRoleAdapter
                     }
                     PendingDouses[bot.PlayerId] = new PendingDouse(
                         target.PlayerId,
-                        Time.time + Mathf.Max(1.5f, GetStaticFloat("Arsonist", "duration")));
+                        Time.time + Mathf.Max(0.05f, GetStaticFloat("Arsonist", "duration")));
                     outcome = $"began channeling douse on {Describe(target)}";
                     return true;
                 case "Pursuer":
@@ -831,7 +1231,7 @@ internal static class TorRoleAdapter
                     });
                     InvokeProcedure("setBlanked", target!.PlayerId, byte.MaxValue);
                     SetStaticField("Pursuer", "blanks", GetStaticInt("Pursuer", "blanks") + 1);
-                    NextRoleAbilityAt[(bot.PlayerId, role.Name)] = Time.time + Mathf.Max(10f, GetStaticFloat("Pursuer", "cooldown"));
+                    NextRoleAbilityAt[(bot.PlayerId, role.Name)] = Time.time + Mathf.Max(0.05f, GetStaticFloat("Pursuer", "cooldown"));
                     outcome = $"blanked {Describe(target)} to protect survival";
                     return true;
                 case "Thief":
@@ -941,7 +1341,7 @@ internal static class TorRoleAdapter
         InvokeProcedure("placePortal", buffer);
         placements.Add(position);
         NextRoleAbilityAt[(bot.PlayerId, "Portalmaker")] =
-            Time.time + Mathf.Max(8f, GetStaticFloat("Portalmaker", "cooldown"));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Portalmaker", "cooldown"));
         outcome = $"placed portal {placements.Count}/2 at {SkeldPathGraph.Instance.NearestNode(position).Id}";
         return true;
     }
@@ -956,7 +1356,7 @@ internal static class TorRoleAdapter
             SendRpc(bot, 148);
             InvokeProcedure("lightsOut");
             NextRoleAbilityAt[(bot.PlayerId, "Trickster")] =
-                Time.time + Mathf.Max(10f, GetStaticFloat("Trickster", "lightsOutCooldown"));
+                Time.time + Mathf.Max(0.05f, GetStaticFloat("Trickster", "lightsOutCooldown"));
             outcome = "activated box-network darkness for a deliberate hostile play";
             return true;
         }
@@ -980,7 +1380,7 @@ internal static class TorRoleAdapter
         InvokeProcedure("placeJackInTheBox", buffer);
         placements.Add(position);
         NextRoleAbilityAt[(bot.PlayerId, "Trickster")] =
-            Time.time + Mathf.Max(8f, GetStaticFloat("Trickster", "placeBoxCooldown"));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Trickster", "placeBoxCooldown"));
         outcome = $"placed Jack-in-the-box {boxes + 1}/{limit} at {SkeldPathGraph.Instance.NearestNode(position).Id}";
         return true;
     }
@@ -1008,7 +1408,7 @@ internal static class TorRoleAdapter
         InvokeProcedure("placeCamera", buffer);
         placements.Add(position);
         NextRoleAbilityAt[(bot.PlayerId, "SecurityGuard")] =
-            Time.time + Mathf.Max(8f, GetStaticFloat("SecurityGuard", "cooldown"));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("SecurityGuard", "cooldown"));
         outcome = $"placed a camera at informative chokepoint {SkeldPathGraph.Instance.NearestNode(position).Id}; screws={remaining - price}";
         return true;
     }
@@ -1028,6 +1428,26 @@ internal static class TorRoleAdapter
             return true;
         }
 
+        if (IsNearGarlic(target))
+        {
+            if (!GetStaticBool("Vampire", "canKillNearGarlics"))
+            {
+                outcome = "bite was blocked because the target is protected by garlic under the room rules";
+                return true;
+            }
+
+            if (!TryExecuteRuleAwareMurder(bot, target, out var killedNearGarlic, out var garlicResult))
+            {
+                outcome = "TOR murder validator unavailable; garlic-proximity attack was safely cancelled";
+                return false;
+            }
+
+            outcome = killedNearGarlic
+                ? $"directly killed {Describe(target)} near garlic as required by TOR rules ({garlicResult})"
+                : $"garlic-proximity attack on {Describe(target)} was blocked ({garlicResult})";
+            return true;
+        }
+
         SendRpc(bot, 133, writer =>
         {
             writer.Write(target.PlayerId);
@@ -1036,9 +1456,32 @@ internal static class TorRoleAdapter
         InvokeProcedure("vampireSetBitten", target.PlayerId, (byte)0);
         PendingVampireBites[bot.PlayerId] = new PendingVampireBite(
             target.PlayerId,
-            Time.time + Mathf.Max(1f, GetStaticFloat("Vampire", "delay")));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Vampire", "delay")));
         outcome = $"bit isolated target {Describe(target)}; delayed kill will resolve after the room-configured delay";
         return true;
+    }
+
+    private static bool IsNearGarlic(PlayerControl target)
+    {
+        var garlicType = _assembly?.GetType("TheOtherRoles.Objects.Garlic");
+        var garlics = garlicType?.GetField("garlics", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null) as IEnumerable;
+        if (garlics is null)
+        {
+            return false;
+        }
+
+        foreach (var garlic in garlics)
+        {
+            var gameObject = garlic?.GetType()
+                .GetField("garlic", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?
+                .GetValue(garlic) as GameObject;
+            if (gameObject && Vector2.Distance(gameObject!.transform.position, target.GetTruePosition()) <= 1.91f)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool TryUseWarlockCurse(PlayerControl bot, PlayerControl target, out string outcome)
@@ -1062,7 +1505,7 @@ internal static class TorRoleAdapter
         SetStaticField("Warlock", "curseVictim", null!);
         SetStaticField("Warlock", "curseVictimTarget", null!);
         NextRoleAbilityAt[(botId, "Warlock")] =
-            Time.time + Mathf.Max(8f, GetStaticFloat("Warlock", "cooldown"));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Warlock", "cooldown"));
         _log?.LogInfo($"DeepBot Warlock curse resolved: bot={Describe(FindPlayer(botId))}, {reason}.");
     }
 
@@ -1104,10 +1547,10 @@ internal static class TorRoleAdapter
         InvokeProcedure("placeNinjaTrace", destinationBuffer);
 
         PendingNinjaReveals[bot.PlayerId] =
-            Time.time + Mathf.Max(1f, GetStaticFloat("Ninja", "invisibleDuration"));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Ninja", "invisibleDuration"));
         SetStaticField("Ninja", "ninjaMarked", null!);
         NextRoleAbilityAt[(bot.PlayerId, "Ninja")] =
-            Time.time + Mathf.Max(8f, GetStaticFloat("Ninja", "cooldown"));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Ninja", "cooldown"));
         outcome = $"assassinated marked target {Describe(marked)} with TOR traces and room-configured invisibility";
         return true;
     }
@@ -1126,9 +1569,159 @@ internal static class TorRoleAdapter
         InvokeProcedure("placeBomb", buffer);
         SetStaticField("Bomber", "isPlanted", true);
         NextRoleAbilityAt[(bot.PlayerId, "Bomber")] =
-            Time.time + Mathf.Max(8f, GetStaticFloat("Bomber", "bombCooldown"));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Bomber", "bombCooldown"));
         outcome = $"planted a room-configured bomb at {SkeldPathGraph.Instance.NearestNode(position).Id} for a deliberate split or elimination";
         return true;
+    }
+
+    private static bool TryUseHacker(PlayerControl bot, out string outcome)
+    {
+        var players = PlayerControl.AllPlayerControls
+            .ToArray()
+            .Where(player => player && player.Data is not null && !player.Data.Disconnected)
+            .ToArray();
+        var dead = players.Where(player => player.Data!.IsDead).ToArray();
+        var vitalsCharges = GetStaticInt("Hacker", "chargesVitals");
+        var adminCharges = GetStaticInt("Hacker", "chargesAdminTable");
+
+        if (dead.Length > 0 && vitalsCharges > 0)
+        {
+            SetStaticField("Hacker", "chargesVitals", vitalsCharges - 1);
+            SetStaticField("Hacker", "hackerTimer", Mathf.Max(0.05f, GetStaticFloat("Hacker", "duration")));
+            outcome = "used one TOR vitals charge; status=" + string.Join(", ", players.Select(player =>
+                $"{Describe(player)}:{(player.Data!.IsDead ? "dead" : "alive")}"));
+            return true;
+        }
+
+        if (adminCharges > 0)
+        {
+            SetStaticField("Hacker", "chargesAdminTable", adminCharges - 1);
+            var occupancy = players
+                .Where(player => !player.Data!.IsDead)
+                .GroupBy(player => SkeldPathGraph.Instance.NearestNode(player.GetTruePosition()).Id)
+                .OrderBy(group => group.Key, StringComparer.Ordinal)
+                .Select(group => $"{group.Key}={group.Count()}");
+            outcome = "used one TOR admin charge; anonymous occupancy by nearest room node=" + string.Join(", ", occupancy);
+            return true;
+        }
+
+        outcome = "no Hacker information charge remains";
+        return false;
+    }
+
+    private static bool TryUseMayorMeeting(PlayerControl bot, out string outcome)
+    {
+        if (MeetingHud.Instance || ExileController.Instance || HasRepairableEmergency(bot) || !bot.moveable)
+        {
+            outcome = "remote meeting blocked by the current TOR/game phase";
+            return false;
+        }
+
+        var remaining = GetStaticInt("Mayor", "remoteMeetingsLeft");
+        if (!GetStaticBool("Mayor", "meetingButton") || remaining <= 0)
+        {
+            outcome = "no room-configured Mayor remote meeting remains";
+            return false;
+        }
+
+        InvokeHelper("handleVampireBiteOnBodyReport");
+        InvokeProcedure("uncheckedCmdReportDeadBody", bot.PlayerId, byte.MaxValue);
+        SendRpc(bot, 109, writer =>
+        {
+            writer.Write(bot.PlayerId);
+            writer.Write(byte.MaxValue);
+        });
+        SetStaticField("Mayor", "remoteMeetingsLeft", remaining - 1);
+        outcome = "called a TOR remote meeting after evidence crossed the Mayor threshold";
+        return true;
+    }
+
+    private static bool TryUseMedium(PlayerControl bot, out string outcome)
+    {
+        if (!TryFindMediumSoul(bot, true, out var tuple, out var deadPlayer, out _))
+        {
+            outcome = "no soul is within TOR's configured interaction range";
+            return false;
+        }
+
+        var deadType = deadPlayer!.GetType();
+        var player = deadType.GetField("player", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(deadPlayer) as PlayerControl;
+        var killer = deadType.GetField("killerIfExisting", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(deadPlayer) as PlayerControl;
+        if (!player)
+        {
+            outcome = "the selected soul no longer has a valid player record";
+            return false;
+        }
+
+        SetStaticField("Medium", "target", deadPlayer);
+        SetStaticField("Medium", "soulTarget", deadPlayer);
+        var mediumType = GetTorType("Medium");
+        var getInfo = mediumType?.GetMethod("getInfo", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        var info = getInfo?.Invoke(null, new object?[] { player, killer }) as string;
+        if (string.IsNullOrWhiteSpace(info))
+        {
+            info = $"Soul information for {Describe(player)} was inconclusive.";
+        }
+
+        if (GetStaticBool("Medium", "oneTimeUse") && GetStaticField("Medium", "deadBodies") is IList souls)
+        {
+            souls.Remove(tuple);
+        }
+        SetStaticField("Medium", "soulTarget", null!);
+        outcome = $"questioned {Describe(player)}'s soul; answer={info}";
+        return true;
+    }
+
+    private static bool TryFindMediumSoul(
+        PlayerControl bot,
+        bool requireNearby,
+        out object? tuple,
+        out object? deadPlayer,
+        out Vector2 position)
+    {
+        tuple = null;
+        deadPlayer = null;
+        position = default;
+        if (!bot || GetStaticField("Medium", "deadBodies") is not IEnumerable souls)
+        {
+            return false;
+        }
+
+        var usableDistance = UnityEngine.Object.FindObjectsOfType<Vent>()
+            .Where(vent => vent)
+            .Select(vent => vent.UsableDistance)
+            .DefaultIfEmpty(1.5f)
+            .First();
+        var botPosition = bot.GetTruePosition();
+        var bestDistance = float.MaxValue;
+        foreach (var candidate in souls)
+        {
+            if (candidate is null)
+            {
+                continue;
+            }
+
+            var candidateType = candidate.GetType();
+            var dp = candidateType.GetProperty("Item1")?.GetValue(candidate);
+            var rawPosition = candidateType.GetProperty("Item2")?.GetValue(candidate);
+            if (dp is null || rawPosition is not Vector3 soulPosition)
+            {
+                continue;
+            }
+
+            var distance = Vector2.Distance(botPosition, soulPosition);
+            if ((requireNearby && distance > usableDistance) || distance >= bestDistance)
+            {
+                continue;
+            }
+
+            tuple = candidate;
+            deadPlayer = dp;
+            position = soulPosition;
+            bestDistance = distance;
+        }
+
+        return tuple is not null;
     }
 
     private static bool TryUseYoyo(PlayerControl bot, out string outcome)
@@ -1150,7 +1743,7 @@ internal static class TorRoleAdapter
             writer.WriteBytesAndSize(buffer);
         });
         InvokeProcedure("yoyoBlink", true, buffer);
-        PendingYoyoReturns[bot.PlayerId] = Time.time + Mathf.Max(1f, GetStaticFloat("Yoyo", "blinkDuration"));
+        PendingYoyoReturns[bot.PlayerId] = Time.time + Mathf.Max(0.05f, GetStaticFloat("Yoyo", "blinkDuration"));
         outcome = "blinked to the marked location and scheduled a room-configured timed return";
         return true;
     }
@@ -1187,7 +1780,7 @@ internal static class TorRoleAdapter
         SendRpc(bot, 162, writer => writer.WriteBytesAndSize(buffer));
         InvokeProcedure("setTrap", buffer);
         NextRoleAbilityAt[(bot.PlayerId, "Trapper")] =
-            Time.time + Mathf.Max(8f, GetStaticFloat("Trapper", "cooldown"));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Trapper", "cooldown"));
         outcome = $"placed an information trap at {SkeldPathGraph.Instance.NearestNode(position).Id}";
         return true;
     }
@@ -1267,6 +1860,11 @@ internal static class TorRoleAdapter
             return false;
         }
 
+        if (AreLoverPartners(bot, target) && (role.IsImpostorTeam || role.IsNeutral))
+        {
+            return false;
+        }
+
         return !role.IsImpostorTeam || target.Data.Role?.IsImpostor != true;
     }
 
@@ -1274,6 +1872,11 @@ internal static class TorRoleAdapter
     {
         if (target.Data?.Role?.IsImpostor == true)
         {
+            var mini = GetStaticField("Mini", "mini") as PlayerControl;
+            if (mini && mini!.PlayerId == target.PlayerId && !InvokeStaticBool("Mini", "isGrownUp"))
+            {
+                return false;
+            }
             return true;
         }
 
@@ -1497,6 +2100,51 @@ internal static class TorRoleAdapter
         }
 
         method.Invoke(null, args);
+    }
+
+    private static void InvokeHelper(string methodName)
+    {
+        if (!EnsureLoaded() || _helpersType is null)
+        {
+            throw new InvalidOperationException("TOR Helpers is unavailable.");
+        }
+
+        var method = _helpersType.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        if (method is null)
+        {
+            throw new MissingMethodException(_helpersType.FullName, methodName);
+        }
+        method.Invoke(null, null);
+    }
+
+    private static bool InvokeStaticBool(string typeName, string methodName)
+    {
+        if (!EnsureLoaded() || _assembly is null)
+        {
+            return false;
+        }
+
+        var type = GetTorType(typeName);
+        var method = type?.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        return method?.Invoke(null, null) is bool value && value;
+    }
+
+    private static object? InvokeRoleMethod(string typeName, string methodName, params object[] args)
+    {
+        var type = GetTorType(typeName);
+        var method = type?.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+        if (method is null)
+        {
+            throw new MissingMethodException(type?.FullName ?? typeName, methodName);
+        }
+        return method.Invoke(null, args);
+    }
+
+    private static Type? GetTorType(string typeName)
+    {
+        return _rootType?.GetNestedType(typeName, BindingFlags.Public | BindingFlags.NonPublic) ??
+               _assembly?.GetType($"TheOtherRoles.{typeName}", false) ??
+               _assembly?.GetType($"TheOtherRoles.Objects.{typeName}", false);
     }
 
     private static bool EnsureLoaded()
