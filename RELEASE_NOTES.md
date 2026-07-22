@@ -1,26 +1,25 @@
 # 0.9.10-tor46-strict-role-rules
 
-- 吸血鬼延迟咬杀改为无位移结算；施术者不会在倒计时结束时瞬移到被害者身边。
-- 炸弹改为宿主权威范围判定，只有 TOR 校验确实死亡的目标才记录炸弹死因。
-- TOR 陷阱与诱饵规则覆盖房主拥有的虚拟 Bot；副警长手铐期间禁止 Bot 击杀、破坏、技能和跳管。
-- 修复真人带反向操作时所有 Bot 一起反向抽搐；Bot 自身带反向操作时会正确补偿输入。
-- 技能冷却在跳管期间继续流逝，会议/真正不可移动状态仍暂停。
-- 亲眼击杀成为本地硬证据；跳管和多种 TOR 特殊动作进入私有会议记忆与全职业公开规则推断。
-- 修复“某人可能是船员”被误判为指认；减少无信息套话，API 无结论时也不会覆盖先前有效投票。
-- 恋人伙伴加入代码与提示词双重保护，敌对技能和普通击杀都不能把已知伴侣当目标。
-- 中立职业不再进入内鬼开局假任务流程；只有真正内鬼使用内鬼开场伪装和无模型后备行为。
-- 普通船员只有亲眼见过击杀或会议明确标记嫌疑后，才会因对方持续接近而中断任务逃跑。
-- 行动/技能模型输出预算提高，减少 Agnes 推理耗尽预算却没有最终 JSON、导致技能长期不用的问题。
-- TOR 等待房间新增 `AI Bot 数量` 1–8，仍由房主唯一生成并驱动。
-- 保留并扩展 44 个 TOR 自定义主职业、2 个原版身份和 11 种附加职业的识别与目标说明。
-- 发布包和源码不包含 API 密钥。
+- Vampire bites now resolve after the configured delay without moving the attacker to the victim.
+- Bombs use host-authoritative range checks and record a bomb death only after TOR confirms the kill.
+- TOR traps and Bait cover host-owned virtual bots. Deputy handcuffs prevent a bot from killing, sabotaging, using abilities, or venting.
+- Fixed the match-wide movement twitch that occurred when a human player had reversed controls. A bot with the modifier now compensates its own input correctly.
+- Ability cooldowns continue while venting, while meetings and genuine immobility states still pause them.
+- Personally witnessed kills become hard local evidence. Vents and multiple TOR special actions enter private meeting memory and role deduction.
+- Supportive crew reads are no longer parsed as accusations. Low-information filler is suppressed, and an inconclusive model response no longer overwrites a valid earlier vote.
+- Known Lover partners are protected by both code and decision policy from intentional kills, hostile abilities, and votes.
+- Neutral roles no longer enter the impostor opening fake-task flow. Only true impostors use impostor cover behavior and its local fallback.
+- Ordinary crewmates interrupt their current goal to evade an approaching player only after personally witnessing a kill or carrying an explicit meeting suspicion.
+- Action and ability response budgets were increased to reduce model outputs that end before returning their final JSON decision.
+- TOR lobby settings now expose an `AI Bot Count` from 1 to 8. Bots remain host-created and host-driven.
+- Preserves and extends recognition of all 44 TOR custom primary roles, 2 base identities, and 11 stackable modifiers.
+- Release archives and source contain no API key.
 
-## 上一版：0.9.9-tor46-full-role-recognition
+## Previous release: 0.9.9-tor46-full-role-recognition
 
-- 补齐 TOR v4.6.0 全部 57 个 `RoleId` 的身份识别，审计 `missing=0`。
-- 新增检察官独立识别、胜利目标和会议策略，不再误当律师。
-- 主职业与 11 种附加职业分离；职业交换者不再覆盖真正主职业。
-- 附加职业被写入 Bot 私有角色提示、能力决策和分配日志。
-- 继续保留 0.9.8 的职业技能仲裁、TOR 规则校验、任务/紧急事件、导航、会议推理和赛后反思。
-- 发布包不包含游戏、第三方 Mod 或 API 密钥。
-
+- Completed identity recognition for all 57 TOR v4.6.0 `RoleId` values, audited with `missing=0`.
+- Added Prosecutor-specific identity, objective, and meeting strategy instead of treating it as Lawyer.
+- Separated primary roles from all 11 modifiers so Role Exchanger no longer overwrites the real primary role.
+- Added modifiers to private role prompts, ability decisions, and assignment logs.
+- Retained the 0.9.8 role-ability arbitration, TOR validation, task and emergency handling, navigation, meeting reasoning, and post-game reflection systems.
+- Release archives contain no game files, third-party mod distribution beyond the documented compatibility package, or API key.
