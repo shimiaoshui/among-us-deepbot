@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>AmongUsDeepSeekBots</AssemblyName>
+    <RootNamespace>AmongUsDeepSeekBots</RootNamespace>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\Release\</OutputPath>
+    <AmongUsDir Condition="'$(AmongUsDir)' == ''">$(AMONG_US_DIR)</AmongUsDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="decompiled_old_1_0\**\*.cs" />
+    <None Remove="decompiled_old_1_0\**\*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="0Harmony" HintPath="$(AmongUsDir)\BepInEx\core\0Harmony.dll" Private="false" />
+    <Reference Include="BepInEx.Core" HintPath="$(AmongUsDir)\BepInEx\core\BepInEx.Core.dll" Private="false" />
+    <Reference Include="BepInEx.Unity.IL2CPP" HintPath="$(AmongUsDir)\BepInEx\core\BepInEx.Unity.IL2CPP.dll" Private="false" />
+    <Reference Include="BepInEx.Unity.Common" HintPath="$(AmongUsDir)\BepInEx\core\BepInEx.Unity.Common.dll" Private="false" />
+    <Reference Include="Il2CppInterop.Runtime" HintPath="$(AmongUsDir)\BepInEx\core\Il2CppInterop.Runtime.dll" Private="false" />
+    <Reference Include="Il2CppInterop.Common" HintPath="$(AmongUsDir)\BepInEx\core\Il2CppInterop.Common.dll" Private="false" />
+    <Reference Include="Assembly-CSharp" HintPath="$(AmongUsDir)\BepInEx\interop\Assembly-CSharp.dll" Private="false" />
+    <Reference Include="UnityEngine" HintPath="$(AmongUsDir)\BepInEx\interop\UnityEngine.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(AmongUsDir)\BepInEx\interop\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.Physics2DModule" HintPath="$(AmongUsDir)\BepInEx\interop\UnityEngine.Physics2DModule.dll" Private="false" />
+    <Reference Include="UnityEngine.InputLegacyModule" HintPath="$(AmongUsDir)\BepInEx\interop\UnityEngine.InputLegacyModule.dll" Private="false" />
+    <Reference Include="UnityEngine.UIModule" HintPath="$(AmongUsDir)\BepInEx\interop\UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="Il2Cppmscorlib" HintPath="$(AmongUsDir)\BepInEx\interop\Il2Cppmscorlib.dll" Private="false" />
+    <Reference Include="Il2CppSystem" HintPath="$(AmongUsDir)\BepInEx\interop\Il2CppSystem.dll" Private="false" />
+    <Reference Include="Hazel" HintPath="$(AmongUsDir)\BepInEx\interop\Hazel.dll" Private="false" />
+  </ItemGroup>
+
+  <Target Name="ValidateAmongUsDir" BeforeTargets="ResolveReferences" Condition="'$(AmongUsDir)' == '' Or !Exists('$(AmongUsDir)\BepInEx\interop\Assembly-CSharp.dll')">
+    <Error Text="Set AMONG_US_DIR or pass /p:AmongUsDir=&quot;path to the Among Us game directory with generated BepInEx interop files&quot;." />
+  </Target>
+</Project>

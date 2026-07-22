@@ -1,0 +1,12 @@
+bin/
+obj/
+release/
+*.user
+*.suo
+*.zip
+*.log
+api-key.txt
+**/api-key.txt
+**/*secret*
+**/*.bak
+
