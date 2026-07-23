@@ -499,8 +499,7 @@ internal sealed class BotMatchMemory
 
     private static bool IsDeepBot(PlayerControl player)
     {
-        return player.Data is not null &&
-            player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal);
+        return DeepBotIdentity.IsBot(player);
     }
 
     private static bool IsImpostor(PlayerControl player)

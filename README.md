@@ -2,7 +2,7 @@
 
 > Turn empty local-lobby slots into independent players that move, observe, deceive, discuss, vote, and learn from failed rounds.
 
-[![Release](https://img.shields.io/badge/release-0.9.10-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
+[![Release](https://img.shields.io/badge/release-0.9.11-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4)](#requirements)
 [![Game](https://img.shields.io/badge/game-Among%20Us-e83b3b)](#)
 [![TOR](https://img.shields.io/badge/The%20Other%20Roles-4.6.0-8a5cff)](#the-other-roles-460-integration)
@@ -10,7 +10,7 @@
 
 **Among Us DeepBot** is a host-authoritative AI player plugin for Among Us local and LAN lobbies. The host can configure between `1` and `8` bots in the lobby. Each bot joins as a real network player, while movement, decisions, and synchronization remain under host control. Human players, bots, and compatible clients can therefore play in the same match.
 
-Current release: `0.9.10-tor46-strict-role-rules`. It includes a standalone build for the base game and a localized The Other Roles v4.6.0 integration build.
+Current release: `0.9.11-lobby-identity-meeting`. It includes a standalone build for the base game and a localized The Other Roles v4.6.0 integration build.
 
 ## More than an auto-walking bot
 
@@ -44,7 +44,17 @@ flowchart LR
 
 DeepBot does not force every bot to play an identical optimal strategy. Personality affects work rate, risk tolerance, trust in testimony, speaking style, and vote thresholds. One bot may rush tasks, another may wander or follow a trusted player, one may trust only eyewitness evidence, and another may be persuaded by a credible account.
 
-## Highlights in 0.9.10
+## Highlights in 0.9.11
+
+- The TOR lobby settings now configure each of up to eight bots independently: display name, color, outfit, and nameplate.
+- Bot identity is tied to reserved virtual-client ownership instead of the visible `DeepBot N` prefix. Renaming a bot no longer disables movement, tasks, meetings, abilities, camera isolation, or TOR interactions.
+- Duplicate configured names are disambiguated deterministically, such as `Echo` and `Echo 6`, so overlapping role labels cannot make two players look like one player with multiple primary roles.
+- Meeting prompts isolate each bot's private timeline from every other bot. Public chat remains hearsay unless the receiving bot personally witnessed the event.
+- Unsupported claims such as asking for another player's "murder route" are rewritten into an honest suspicion or a direct eyewitness accusation only when that bot actually witnessed the kill.
+- Bot-to-bot messages no longer recursively trigger every bot to call the model again. A bot reconsiders another bot's line only when directly addressed or when its current vote candidate is discussed; human statements still update every bot's beliefs and vote.
+- Secret impostor kill details cannot be presented as public corpse locations, timing, routes, or eyewitness facts until the same information has been disclosed publicly.
+
+The release also retains the strict TOR rule integration introduced in 0.9.10:
 
 - Host-created bots synchronize to clients without duplicating bots or stealing a human player's camera and controls.
 - Vampire bites resolve after the configured delay without teleporting the Vampire to the victim.
@@ -70,8 +80,8 @@ See the [complete TOR 4.6.0 role coverage matrix](docs/TOR-4.6.0-全职业覆盖
 
 Open [GitHub Releases](https://github.com/shimiaoshui/among-us-deepbot/releases/latest) and choose one package:
 
-- `AmongUs-DeepBot-0.9.10-Standalone.zip`: base Among Us with BepInEx 6.
-- `AmongUs-DeepBot-0.9.10-TOR46-Strict-Rules.zip`: strict TOR 4.6.0 integration. Every human player in the same lobby must install the identical compatibility package.
+- `AmongUs-DeepBot-0.9.11-Standalone.zip`: base Among Us with BepInEx 6.
+- `AmongUs-DeepBot-0.9.11-TOR46-Lobby-Identity-Meeting.zip`: strict TOR 4.6.0 integration with per-bot appearance settings and meeting evidence isolation. Every human player in the same lobby must install the identical compatibility package.
 
 Basic installation:
 

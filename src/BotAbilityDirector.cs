@@ -1001,9 +1001,7 @@ internal sealed class BotAbilityDirector
     {
         foreach (var player in PlayerControl.AllPlayerControls)
         {
-            if (player &&
-                player.Data is not null &&
-                player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+            if (DeepBotIdentity.IsBot(player))
             {
                 yield return player;
             }

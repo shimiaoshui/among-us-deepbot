@@ -235,7 +235,7 @@ internal sealed class BotSocialDirector
         var clean = text.Trim();
         var sourceId = source ? source.PlayerId : byte.MaxValue;
         var sourceName = source && source.Data is not null ? source.Data.PlayerName : "Unknown";
-        var isBotSource = sourceName.StartsWith("DeepBot ", StringComparison.Ordinal);
+        var isBotSource = source && DeepBotIdentity.IsBot(source);
         _transcript.Add(new TranscriptEntry(sourceId, sourceName, clean));
         TrimTranscript();
         _transcriptVersion++;
@@ -533,7 +533,7 @@ internal sealed class BotSocialDirector
                 !state.DecisionInFlight &&
                 !state.DecisionCompleted &&
                 state.DecisionRounds < MaxMeetingDecisionRoundsPerBot &&
-                NeedsAnotherMeetingDecision(state) &&
+                NeedsAnotherMeetingDecision(bot, state) &&
                 Time.time >= state.SpeakAt)
             {
                 RequestMeetingDecision(bot, state, config);
@@ -574,10 +574,7 @@ internal sealed class BotSocialDirector
                 var conversationStillChanging =
                     Time.time - _lastTranscriptAt < VoteQuietSeconds ||
                     (canReconsider &&
-                     (state.HumanReconsiderRequested ||
-                      BotBehaviorPolicy.HasUnanalyzedMeetingTranscript(
-                          state.LastAnalyzedTranscriptVersion,
-                          _transcriptVersion)));
+                     NeedsAnotherMeetingDecision(bot, state));
                 if (state.DecisionInFlight || state.DecisionCompleted || conversationStillChanging)
                 {
                     state.VoteAt = Time.time + 1f;
@@ -695,7 +692,7 @@ internal sealed class BotSocialDirector
             ? "no meeting chat yet"
             : string.Join("\n", _transcript.TakeLast(20).Select(entry => $"{entry.Name}({entry.PlayerId}): {entry.Text}"));
         var latestHuman = _transcript.LastOrDefault(entry =>
-            !entry.Name.StartsWith("DeepBot ", StringComparison.Ordinal));
+            !DeepBotIdentity.IsBotPlayerId(entry.PlayerId));
         var conversationFocus = latestHuman is null
             ? "No newer human statement; compare the current evidence ledger with earlier bot claims."
             : $"Latest human statement: {latestHuman.Name}({latestHuman.PlayerId}): {latestHuman.Text}. " +
@@ -790,7 +787,7 @@ internal sealed class BotSocialDirector
         state.DecisionCompleted = false;
         state.DecisionApplied = false;
         if (state.DecisionRounds < MaxMeetingDecisionRoundsPerBot &&
-            NeedsAnotherMeetingDecision(state))
+            NeedsAnotherMeetingDecision(bot, state))
         {
             state.SpeakAt = Time.time + UnityEngine.Random.Range(1.4f, 3.2f);
         }
@@ -802,6 +799,12 @@ internal sealed class BotSocialDirector
         if (string.IsNullOrWhiteSpace(line))
         {
             return;
+        }
+
+        line = EnforcePrivateEvidenceBoundary(bot, line, out var evidenceRewritten);
+        if (evidenceRewritten)
+        {
+            source += "-evidence-guard";
         }
 
         try
@@ -827,6 +830,43 @@ internal sealed class BotSocialDirector
         {
             _injectingChat = false;
         }
+    }
+
+    private string EnforcePrivateEvidenceBoundary(PlayerControl bot, string line, out bool rewritten)
+    {
+        rewritten = false;
+        var referencedTarget = EnumerateLivingPlayers()
+            .FirstOrDefault(player => player.PlayerId != bot.PlayerId && MentionsPlayer(line, player));
+        if (referencedTarget is null)
+        {
+            var previousSpeaker = _transcript.LastOrDefault(entry => entry.PlayerId != bot.PlayerId);
+            if (previousSpeaker is not null)
+            {
+                referencedTarget = FindPlayer(previousSpeaker.PlayerId);
+            }
+        }
+
+        var hasPersonalWitness = _memory.TryGetLatestWitnessedKiller(bot.PlayerId, out var witnessedKillerId);
+        var referencedTargetMatchesWitness = referencedTarget is null || referencedTarget.PlayerId == witnessedKillerId;
+        if (!BotBehaviorPolicy.ShouldRewriteUnsupportedMurderFact(
+                line,
+                hasPersonalWitness,
+                referencedTargetMatchesWitness))
+        {
+            return line;
+        }
+
+        rewritten = true;
+        var targetName = referencedTarget?.Data?.PlayerName;
+        var replacement = hasPersonalWitness && referencedTargetMatchesWitness && !string.IsNullOrWhiteSpace(targetName)
+            ? $"我亲眼看见{targetName}动手，我会投{targetName}。"
+            : string.IsNullOrWhiteSpace(targetName)
+                ? "我没有亲眼看到击杀，只能按公开发言和路线判断。"
+                : $"我没有亲眼看见{targetName}杀人，只是怀疑。{targetName}请解释上一轮的位置。";
+        _log.LogWarning(
+            $"DeepBot meeting evidence guard rewrote unsupported private claim: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+            $"target={targetName ?? "unknown"}, original={line}, replacement={replacement}");
+        return replacement;
     }
 
     private void TrySendHumanReaction(PlayerControl bot, SocialState state)
@@ -1332,13 +1372,36 @@ internal sealed class BotSocialDirector
         }
     }
 
-    private bool NeedsAnotherMeetingDecision(SocialState state)
+    private bool NeedsAnotherMeetingDecision(PlayerControl bot, SocialState state)
     {
-        return state.DecisionRounds == 0 ||
-            state.HumanReconsiderRequested ||
-            BotBehaviorPolicy.HasUnanalyzedMeetingTranscript(
+        if (state.DecisionRounds == 0 || state.HumanReconsiderRequested)
+        {
+            return true;
+        }
+
+        if (!BotBehaviorPolicy.HasUnanalyzedMeetingTranscript(
                 state.LastAnalyzedTranscriptVersion,
-                _transcriptVersion);
+                _transcriptVersion) ||
+            _transcript.Count == 0)
+        {
+            return false;
+        }
+
+        var latest = _transcript[^1];
+        if (!DeepBotIdentity.IsBotPlayerId(latest.PlayerId))
+        {
+            return true;
+        }
+
+        var directlyAddressesBot = MentionsPlayer(latest.Text, bot);
+        var currentCandidate = state.MeetingDecision?.VotePlayerId is >= byte.MinValue and <= byte.MaxValue
+            ? FindPlayer((byte)state.MeetingDecision.VotePlayerId.Value)
+            : null;
+        var mentionsCurrentCandidate = currentCandidate is not null &&
+            MentionsPlayer(latest.Text, currentCandidate);
+        return BotBehaviorPolicy.ShouldReconsiderBotMeetingLine(
+            directlyAddressesBot,
+            mentionsCurrentCandidate);
     }
 
     private static string NormalizeFollowIntent(string? value)
@@ -1534,9 +1597,7 @@ internal sealed class BotSocialDirector
     {
         foreach (var player in PlayerControl.AllPlayerControls)
         {
-            if (player &&
-                player.Data is not null &&
-                player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+            if (DeepBotIdentity.IsBot(player))
             {
                 yield return player;
             }
