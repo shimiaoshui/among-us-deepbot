@@ -308,6 +308,48 @@ internal static class BotBehaviorPolicy
             : Mathf.Max(0f, currentCooldown - Mathf.Max(0f, elapsedSeconds));
     }
 
+    public static bool ShouldRewriteUnsupportedMurderFact(
+        string? line,
+        bool hasPersonalWitness,
+        bool referencedTargetMatchesWitness)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        string[] unsupportedFactPhrases =
+        [
+            "你杀人的", "把你杀人", "你的杀人", "你杀了", "你刀了", "你刚杀", "你行凶",
+            "你动刀", "你杀完", "亲眼看见你", "亲眼看到你", "我看见你杀", "我看到你杀"
+        ];
+        var containsUnsupportedFact = unsupportedFactPhrases.Any(phrase =>
+            line.Contains(phrase, StringComparison.OrdinalIgnoreCase));
+        return IsMurderRouteAssumption(line) ||
+               (containsUnsupportedFact && (!hasPersonalWitness || !referencedTargetMatchesWitness));
+    }
+
+    public static bool IsMurderRouteAssumption(string? line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        string[] phrases =
+        [
+            "杀人的路线", "杀人路线", "杀完人的路线", "作案路线", "行凶路线", "凶手路线"
+        ];
+        return phrases.Any(phrase => line.Contains(phrase, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public static bool ShouldReconsiderBotMeetingLine(
+        bool directlyAddressesBot,
+        bool mentionsCurrentCandidate)
+    {
+        return directlyAddressesBot || mentionsCurrentCandidate;
+    }
+
     public static void LogSelfTest(ManualLogSource log)
     {
         var distributionOk =
@@ -407,6 +449,22 @@ internal static class BotBehaviorPolicy
             !CanReleasePostMurderMovement(0.5f, 0.9f, false) &&
             !CanReleasePostMurderMovement(1f, 0.9f, true) &&
             CanReleasePostMurderMovement(1f, 0.9f, false);
+        var configurableAppearanceValid =
+            DeepBotAppearance.ResolveName(0, 0) == "DeepBot 1" &&
+            DeepBotAppearance.ResolveName(0, 1) == "Alpha" &&
+            DeepBotIdentity.IsReservedClientId(64) &&
+            DeepBotIdentity.IsReservedClientId(95) &&
+            !DeepBotIdentity.IsReservedClientId(63) &&
+            !DeepBotIdentity.IsReservedClientId(96);
+        var privateEvidenceBoundaryValid =
+            ShouldRewriteUnsupportedMurderFact("把你杀人的路线说一下", false, false) &&
+            ShouldRewriteUnsupportedMurderFact("说一下你的作案路线", true, true) &&
+            ShouldRewriteUnsupportedMurderFact("我看到你杀人了", true, false) &&
+            !ShouldRewriteUnsupportedMurderFact("我怀疑你，请解释路线", false, false) &&
+            !ShouldRewriteUnsupportedMurderFact("我亲眼看到你杀人", true, true) &&
+            ShouldReconsiderBotMeetingLine(true, false) &&
+            ShouldReconsiderBotMeetingLine(false, true) &&
+            !ShouldReconsiderBotMeetingLine(false, false);
         var level = distributionOk &&
                     validArrival &&
                     wrongRoomRejected &&
@@ -430,7 +488,9 @@ internal static class BotBehaviorPolicy
                     meetingResponderSchedulingValid &&
                     visionDistanceRepairValid &&
                     hostViewRestoreValid &&
-                    postMurderEscapeGateValid
+                    postMurderEscapeGateValid &&
+                    configurableAppearanceValid &&
+                    privateEvidenceBoundaryValid
             ? "ok"
             : "warning";
         log.LogInfo(
@@ -446,6 +506,7 @@ internal static class BotBehaviorPolicy
             $"independentEmergency={independentEmergencyValid}, meetingThresholds={meetingThresholdsValid}, " +
             $"meetingReconsideration={meetingReconsiderationValid}, meetingAliases={meetingAliasesValid}, " +
             $"humanReactionScheduling={meetingResponderSchedulingValid}, visionDistanceRepair={visionDistanceRepairValid}, " +
-            $"hostViewRestore={hostViewRestoreValid}, postMurderEscapeGate={postMurderEscapeGateValid}");
+            $"hostViewRestore={hostViewRestoreValid}, postMurderEscapeGate={postMurderEscapeGateValid}, " +
+            $"configurableAppearance={configurableAppearanceValid}, privateEvidenceBoundary={privateEvidenceBoundaryValid}");
     }
 }

@@ -1,4 +1,4 @@
-Among Us DeepBot 原版包
+Among Us DeepBot 0.9.11 原版包
 
 适用：原版 Among Us + BepInEx 6 IL2CPP。
 先安装 BepInEx 并启动游戏一次，再运行 Install-DeepBot.cmd。

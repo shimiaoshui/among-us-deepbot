@@ -12,9 +12,6 @@ namespace AmongUsDeepSeekBots;
 
 internal sealed class SafeLocalBotSpawner
 {
-    private const int LocalBotClientIdStart = 64;
-    private const int LocalBotClientIdEnd = 95;
-
     private static readonly MethodInfo? CreatePlayerMethod =
         AccessTools.Method(typeof(AmongUsClient), "CreatePlayer");
 
@@ -32,6 +29,7 @@ internal sealed class SafeLocalBotSpawner
     private readonly HashSet<byte> _visibilityRestored = [];
     private readonly HashSet<byte> _renderDiagnosticsLogged = [];
     private readonly HashSet<byte> _disabledBotLightIds = [];
+    private readonly Dictionary<int, string> _appliedLobbyAppearances = [];
     private float _nextSpawnAt;
     private float _nextStatusAt;
     private float _nextGuestStatusAt;
@@ -80,6 +78,10 @@ internal sealed class SafeLocalBotSpawner
             existingCount = CountManagedClients(client);
         }
         ConfigureTrackedClients(client);
+        if (client.GameState != InnerNetClient.GameStates.Started)
+        {
+            RefreshLobbyAppearances(client);
+        }
         EnsureHostLocalPlayer(client, "spawner tick");
 
         if (Time.time >= _nextStatusAt)
@@ -108,10 +110,7 @@ internal sealed class SafeLocalBotSpawner
                 continue;
             }
 
-            var name = candidate.Character && candidate.Character.Data is not null
-                ? candidate.Character.Data.PlayerName
-                : candidate.PlayerName;
-            if (TryParseBotIndex(name, out var botIndex))
+            if (DeepBotIdentity.TryGetBotIndex(candidate, out var botIndex))
             {
                 managed.Add((i, candidate, botIndex));
             }
@@ -129,6 +128,7 @@ internal sealed class SafeLocalBotSpawner
             }
             client.allClients.RemoveAt(item.ClientListIndex);
             _tracked.RemoveAll(tracked => tracked.ClientId == item.Client.Id);
+            _appliedLobbyAppearances.Remove(item.Client.Id);
             _log.LogInfo($"DeepBot lobby roster reduced: removed=DeepBot {item.BotIndex + 1}, target={targetCount}.");
         }
     }
@@ -164,7 +164,8 @@ internal sealed class SafeLocalBotSpawner
             return;
         }
 
-        var displayName = $"DeepBot {botIndex + 1}";
+        var appearance = TorRoleAdapter.GetLobbyAppearance(botIndex);
+        var displayName = ResolveUniqueLobbyName(botIndex, appearance.NameSelection);
         var platform = new PlatformSpecificData
         {
             Platform = Platforms.StandaloneSteamPC,
@@ -213,7 +214,8 @@ internal sealed class SafeLocalBotSpawner
                 continue;
             }
 
-            var name = $"DeepBot {tracked.Index + 1}";
+            var appearance = TorRoleAdapter.GetLobbyAppearance(tracked.Index);
+            var name = ResolveUniqueLobbyName(tracked.Index, appearance.NameSelection);
             tracked.Client.InScene = true;
             tracked.Client.IsReady = true;
             tracked.Client.IsBeingCreated = false;
@@ -226,7 +228,7 @@ internal sealed class SafeLocalBotSpawner
             character.SetName(name);
             character.RpcSetName(name);
 
-            var color = (tracked.Index + 1) % Palette.PlayerColors.Length;
+            var color = DeepBotAppearance.ResolveColor(tracked.Index, appearance.ColorSelection);
             character.SetColor(color);
             character.RpcSetColor((byte)color);
             character.NetTransform.SnapTo(GetSpawnPoint(tracked.Index));
@@ -241,6 +243,76 @@ internal sealed class SafeLocalBotSpawner
 
             _tracked.RemoveAt(i);
         }
+    }
+
+    private void RefreshLobbyAppearances(AmongUsClient client)
+    {
+        for (var i = 0; i < client.allClients.Count; i++)
+        {
+            var candidate = client.allClients[i];
+            if (!DeepBotIdentity.TryGetBotIndex(candidate, out var botIndex) ||
+                candidate.Character is not { } character ||
+                !character ||
+                character.Data is null)
+            {
+                continue;
+            }
+
+            var appearance = TorRoleAdapter.GetLobbyAppearance(botIndex);
+            var name = ResolveUniqueLobbyName(botIndex, appearance.NameSelection);
+            var color = DeepBotAppearance.ResolveColor(botIndex, appearance.ColorSelection);
+            var gameId = appearance.OutfitSelection == 3 || appearance.NamePlateSelection == 3 ? client.GameId : 0;
+            var signature = $"{name}:{appearance.NameSelection}:{appearance.ColorSelection}:{appearance.OutfitSelection}:{appearance.NamePlateSelection}:{gameId}";
+            if (_appliedLobbyAppearances.TryGetValue(candidate.Id, out var applied) && applied == signature)
+            {
+                continue;
+            }
+
+            candidate.PlayerName = name;
+            character.Data.PlayerName = name;
+            character.SetName(name);
+            character.RpcSetName(name);
+            character.SetColor(color);
+            character.RpcSetColor((byte)color);
+            DeepBotAppearance.ApplyOutfit(character, _hostPlayer, botIndex, appearance.OutfitSelection, _log);
+            DeepBotAppearance.ApplyNamePlate(character, _hostPlayer, botIndex, appearance.NamePlateSelection, _log);
+            _appliedLobbyAppearances[candidate.Id] = signature;
+            _log.LogInfo(
+                $"DeepBot lobby appearance applied: bot={botIndex + 1}, client={candidate.Id}, " +
+                $"name={name}, color={color}, outfit={appearance.OutfitSelection}, nameplate={appearance.NamePlateSelection}.");
+        }
+    }
+
+    private static string ResolveUniqueLobbyName(int botIndex, int nameSelection)
+    {
+        var configuredName = DeepBotAppearance.ResolveName(botIndex, nameSelection);
+        var collidesWithEarlierBot = false;
+        for (var earlierIndex = 0; earlierIndex < botIndex; earlierIndex++)
+        {
+            var earlierAppearance = TorRoleAdapter.GetLobbyAppearance(earlierIndex);
+            var earlierName = DeepBotAppearance.ResolveName(earlierIndex, earlierAppearance.NameSelection);
+            if (string.Equals(earlierName, configuredName, StringComparison.OrdinalIgnoreCase))
+            {
+                collidesWithEarlierBot = true;
+                break;
+            }
+        }
+
+        var collidesWithHuman = false;
+        foreach (var player in PlayerControl.AllPlayerControls)
+        {
+            if (player &&
+                player.Data is not null &&
+                !DeepBotIdentity.IsBot(player) &&
+                string.Equals(player.Data.PlayerName, configuredName, StringComparison.OrdinalIgnoreCase))
+            {
+                collidesWithHuman = true;
+                break;
+            }
+        }
+        return collidesWithEarlierBot || collidesWithHuman
+            ? $"{configuredName} {botIndex + 1}"
+            : configuredName;
     }
 
     private static void StartCreatePlayerCoroutine(AmongUsClient client, object? created, ClientData botClient)
@@ -326,7 +398,7 @@ internal sealed class SafeLocalBotSpawner
                 candidate.Id != client.ClientId ||
                 !candidate.Character ||
                 candidate.Character.Data is null ||
-                candidate.Character.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+                DeepBotIdentity.IsBot(candidate.Character))
             {
                 continue;
             }
@@ -338,7 +410,7 @@ internal sealed class SafeLocalBotSpawner
         var local = PlayerControl.LocalPlayer;
         if (local &&
             local.Data is not null &&
-            !local.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal) &&
+            !DeepBotIdentity.IsBot(local) &&
             local.OwnerId == client.ClientId)
         {
             _hostPlayer = local;
@@ -352,7 +424,7 @@ internal sealed class SafeLocalBotSpawner
             !host ||
             host.Data is null ||
             host.OwnerId != client.ClientId ||
-            host.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+            DeepBotIdentity.IsBot(host))
         {
             CaptureHostPlayer(client);
             host = _hostPlayer;
@@ -397,7 +469,7 @@ internal sealed class SafeLocalBotSpawner
             (replacedPlayer is not null &&
              replacedPlayer &&
              replacedPlayer.Data is not null &&
-             replacedPlayer.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal));
+                DeepBotIdentity.IsBot(replacedPlayer));
         if (!recoverMissingOrBotTarget)
         {
             return;
@@ -450,7 +522,7 @@ internal sealed class SafeLocalBotSpawner
             !host ||
             host.Data is null ||
             host.OwnerId != client.ClientId ||
-            host.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+            DeepBotIdentity.IsBot(host))
         {
             return;
         }
@@ -529,7 +601,7 @@ internal sealed class SafeLocalBotSpawner
                 !character ||
                 character == host ||
                 character.Data is null ||
-                !character.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+                !DeepBotIdentity.IsBot(character))
             {
                 continue;
             }
@@ -740,9 +812,7 @@ internal sealed class SafeLocalBotSpawner
             var candidate = client.allClients[i];
             if (candidate is not null &&
                 candidate.Id != client.ClientId &&
-                (IsReservedBotClientId(candidate.Id) ||
-                    candidate.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal) ||
-                    (candidate.Character && candidate.Character.Data is not null && candidate.Character.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))))
+                DeepBotIdentity.IsBot(candidate))
             {
                 managedIds.Add(candidate.Id);
             }
@@ -767,12 +837,7 @@ internal sealed class SafeLocalBotSpawner
                 continue;
             }
 
-            if (TryParseBotIndex(candidate.PlayerName, out var index))
-            {
-                occupied.Add(index);
-            }
-
-            if (candidate.Character && candidate.Character.Data is not null && TryParseBotIndex(candidate.Character.Data.PlayerName, out index))
+            if (DeepBotIdentity.TryGetBotIndex(candidate, out var index))
             {
                 occupied.Add(index);
             }
@@ -794,20 +859,9 @@ internal sealed class SafeLocalBotSpawner
         return occupied.Count == 0 ? 0 : occupied.Max() + 1;
     }
 
-    private static bool TryParseBotIndex(string? name, out int index)
-    {
-        index = -1;
-        if (string.IsNullOrWhiteSpace(name) || !name.StartsWith("DeepBot ", StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        return int.TryParse(name["DeepBot ".Length..], out var oneBased) && oneBased > 0 && (index = oneBased - 1) >= 0;
-    }
-
     private static int FindAvailableClientId(AmongUsClient client)
     {
-        for (var id = LocalBotClientIdStart; id <= LocalBotClientIdEnd; id++)
+        for (var id = DeepBotIdentity.ReservedClientIdStart; id <= DeepBotIdentity.ReservedClientIdEnd; id++)
         {
             var used = false;
             for (var i = 0; i < client.allClients.Count; i++)
@@ -826,11 +880,6 @@ internal sealed class SafeLocalBotSpawner
         }
 
         return -1;
-    }
-
-    private static bool IsReservedBotClientId(int id)
-    {
-        return id is >= LocalBotClientIdStart and <= LocalBotClientIdEnd;
     }
 
     private static void AssignRuntimeOwnership(AmongUsClient client, PlayerControl player, int virtualClientId)
@@ -855,6 +904,7 @@ internal sealed class SafeLocalBotSpawner
         _visibilityRestored.Clear();
         _renderDiagnosticsLogged.Clear();
         _disabledBotLightIds.Clear();
+        _appliedLobbyAppearances.Clear();
         _hostLightRepairLogged = false;
     }
 

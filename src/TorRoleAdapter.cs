@@ -131,6 +131,55 @@ internal static class TorRoleAdapter
         return Mathf.Clamp(fallback, 1, 8);
     }
 
+    internal static DeepBotAppearanceSettings GetLobbyAppearance(int botIndex)
+    {
+        if (botIndex is < 0 or >= 8 || !EnsureLoaded() || _assembly is null)
+        {
+            return DeepBotAppearanceSettings.Default;
+        }
+
+        try
+        {
+            var holder = _assembly.GetType("TheOtherRoles.CustomOptionHolder", false);
+            if (holder is null || ReadOptionSelection(holder, "deepBotAppearanceEnabled") <= 0)
+            {
+                return DeepBotAppearanceSettings.Default;
+            }
+
+            return new DeepBotAppearanceSettings(
+                ReadArrayOptionSelection(holder, "deepBotNames", botIndex),
+                ReadArrayOptionSelection(holder, "deepBotColors", botIndex),
+                ReadArrayOptionSelection(holder, "deepBotOutfits", botIndex),
+                ReadArrayOptionSelection(holder, "deepBotNamePlates", botIndex));
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning($"DeepBot lobby appearance read failed for bot {botIndex + 1}: {ex.GetBaseException().Message}");
+            return DeepBotAppearanceSettings.Default;
+        }
+    }
+
+    private static int ReadOptionSelection(Type holder, string fieldName)
+    {
+        var option = holder.GetField(fieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null);
+        var getter = option?.GetType().GetMethod("getSelection", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        return getter?.Invoke(option, null) is int selection ? selection : 0;
+    }
+
+    private static int ReadArrayOptionSelection(Type holder, string fieldName, int index)
+    {
+        if (holder.GetField(fieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)?.GetValue(null) is not Array options ||
+            index < 0 ||
+            index >= options.Length)
+        {
+            return 0;
+        }
+
+        var option = options.GetValue(index);
+        var getter = option?.GetType().GetMethod("getSelection", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        return getter?.Invoke(option, null) is int selection ? selection : 0;
+    }
+
     /// <summary>
     /// Routes an ordinary bot kill through TOR's own murder validator.  This
     /// preserves modifier/role rules such as the ungrown Mini, Medic shield,
@@ -343,9 +392,7 @@ internal static class TorRoleAdapter
 
         foreach (var player in PlayerControl.AllPlayerControls)
         {
-            if (!player ||
-                player.Data is null ||
-                !player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+            if (!DeepBotIdentity.IsBot(player))
             {
                 continue;
             }
@@ -964,9 +1011,7 @@ internal static class TorRoleAdapter
         }
 
         var pending = GetStaticField("Deputy", "handcuffedPlayers") as IEnumerable;
-        foreach (var bot in PlayerControl.AllPlayerControls.ToArray().Where(player =>
-                     player && player.Data is not null &&
-                     player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal)))
+        foreach (var bot in PlayerControl.AllPlayerControls.ToArray().Where(DeepBotIdentity.IsBot))
         {
             var id = bot.PlayerId;
             var newlyPending = pending?.Cast<object>().Any(value => Convert.ToByte(value) == id) == true;
@@ -1017,9 +1062,7 @@ internal static class TorRoleAdapter
                 .DefaultIfEmpty(0.7f)
                 .First();
 
-            foreach (var bot in PlayerControl.AllPlayerControls.ToArray().Where(player =>
-                         player && player.Data is not null &&
-                         player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal)))
+            foreach (var bot in PlayerControl.AllPlayerControls.ToArray().Where(DeepBotIdentity.IsBot))
             {
                 if (!bot || bot.Data is null || bot.Data.IsDead || bot.Data.Disconnected || bot.inVent || !bot.moveable ||
                     trapper && trapper!.PlayerId == bot.PlayerId || IsRuleImmobilized(bot))

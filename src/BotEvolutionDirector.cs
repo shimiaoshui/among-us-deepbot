@@ -183,7 +183,7 @@ internal sealed class BotEvolutionDirector
                 ? $"TOR:{torRole.Name}/{torRole.Alignment}"
                 : $"native:{player.Data.Role?.NiceName}";
             players.Add(new FinalPlayerSnapshot(player.PlayerId, player.Data.PlayerName, role, !player.Data.IsDead));
-            if (player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+            if (DeepBotIdentity.IsBot(player))
             {
                 bots.Add(new FinalBotSnapshot(
                     player.PlayerId,
@@ -259,8 +259,7 @@ internal sealed class BotEvolutionDirector
     {
         foreach (var player in PlayerControl.AllPlayerControls)
         {
-            if (player && player.Data is not null &&
-                player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+            if (DeepBotIdentity.IsBot(player))
             {
                 yield return player;
             }

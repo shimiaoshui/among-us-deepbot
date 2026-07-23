@@ -1932,7 +1932,7 @@ internal sealed class BotActionDirector
                 continue;
             }
 
-            var otherIsDeepBot = player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal);
+            var otherIsDeepBot = DeepBotIdentity.IsBot(player);
             if (otherIsDeepBot && player.PlayerId > bot.PlayerId)
             {
                 // Deterministic right-of-way prevents two bots in a narrow doorway
@@ -4002,7 +4002,7 @@ internal sealed class BotActionDirector
                         !IsImpostor(other) &&
                         CanObservePlayer(killer, other) &&
                         Vector2.Distance(position, other.GetTruePosition()) <= 3.8f);
-                var isBotVictim = player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal);
+                var isBotVictim = DeepBotIdentity.IsBot(player);
                 var repeatPenalty = state.LastMurderTargetId == player.PlayerId ? 4.5f : 0f;
                 var score = BotBehaviorPolicy.ScoreMurderCandidate(
                     distance,
@@ -4243,9 +4243,7 @@ internal sealed class BotActionDirector
 
     private static bool IsDeepBotPlayer(PlayerControl player)
     {
-        return player &&
-               player.Data is not null &&
-               player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal);
+        return DeepBotIdentity.IsBot(player);
     }
 
     private static string PickStalkNodeNear(Vector2 targetPosition)
@@ -4945,7 +4943,7 @@ internal sealed class BotActionDirector
         for (var i = 0; i < list.Count; i++)
         {
             var player = list[i];
-            if (player && player.Data is not null && player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+            if (DeepBotIdentity.IsBot(player))
             {
                 yield return player;
             }

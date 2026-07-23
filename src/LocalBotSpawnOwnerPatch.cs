@@ -72,6 +72,6 @@ internal static class LocalBotSpawnOwnerPatch
             return null;
         }
 
-        return player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal) ? player : null;
+        return DeepBotIdentity.IsBot(player) ? player : null;
     }
 }

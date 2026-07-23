@@ -40,7 +40,7 @@ internal sealed class HostRoleControlGuard
             host.Data is null ||
             host.Data.Disconnected ||
             host.Data.Role is null ||
-            host.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+            DeepBotIdentity.IsBot(host))
         {
             return;
         }

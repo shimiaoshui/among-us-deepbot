@@ -1,4 +1,15 @@
-# 0.9.10-tor46-strict-role-rules
+# 0.9.11-lobby-identity-meeting
+
+- Added TOR lobby controls for each bot's name, color, outfit, and nameplate.
+- Replaced visible-name bot detection with reserved virtual-client identity, so custom names remain fully functional.
+- Automatically disambiguates duplicate bot names to prevent two overlapping players from appearing to have multiple primary roles.
+- Isolated meeting memory per bot and classified other speakers' statements as public claims rather than shared eyewitness facts.
+- Added a code-level evidence guard for unsupported kill claims and unnatural "murder route" prompts.
+- Prevented recursive bot-to-bot model calls while preserving direct replies and full reconsideration after human statements.
+- Prevented impostors from publicly leaking private murder location, timing, victim-route, or ability-kill details before those facts are disclosed in the meeting.
+- Release archives and source contain no API key.
+
+## Previous release: 0.9.10-tor46-strict-role-rules
 
 - Vampire bites now resolve after the configured delay without moving the attacker to the victim.
 - Bombs use host-authoritative range checks and record a bomb death only after TOR confirms the kill.

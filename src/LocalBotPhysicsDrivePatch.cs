@@ -16,7 +16,7 @@ internal static class LocalBotPhysicsDrivePatch
         }
 
         var player = __instance.myPlayer;
-        if (!player || player.Data is null || !player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+        if (!DeepBotIdentity.IsBot(player))
         {
             return true;
         }
