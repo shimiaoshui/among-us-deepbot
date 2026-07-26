@@ -14,7 +14,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "local.amongus.deepseekbots";
     public const string PluginName = "Among Us DeepSeek Bots";
-    public const string PluginVersion = "0.9.11-lobby-identity-meeting";
+    public const string PluginVersion = "0.10.0-skeld-native-tor";
 
     private readonly Harmony _harmony = new(PluginGuid);
 
@@ -22,6 +22,12 @@ public sealed class Plugin : BasePlugin
     internal static ManualLogSource LogSource { get; private set; } = null!;
     internal static PluginConfig Settings { get; private set; } = null!;
     internal static DeepBotRuntime? Runtime { get; set; }
+
+    internal static void ApplyLateTorRolePatches()
+    {
+        TorAuthoritativeRoleTextPatch.TryApplyLate(Instance._harmony);
+        TorNinjaTraceColorGuardPatch.TryApplyLate(Instance._harmony);
+    }
 
     public override void Load()
     {
@@ -74,6 +80,7 @@ internal sealed class PluginConfig
     public ConfigEntry<bool> VerboseDiagnostics { get; private init; } = null!;
     public ConfigEntry<string> Model { get; private init; } = null!;
     public ConfigEntry<string> ApiBaseUrl { get; private init; } = null!;
+    public ConfigEntry<float> AbilityRequestSpacingSeconds { get; private init; } = null!;
     public ConfigEntry<float> BotSpeedMultiplier { get; private init; } = null!;
     public ConfigEntry<bool> SocialInteraction { get; private init; } = null!;
     public ConfigEntry<bool> AutoReportBodies { get; private init; } = null!;
@@ -90,12 +97,17 @@ internal sealed class PluginConfig
         return new PluginConfig
         {
             Enabled = config.Bind("General", "Enabled", true, "Enable the rebuilt DeepBot controller."),
-            LocalBotCount = config.Bind("Local", "BotCount", 5, "Number of host-authoritative Skeld bots to create in a local/LAN lobby."),
+            LocalBotCount = config.Bind("Local", "BotCount", 5, "Number of host-authoritative bots to create in a local/LAN lobby on The Skeld or MIRA HQ."),
             TickIntervalSeconds = config.Bind("Runtime", "TickIntervalSeconds", 1.0f, "Controller decision tick interval. Movement and social checks are separately throttled."),
             DryRun = config.Bind("Runtime", "DryRun", false, "When true, only logs decisions and never spawns or controls bots."),
             VerboseDiagnostics = config.Bind("Diagnostics", "Verbose", true, "Write concise periodic game-state diagnostics."),
             Model = config.Bind("AI", "Model", "agnes-2.0-flash", "OpenAI-compatible model identifier."),
             ApiBaseUrl = config.Bind("AI", "ApiBaseUrl", "https://apihub.agnes-ai.com/v1", "OpenAI-compatible API base URL."),
+            AbilityRequestSpacingSeconds = config.Bind(
+                "AI",
+                "AbilityRequestSpacingSeconds",
+                1.25f,
+                "Minimum host-wide spacing between independent bot ability-brain requests. Lower values react faster but use more API capacity."),
             BotSpeedMultiplier = config.Bind("Movement", "SpeedMultiplier", 0.82f, "Bot movement speed multiplier."),
             SocialInteraction = config.Bind("Social", "Enabled", true, "Enable host-authoritative body reports, meeting chat, and voting."),
             AutoReportBodies = config.Bind("Social", "AutoReportBodies", true, "Allow crew bots to route to and report bodies they can actually see."),

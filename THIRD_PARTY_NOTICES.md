@@ -1,11 +1,11 @@
-# 第三方组件说明
+# Third-party notices
 
-`AmongUs-DeepBot-0.9.10-TOR46-Strict-Rules.zip` 中的 `TheOtherRoles.dll` 是 The Other Roles v4.6.0 的明确修改版，用于修复宿主虚拟 Bot 与 TOR 本地玩家规则不一致的问题。
+The release includes a clearly identified modified build of The Other Roles 4.6.0 so host-owned virtual players obey the same native TOR rules as ordinary players.
 
-- 上游项目：The Other Roles
-- 上游版本：v4.6.0
-- 上游许可证：GNU General Public License v3.0
-- 修改内容：虚拟 Bot 陷阱/诱饵/炸弹规则、任务统计、身份报幕、房间 AI 数量、冷却与角色约束等兼容修复
-- 对应源码：同一 GitHub Release 中的 `TheOtherRoles-4.6.0-DeepBot-0.9.10-Source.zip`
+- Upstream project: The Other Roles
+- Upstream version: 4.6.0
+- License: GNU General Public License v3.0
+- DeepBot integration changes: virtual-player role rules, traps, Bait, bombs, task accounting, intro presentation, lobby AI count, cooldown/state compatibility, and related host-authority fixes
+- Complete corresponding source: published as a separate source archive on the same GitHub Release
 
-Among Us 与相关素材仍属于 Innersloth LLC；本项目与 Innersloth 无隶属或背书关系。
+Among Us and its assets remain the property of Innersloth LLC. This project is not affiliated with or endorsed by Innersloth.

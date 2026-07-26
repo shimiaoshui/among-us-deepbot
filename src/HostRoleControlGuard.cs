@@ -10,7 +10,6 @@ internal sealed class HostRoleControlGuard
     private readonly ManualLogSource _log;
     private RoleTypes? _boundRole;
     private bool _abilityButtonsInitialized;
-    private int _lastVentTargetId = -1;
     private float _nextDiagnosticAt;
     private float _nextCooldownRepairLogAt;
 
@@ -51,7 +50,6 @@ internal sealed class HostRoleControlGuard
         {
             _boundRole = host.Data.RoleType;
             _abilityButtonsInitialized = false;
-            _lastVentTargetId = -1;
             _nextDiagnosticAt = 0f;
         }
 
@@ -70,7 +68,6 @@ internal sealed class HostRoleControlGuard
             var hud = DestroyableSingleton<HudManager>.Instance;
             EnsureAbilityButtons(host, role, hud);
             EnsureAbilityCooldownVisual(host, role, hud);
-            EnsureVentTarget(host, role, hud);
             LogDiagnostics(host, role, hud, roleChanged);
         }
     }
@@ -225,59 +222,6 @@ internal sealed class HostRoleControlGuard
         }
     }
 
-    private void EnsureVentTarget(PlayerControl host, RoleBehaviour role, HudManager hud)
-    {
-        if (!role.CanVent || !host.moveable || host.inVent || host.walkingToVent || !hud.ImpostorVentButton)
-        {
-            return;
-        }
-
-        var position = host.GetTruePosition();
-        Vent? bestVent = null;
-        var bestDistance = float.MaxValue;
-        foreach (var vent in UnityEngine.Object.FindObjectsOfType<Vent>())
-        {
-            if (!vent)
-            {
-                continue;
-            }
-
-            var distance = Vector2.Distance(position, vent.transform.position);
-            if (distance >= bestDistance)
-            {
-                continue;
-            }
-
-            var usableDistance = vent.CanUse(host.Data, out _, out var couldUse);
-            if (!couldUse || usableDistance > 1.75f)
-            {
-                continue;
-            }
-
-            bestVent = vent;
-            bestDistance = distance;
-        }
-
-        if (bestVent is null)
-        {
-            return;
-        }
-
-        var engineer = role.TryCast<EngineerRole>();
-        if (engineer is not null)
-        {
-            engineer.currentTarget = bestVent;
-        }
-        hud.ImpostorVentButton.SetTarget(bestVent);
-        if (_lastVentTargetId != bestVent.Id)
-        {
-            _lastVentTargetId = bestVent.Id;
-            _log.LogInfo(
-                $"DeepBot host vent target rebound: player={host.Data.PlayerName}({host.PlayerId}), " +
-                $"role={host.Data.RoleType}, vent={bestVent.Id}, distance={bestDistance:0.00}.");
-        }
-    }
-
     private void LogDiagnostics(PlayerControl host, RoleBehaviour role, HudManager hud, bool force)
     {
         if (!force && Time.time < _nextDiagnosticAt)
@@ -319,7 +263,6 @@ internal sealed class HostRoleControlGuard
     {
         _boundRole = null;
         _abilityButtonsInitialized = false;
-        _lastVentTargetId = -1;
         _nextDiagnosticAt = 0f;
         _nextCooldownRepairLogAt = 0f;
     }

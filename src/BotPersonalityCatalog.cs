@@ -107,6 +107,6 @@ internal sealed record BotPersonalityProfile(
     public string MeetingPrompt =>
         $"固定性格={Name}；说话风格={MeetingStyle}；听信他人倾向={SocialSuggestibility:0.00}；" +
         $"亲眼证据依赖={EyewitnessReliance:0.00}；冒险投票倾向={VoteBoldness:0.00}。" +
-        "结合这些倾向独立判断：容易信任者可被可信说法改变，重视亲眼者除非证据很强否则不随声附和，" +
+        "结合这些倾向独立判断：容易信任者也只能被带地点与动作、能核对的可信说法改变，不能把语气或跟票当证据；重视亲眼者除非证据很强否则不随声附和，" +
         "果断者可在不完全确定时下注，谨慎者提高投票门槛。";
 }

@@ -21,6 +21,40 @@ internal static class DeepBotIdentity
                 player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal));
     }
 
+    internal static PlayerControl? FindLocalHumanPlayer()
+    {
+        var client = AmongUsClient.Instance;
+        if (client)
+        {
+            for (var index = 0; index < client.allClients.Count; index++)
+            {
+                var candidate = client.allClients[index];
+                if (candidate is not null &&
+                    candidate.Id == client.ClientId &&
+                    candidate.Character &&
+                    candidate.Character.Data is not null &&
+                    !IsBot(candidate.Character))
+                {
+                    return candidate.Character;
+                }
+            }
+
+            foreach (var player in PlayerControl.AllPlayerControls)
+            {
+                if (player &&
+                    player.Data is not null &&
+                    player.OwnerId == client.ClientId &&
+                    !IsBot(player))
+                {
+                    return player;
+                }
+            }
+        }
+
+        var local = PlayerControl.LocalPlayer;
+        return local && local.Data is not null && !IsBot(local) ? local : null;
+    }
+
     internal static bool IsBot(ClientData? client)
     {
         return client is not null &&

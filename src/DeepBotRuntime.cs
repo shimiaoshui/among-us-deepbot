@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using BepInEx.Logging;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -18,6 +19,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
     private BotAbilityDirector _abilities = null!;
     private HostRoleControlGuard _hostRoleControls = null!;
     private float _nextTickAt;
+    private float _nextHostUiIsolationLogAt;
     private string _lastScene = string.Empty;
     private bool _started;
 
@@ -41,11 +43,26 @@ public sealed class DeepBotRuntime : MonoBehaviour
         _social = new BotSocialDirector(_log, _deepSeek, _memory);
         _abilities = new BotAbilityDirector(_log, _memory, _director, _deepSeek);
         TorRoleAdapter.Initialize(_log);
+        TorRoleAdapter.LogRoleCoverageSelfTest(_log);
         _hostRoleControls = new HostRoleControlGuard(_log);
         Plugin.Runtime = this;
         _started = true;
+        SkeldPathGraph.Instance.LogSupportedMapSelfTests(_log);
         SkeldPathGraph.Instance.LogStaticSelfTest(_log);
         BotBehaviorPolicy.LogSelfTest(_log);
+        BotMatchMemory.LogSelfTest(_log);
+        TorLocalRoleChatPolicy.LogSelfTest(_log);
+        ObservedTorActionRpcPatch.LogSelfTest(_log);
+        VampireDelayedDeathPositionPatch.LogSelfTest(_log);
+        SafeLocalBotSpawner.LogLobbySpawnSelfTest(_log);
+        BotActionDirector.LogMiraDeconRecoverySelfTest(_log);
+        BotActionDirector.LogPostMeetingMovementRecoverySelfTest(_log);
+        BotActionDirector.LogMurderPlanningSelfTest(_log);
+        TorIntroPresentationPatch.LogSelfTest(_log);
+        BotSocialDirector.LogSelfTest(_log);
+        BotAbilityDirector.LogSelfTest(_log);
+        DeepSeekDecisionClient.LogSelfTest(_log);
+        SmoothTaskProgressPatch.LogSelfTest(_log);
         _log.LogInfo($"DeepBotRuntime started. graph={SkeldPathGraph.Instance.Summary}, hostKey={(DeepSeekDecisionClient.LoadHostApiKey() is null ? "missing" : "configured")}.");
     }
 
@@ -58,11 +75,26 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
         var now = Time.realtimeSinceStartup;
         _spawner.MaintainHostLocalView();
-        _hostRoleControls.Update();
+        TorIntroPresentationPatch.RefreshVisibleSpecificRole();
+        VampireDelayedDeathPositionPatch.MaintainPositionHolds();
+        try
+        {
+            _hostRoleControls.Update();
+        }
+        catch (Exception ex)
+        {
+            // Host HUD repair is optional presentation/control assistance. It
+            // must never starve movement, abilities, memory, or meetings.
+            if (Time.time >= _nextHostUiIsolationLogAt)
+            {
+                _nextHostUiIsolationLogAt = Time.time + 3f;
+                _log.LogWarning($"DeepBot host UI subsystem isolated: {ex.Message}");
+            }
+        }
         _memory.Update(Plugin.Settings);
         _director.UpdateMovement(Plugin.Settings, Time.deltaTime);
         _abilities.Update(Plugin.Settings);
-        TorRoleAdapter.Update();
+        TorRoleAdapter.Update(_memory.MatchSerial);
         _social.Update(Plugin.Settings);
 
         var interval = Math.Max(0.25f, Plugin.Settings.TickIntervalSeconds.Value);
@@ -115,6 +147,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
     {
         if (_started)
         {
+            _director.OnMeetingStarted();
             _social.OnMeetingStarted();
         }
     }
@@ -124,6 +157,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
         if (_started)
         {
             _social.OnMeetingEnded();
+            _director.OnMeetingEnded();
         }
     }
 
@@ -152,6 +186,14 @@ public sealed class DeepBotRuntime : MonoBehaviour
         }
     }
 
+    internal void OnBodyReportRequested(PlayerControl reporter, NetworkedPlayerInfo victim)
+    {
+        if (_started)
+        {
+            _social.RecordBodyReporter(reporter, victim);
+        }
+    }
+
     internal void ApplyPhysicsMovement(PlayerPhysics physics)
     {
         if (_started)
@@ -160,9 +202,38 @@ public sealed class DeepBotRuntime : MonoBehaviour
         }
     }
 
-    internal void RecordObservedMurder(PlayerControl killer, PlayerControl victim)
+    internal int CapturePotentialMurderWitnessMask(PlayerControl killer, PlayerControl victim)
     {
-        _memory.RecordObservedMurder(killer, victim);
+        if (!_started)
+        {
+            return 0;
+        }
+
+        var mask = 0;
+        foreach (var playerId in _memory.CapturePotentialMurderWitnesses(killer, victim))
+        {
+            if (playerId < 32)
+            {
+                mask |= 1 << playerId;
+            }
+        }
+        return mask;
+    }
+
+    internal void RecordObservedMurder(
+        PlayerControl killer,
+        PlayerControl victim,
+        int preEventWitnessMask = 0)
+    {
+        var preEventWitnessIds = Enumerable.Range(0, 32)
+            .Where(playerId => (preEventWitnessMask & (1 << playerId)) != 0)
+            .Select(playerId => (byte)playerId)
+            .ToArray();
+        var witnessIds = _memory.RecordObservedMurder(killer, victim, preEventWitnessIds);
+        if (witnessIds.Count > 0)
+        {
+            _director.OnWitnessedMurder(killer, victim, witnessIds);
+        }
     }
 
     internal void RecordObservedSpecialAction(PlayerControl actor, string action, string inference)

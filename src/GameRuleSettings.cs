@@ -58,6 +58,16 @@ internal static class GameRuleSettings
         return Mathf.Clamp(TryGetFloat(fallback, "PlayerSpeedMod"), 0.25f, 3f);
     }
 
+    internal static float GetEngineerCooldown(float fallback = 30f)
+    {
+        return Mathf.Clamp(TryGetFloat(fallback, "EngineerCooldown"), 0f, 120f);
+    }
+
+    internal static float GetEngineerMaxVentTime(float fallback = 10f)
+    {
+        return Mathf.Clamp(TryGetFloat(fallback, "EngineerInVentMaxTime"), 0.5f, 60f);
+    }
+
     internal static int GetDiscussionTime(int fallback)
     {
         return Mathf.Max(0, TryGetInt(fallback, "DiscussionTime"));
@@ -73,6 +83,37 @@ internal static class GameRuleSettings
         return Mathf.Max(0, TryGetInt(fallback, "EmergencyCooldown"));
     }
 
+    internal static int GetMaxPlayers(int fallback = 15)
+    {
+        var currentOptions = GetCurrentOptions();
+        if (currentOptions is null)
+        {
+            return Mathf.Clamp(fallback, 4, 15);
+        }
+
+        try
+        {
+            var type = currentOptions.GetType();
+            var property = AccessTools.Property(type, "MaxPlayers") ??
+                           AccessTools.Property(type, "maxPlayers");
+            if (property?.GetValue(currentOptions) is { } value)
+            {
+                return Mathf.Clamp(Convert.ToInt32(value), 4, 15);
+            }
+
+            var field = AccessTools.Field(type, "MaxPlayers") ??
+                        AccessTools.Field(type, "maxPlayers") ??
+                        AccessTools.Field(type, "<MaxPlayers>k__BackingField");
+            return field?.GetValue(currentOptions) is { } fieldValue
+                ? Mathf.Clamp(Convert.ToInt32(fieldValue), 4, 15)
+                : Mathf.Clamp(fallback, 4, 15);
+        }
+        catch
+        {
+            return Mathf.Clamp(fallback, 4, 15);
+        }
+    }
+
     internal static RoomRuleSnapshot CaptureSnapshot()
     {
         return new RoomRuleSnapshot(
@@ -86,7 +127,9 @@ internal static class GameRuleSettings
             GetDiscussionTime(15),
             GetVotingTime(120),
             GetEmergencyCooldown(15),
-            GetCrewmateTaskCount(0));
+            GetCrewmateTaskCount(0),
+            GetEngineerCooldown(),
+            GetEngineerMaxVentTime());
     }
 
     internal static int GetCrewmateTaskCount(int fallback)
@@ -143,6 +186,30 @@ internal static class GameRuleSettings
     internal static bool IsSkeldMap()
     {
         return GetMapId() == 0;
+    }
+
+    internal static bool IsMiraHqMap()
+    {
+        return GetMapId() == 1;
+    }
+
+    internal static bool IsDeepBotSupportedMap()
+    {
+        return MapNavigationProfile.IsSupported(GetMapId());
+    }
+
+    internal static string GetMapName()
+    {
+        return GetMapId() switch
+        {
+            0 => "The Skeld",
+            1 => "MIRA HQ",
+            2 => "Polus",
+            3 => "The Skeld (April Fools)",
+            4 => "The Airship",
+            5 => "The Fungle",
+            var id => $"map-{id}"
+        };
     }
 
     private static int TryGetInt(int fallback, params string[] optionNames)
@@ -310,7 +377,9 @@ internal readonly record struct RoomRuleSnapshot(
     int DiscussionTime,
     int VotingTime,
     int EmergencyCooldown,
-    int CrewmateTaskCount)
+    int CrewmateTaskCount,
+    float EngineerCooldown,
+    float EngineerMaxVentTime)
 {
     internal string Describe()
     {
@@ -318,6 +387,7 @@ internal readonly record struct RoomRuleSnapshot(
                $"killDistance={KillDistance:0.00}, speed={PlayerSpeed:0.00}x, " +
                $"crewVision={CrewVision:0.00}x, impostorVision={ImpostorVision:0.00}x, " +
                $"discussion={DiscussionTime}s, voting={VotingTime}s, emergencyCooldown={EmergencyCooldown}s, " +
-               $"tasksPerCrew={CrewmateTaskCount}";
+               $"tasksPerCrew={CrewmateTaskCount}, engineerCooldown={EngineerCooldown:0.0}s, " +
+               $"engineerMaxVent={EngineerMaxVentTime:0.0}s";
     }
 }

@@ -1,6 +1,12 @@
 bin/
 obj/
 release/
+release-assets/
+packaging/installer/generated/
+packaging/installer/bin/
+packaging/installer/obj/
+.installer-test-*/
+.installer-tests/
 *.user
 *.suo
 *.zip

@@ -20,6 +20,8 @@ internal static class TorRoleAdapter
     private const string TorRootTypeName = "TheOtherRoles.TheOtherRoles";
     private const string TorRpcProcedureTypeName = "TheOtherRoles.RPCProcedure";
     private const string TorHelpersTypeName = "TheOtherRoles.Helpers";
+    private const string TorEngineerVentRulesTypeName = "TheOtherRoles.Patches.EngineerVentRules";
+    private const float VirtualTrapScanIntervalSeconds = 0.10f;
 
     private static readonly RoleSpec[] RoleSpecs =
     [
@@ -85,6 +87,18 @@ internal static class TorRoleAdapter
         new("Shifter", "Shifter", "shifter", false, "Choose one strategically useful target and exchange roles according to TOR rules.")
     ];
 
+    private static readonly HashSet<string> ImplementedActiveAbilityNames =
+    [
+        "Engineer", "Mayor", "Portalmaker", "Medic", "Sheriff", "Deputy", "Tracker", "TimeMaster",
+        "Morphling", "Camouflager", "Hacker", "Medium", "Vampire", "Warlock", "Ninja", "Jackal",
+        "Sidekick", "Arsonist", "Pursuer", "Thief", "Eraser", "Witch", "Shifter", "Cleaner",
+        "Janitor", "Vulture", "Trapper", "Trickster", "SecurityGuard", "Bomber", "Yoyo"
+    ];
+    private static readonly HashSet<string> ImplementedMultiStageAbilityNames =
+    [
+        "Morphling", "Portalmaker", "Trickster", "Ninja", "Warlock", "Arsonist", "Vampire", "Witch", "Bomber", "Yoyo"
+    ];
+
     private static readonly Dictionary<(string Type, string Field), FieldInfo?> FieldCache = [];
     private static Assembly? _assembly;
     private static Type? _rootType;
@@ -92,19 +106,137 @@ internal static class TorRoleAdapter
     private static Type? _helpersType;
     private static MethodInfo? _checkMurderMethod;
     private static MethodInfo? _checkAndKillMethod;
+    private static MethodInfo? _roleCanUseVentsMethod;
     private static ManualLogSource? _log;
     private static bool _availabilityLogged;
     private static readonly Dictionary<byte, string> LoggedAssignments = [];
+    private static readonly Dictionary<byte, string> LoggedAssignmentConflicts = [];
     private static readonly Dictionary<byte, PendingDouse> PendingDouses = [];
     private static readonly Dictionary<byte, PendingVampireBite> PendingVampireBites = [];
     private static readonly Dictionary<byte, PendingWarlockCurse> PendingWarlockCurses = [];
+    private static readonly Dictionary<byte, PendingWitchSpell> PendingWitchSpells = [];
+    private static readonly Dictionary<byte, float> PendingRoleRoots = [];
     private static readonly Dictionary<byte, float> PendingNinjaReveals = [];
     private static readonly Dictionary<byte, float> PendingYoyoReturns = [];
+    private static readonly Dictionary<byte, PendingPortalTeleport> PendingPortalTeleports = [];
+    private static readonly Dictionary<byte, float> NextPortalUseAt = [];
     private static readonly Dictionary<(byte PlayerId, string Role), float> NextRoleAbilityAt = [];
     private static readonly Dictionary<(byte PlayerId, string Role), List<Vector2>> StrategicPlacements = [];
     private static Type? _trapType;
+    private static bool _portalsWereEnabled;
+    private static float _nextVirtualTrapScanAt;
+    private static int _observedMatchSerial = -1;
 
     internal static bool IsAvailable => EnsureLoaded();
+
+    internal static bool IsImpostorTeam(PlayerControl? player)
+    {
+        if (!player || player!.Data is null)
+        {
+            return false;
+        }
+
+        return TryGetRole(player, out var role)
+            ? role.IsImpostorTeam
+            : player.Data.Role?.IsImpostor == true;
+    }
+
+    internal static bool IsPendingVampireDelayedKill(PlayerControl? killer, PlayerControl? target)
+    {
+        if (!killer || !target || !EnsureLoaded())
+        {
+            return false;
+        }
+
+        var vampire = GetStaticField("Vampire", "vampire") as PlayerControl;
+        var bitten = GetStaticField("Vampire", "bitten") as PlayerControl;
+        return vampire &&
+               bitten &&
+               vampire!.PlayerId == killer!.PlayerId &&
+               bitten!.PlayerId == target!.PlayerId &&
+               killer.PlayerId != target.PlayerId;
+    }
+
+    internal static bool IsConcealedFromLivingObserver(PlayerControl? observer, PlayerControl? target)
+    {
+        if (!target || target!.Data is null || target.Data.IsDead || target.Data.Disconnected || !EnsureLoaded())
+        {
+            return false;
+        }
+
+        var ninja = GetStaticField("Ninja", "ninja") as PlayerControl;
+        if (ninja &&
+            ninja!.PlayerId == target.PlayerId &&
+            (GetStaticBool("Ninja", "isInvisble") || GetStaticFloat("Ninja", "invisibleTimer") > 0.01f))
+        {
+            // TOR deliberately leaves a faint outline for dead players and
+            // impostor teammates. Living opponents must not receive the
+            // Ninja's position, route, actions, or murder identity.
+            return !observer ||
+                   observer!.Data is null ||
+                   (!observer.Data.IsDead && !IsImpostorTeam(observer));
+        }
+
+        return TryGetChameleonVisibility(target!, out var visibility) &&
+               visibility <= 0.251f;
+    }
+
+    internal static bool IsTorVisualConcealmentEffectActive(PlayerControl? target)
+    {
+        if (!target || !EnsureLoaded())
+        {
+            return false;
+        }
+
+        var ninja = GetStaticField("Ninja", "ninja") as PlayerControl;
+        if (ninja &&
+            ninja!.PlayerId == target!.PlayerId &&
+            (GetStaticBool("Ninja", "isInvisble") || GetStaticFloat("Ninja", "invisibleTimer") > 0.01f))
+        {
+            return true;
+        }
+
+        // Chameleon fades progressively. Preserve the whole TOR-managed fade
+        // instead of allowing the generic render-repair pass to force alpha=1.
+        return TryGetChameleonVisibility(target!, out var visibility) && visibility < 0.995f;
+    }
+
+    private static bool TryGetChameleonVisibility(PlayerControl target, out float visibility)
+    {
+        visibility = 1f;
+        if (GetStaticField("Chameleon", "chameleon") is not IEnumerable owners)
+        {
+            return false;
+        }
+
+        var ownsModifier = false;
+        foreach (var value in owners)
+        {
+            if (value is PlayerControl owner && owner && owner.PlayerId == target.PlayerId)
+            {
+                ownsModifier = true;
+                break;
+            }
+        }
+
+        if (!ownsModifier)
+        {
+            return false;
+        }
+
+        try
+        {
+            visibility = Convert.ToSingle(InvokeRoleMethod("Chameleon", "visibility", target.PlayerId));
+            return true;
+        }
+        catch
+        {
+            // If TOR changes the helper signature, preserving the renderer is
+            // safer than falsely revealing a role-managed hidden player.
+            visibility = GetStaticFloat("Chameleon", "minVisibility");
+            return true;
+        }
+    }
 
     internal static int GetLobbyConfiguredBotCount(int fallback)
     {
@@ -236,7 +368,11 @@ internal static class TorRoleAdapter
     private static bool TryCheckRuleAwareMurder(
         PlayerControl killer,
         PlayerControl target,
-        out string resultName)
+        out string resultName,
+        bool blockRewind = false,
+        bool ignoreBlank = false,
+        bool ignoreIfKillerIsDead = false,
+        bool ignoreMedic = false)
     {
         resultName = "TOR unavailable";
         if (!EnsureLoaded() || _helpersType is null)
@@ -255,7 +391,7 @@ internal static class TorRoleAdapter
 
             var result = method.Invoke(
                 null,
-                new object[] { killer, target, false, false, false, false });
+                new object[] { killer, target, blockRewind, ignoreBlank, ignoreIfKillerIsDead, ignoreMedic });
             resultName = result?.ToString() ?? "unknown";
             return true;
         }
@@ -289,6 +425,14 @@ internal static class TorRoleAdapter
         log.LogInfo(available
             ? $"DeepBot TOR adapter ready: customRoles={RoleSpecs.Length}, modifiers={ModifierSpecs.Select(modifier => modifier.Name).Distinct().Count()}, activeAbilities={RoleSpecs.Count(role => role.ActiveAbility) + 1}."
             : "DeepBot TOR adapter inactive: TheOtherRoles is not loaded; native roles remain available.");
+        if (available)
+        {
+            // BepInEx loads DeepBot before TOR's plugin entry point, so the
+            // first Harmony PatchAll cannot resolve TOR's nested intro writer.
+            // At this point EnsureLoaded has obtained the live TOR assembly;
+            // apply the role-text postfix now rather than silently skipping it.
+            Plugin.ApplyLateTorRolePatches();
+        }
     }
 
     internal static bool TryGetRole(PlayerControl? player, out TorRoleInfo role)
@@ -299,25 +443,105 @@ internal static class TorRoleAdapter
             return false;
         }
 
-        foreach (var spec in RoleSpecs)
+        var matches = GetOwnedPrimaryRoleSpecs(player!);
+        if (matches.Count == 0)
         {
-            if (spec.Name == "Prosecutor" && !GetStaticBool("Lawyer", "isProsecutor") ||
-                spec.Name == "Lawyer" && GetStaticBool("Lawyer", "isProsecutor"))
+            return false;
+        }
+
+        var spec = matches[0];
+        if (matches.Count > 1 && TryGetAuthoritativePrimaryRoleKey(player!, out var authoritativeKey))
+        {
+            spec = matches.FirstOrDefault(candidate =>
+                       string.Equals(candidate.Name, authoritativeKey, StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(candidate.TypeName, authoritativeKey, StringComparison.OrdinalIgnoreCase)) ?? spec;
+        }
+
+        role = new TorRoleInfo(
+            spec.Name,
+            spec.Alignment,
+            spec.ActiveAbility,
+            BuildWinCondition(spec.Name, spec.Alignment),
+            spec.AbilityPurpose);
+        return true;
+    }
+
+    internal static bool TryGetIntroRole(PlayerControl? player, out TorIntroRoleInfo introRole)
+    {
+        introRole = default;
+        // The intro is presentation owned by TOR itself. Do not gate it on
+        // DeepBot's static role catalogue: a newly added TOR role (or a role
+        // whose assignment arrives a few frames late) must still be shown by
+        // its authoritative RoleInfo instead of falling back to the base
+        // Crewmate/Impostor faction label.
+        if (!player || !EnsureLoaded() || _assembly is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var roleInfoType = _assembly.GetType("TheOtherRoles.RoleInfo", false);
+            var getRoles = roleInfoType?
+                .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                .FirstOrDefault(method =>
+                    method.Name == "getRoleInfoForPlayer" &&
+                    method.GetParameters().Length == 2);
+            var roles = getRoles?.Invoke(null, [player, true]);
+            if (roles is null)
             {
-                continue;
+                return false;
             }
 
-            var owner = GetStaticField(spec.TypeName, spec.OwnerField) as PlayerControl;
-            if (owner && owner!.PlayerId == player!.PlayerId)
+            var rolesType = roles.GetType();
+            var count = Convert.ToInt32(rolesType.GetProperty("Count")?.GetValue(roles) ?? 0);
+            var getItem = rolesType.GetMethod(
+                "get_Item",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                null,
+                [typeof(int)],
+                null);
+            for (var index = 0; index < count; index++)
             {
-                role = new TorRoleInfo(
-                    spec.Name,
-                    spec.Alignment,
-                    spec.ActiveAbility,
-                    BuildWinCondition(spec.Name, spec.Alignment),
-                    spec.AbilityPurpose);
+                var item = getItem?.Invoke(roles, [index]);
+                if (item is null)
+                {
+                    continue;
+                }
+
+                var itemType = item.GetType();
+                var isModifier = itemType.GetField("isModifier")?.GetValue(item) is bool modifier && modifier;
+                if (isModifier)
+                {
+                    continue;
+                }
+
+                var name = itemType.GetField("name")?.GetValue(item) as string;
+                var description = itemType.GetField("introDescription")?.GetValue(item) as string;
+                var isNeutral = itemType.GetField("isNeutral")?.GetValue(item) is bool neutral && neutral;
+                var roleId = itemType.GetField("roleId")?.GetValue(item)?.ToString() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(name) ||
+                    itemType.GetField("color")?.GetValue(item) is not Color color)
+                {
+                    continue;
+                }
+
+                var alignment = isNeutral
+                    ? "neutral"
+                    : IsImpostorTeam(player) ? "impostor" : "crewmate";
+
+                introRole = new TorIntroRoleInfo(
+                    name.Trim(),
+                    string.IsNullOrWhiteSpace(description) ? string.Empty : description.Trim(),
+                    color,
+                    alignment,
+                    roleId);
                 return true;
             }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning($"DeepBot TOR intro-role lookup failed: {ex.GetBaseException().Message}");
         }
 
         return false;
@@ -338,7 +562,8 @@ internal static class TorRoleAdapter
         }
 
         var roles = new List<TorRoleInfo>(2);
-        if (TryGetRole(player, out var primary) && primary.ActiveAbility)
+        if (TryGetRole(player, out var primary) &&
+            ShouldExposeStrategicRole(primary.ActiveAbility, CanUseVents(player!, primary)))
         {
             roles.Add(primary);
         }
@@ -354,6 +579,11 @@ internal static class TorRoleAdapter
         }
 
         return roles;
+    }
+
+    private static bool ShouldExposeStrategicRole(bool activeAbility, bool canUseVents)
+    {
+        return activeAbility || canUseVents;
     }
 
     internal static bool TryGetAbilityRole(PlayerControl? player, string roleName, out TorRoleInfo role)
@@ -392,6 +622,31 @@ internal static class TorRoleAdapter
 
         foreach (var player in PlayerControl.AllPlayerControls)
         {
+            if (!player || player.Data is null || player.Data.Disconnected)
+            {
+                continue;
+            }
+
+            var ownedPrimaryRoles = GetOwnedPrimaryRoleSpecs(player);
+            if (ownedPrimaryRoles.Count > 1)
+            {
+                var conflict = string.Join(",", ownedPrimaryRoles.Select(candidate => candidate.Name).OrderBy(name => name, StringComparer.Ordinal));
+                if (!LoggedAssignmentConflicts.TryGetValue(player.PlayerId, out var priorConflict) ||
+                    !string.Equals(priorConflict, conflict, StringComparison.Ordinal))
+                {
+                    LoggedAssignmentConflicts[player.PlayerId] = conflict;
+                    TryGetAuthoritativePrimaryRoleKey(player, out var authoritativeKey);
+                    _log?.LogError(
+                        $"DeepBot illegal TOR primary-role coexistence detected: player={Describe(player)}, " +
+                        $"primaryRoles=[{conflict}], authoritativeRoleInfo={authoritativeKey ?? "unknown"}. " +
+                        "Only modifiers may coexist; DeepBot will reason and act through one authoritative primary role.");
+                }
+            }
+            else
+            {
+                LoggedAssignmentConflicts.Remove(player.PlayerId);
+            }
+
             if (!DeepBotIdentity.IsBot(player))
             {
                 continue;
@@ -401,7 +656,7 @@ internal static class TorRoleAdapter
             var primaryName = hasCustomRole ? role.Name : player.Data.RoleType.ToString();
             var alignment = hasCustomRole
                 ? role.Alignment
-                : player.Data.Role?.IsImpostor == true ? "impostor" : "crewmate";
+                : IsImpostorTeam(player) ? "impostor" : "crewmate";
             var activeAbility = hasCustomRole && role.ActiveAbility;
             var modifiers = GetModifiers(player);
             var modifierNames = modifiers.Count == 0 ? "none" : string.Join(",", modifiers.Select(modifier => modifier.Name));
@@ -418,9 +673,79 @@ internal static class TorRoleAdapter
         }
     }
 
+    private static IReadOnlyList<RoleSpec> GetOwnedPrimaryRoleSpecs(PlayerControl player)
+    {
+        if (!player)
+        {
+            return Array.Empty<RoleSpec>();
+        }
+
+        return RoleSpecs
+            .Where(spec =>
+                !(spec.Name == "Prosecutor" && !GetStaticBool("Lawyer", "isProsecutor")) &&
+                !(spec.Name == "Lawyer" && GetStaticBool("Lawyer", "isProsecutor")) &&
+                GetStaticField(spec.TypeName, spec.OwnerField) is PlayerControl owner &&
+                owner && owner.PlayerId == player.PlayerId)
+            .ToArray();
+    }
+
+    private static bool TryGetAuthoritativePrimaryRoleKey(PlayerControl player, out string? roleKey)
+    {
+        roleKey = null;
+        if (!player || !EnsureLoaded() || _assembly is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var roleInfoType = _assembly.GetType("TheOtherRoles.RoleInfo", false);
+            var getRoles = roleInfoType?
+                .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                .FirstOrDefault(method => method.Name == "getRoleInfoForPlayer" && method.GetParameters().Length == 2);
+            var roles = getRoles?.Invoke(null, [player, true]);
+            var count = Convert.ToInt32(roles?.GetType().GetProperty("Count")?.GetValue(roles) ?? 0);
+            var getItem = roles?.GetType().GetMethod(
+                "get_Item",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                null,
+                [typeof(int)],
+                null);
+            for (var index = 0; index < count; index++)
+            {
+                var item = getItem?.Invoke(roles, [index]);
+                if (item is null)
+                {
+                    continue;
+                }
+
+                var itemType = item.GetType();
+                if (itemType.GetField("isModifier")?.GetValue(item) is bool modifier && modifier)
+                {
+                    continue;
+                }
+
+                roleKey = itemType.GetField("roleId")?.GetValue(item)?.ToString() ??
+                          itemType.GetField("name")?.GetValue(item) as string;
+                return !string.IsNullOrWhiteSpace(roleKey);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning($"DeepBot authoritative TOR primary-role audit failed safely: {ex.GetBaseException().Message}");
+        }
+
+        return false;
+    }
+
     internal static bool IsAbilityReady(PlayerControl bot, TorRoleInfo role)
     {
-        if (!role.ActiveAbility || !bot || bot.Data is null || bot.Data.IsDead || IsHandcuffed(bot))
+        if (!role.ActiveAbility ||
+            !ImplementedActiveAbilityNames.Contains(role.Name) ||
+            !bot ||
+            bot.Data is null ||
+            bot.Data.IsDead ||
+            IsHandcuffed(bot))
         {
             return false;
         }
@@ -428,6 +753,7 @@ internal static class TorRoleAdapter
         if (PendingDouses.ContainsKey(bot.PlayerId) ||
             PendingVampireBites.ContainsKey(bot.PlayerId) ||
             PendingWarlockCurses.ContainsKey(bot.PlayerId) ||
+            PendingWitchSpells.ContainsKey(bot.PlayerId) ||
             PendingNinjaReveals.ContainsKey(bot.PlayerId) ||
             PendingYoyoReturns.ContainsKey(bot.PlayerId) ||
             Time.time < NextRoleAbilityAt.GetValueOrDefault((bot.PlayerId, role.Name)))
@@ -458,7 +784,9 @@ internal static class TorRoleAdapter
             "Trickster" => !GetStaticBool("JackInTheBox", "boxesConvertedToVents") ||
                            GetStaticFloat("Trickster", "lightsOutTimer") <= 0.05f,
             "SecurityGuard" => GetStaticInt("SecurityGuard", "remainingScrews") >=
-                               GetStaticInt("SecurityGuard", "camPrice"),
+                               Mathf.Min(
+                                   Mathf.Max(1, GetStaticInt("SecurityGuard", "ventPrice")),
+                                   Mathf.Max(1, GetStaticInt("SecurityGuard", "camPrice"))),
             "Bomber" => !GetStaticBool("Bomber", "isPlanted"),
             "Yoyo" => true,
             "Warlock" => true,
@@ -470,9 +798,544 @@ internal static class TorRoleAdapter
         };
     }
 
+    internal static bool TryGetAbilitySequencePlan(
+        PlayerControl bot,
+        TorRoleInfo role,
+        out TorAbilitySequencePlan plan)
+    {
+        plan = default;
+        if (!bot || bot.Data is null || bot.Data.IsDead)
+        {
+            return false;
+        }
+
+        if (role.Name == "Morphling" &&
+            GetStaticField("Morphling", "sampledTarget") is PlayerControl invalidSample &&
+            !IsSequenceTargetAvailable(invalidSample, allowVentConcealment: true))
+        {
+            SetStaticField("Morphling", "sampledTarget", null!);
+            NextRoleAbilityAt[(bot.PlayerId, role.Name)] = Time.time + 0.35f;
+            _log?.LogInfo(
+                $"DeepBot Morphling sequence aborted safely: bot={Describe(bot)}, " +
+                $"sample={Describe(invalidSample)}, reason=sample target died or disconnected.");
+            return false;
+        }
+
+        if (role.Name == "Ninja" &&
+            GetStaticField("Ninja", "ninjaMarked") is PlayerControl invalidMark &&
+            !IsSequenceTargetAvailable(invalidMark, allowVentConcealment: true))
+        {
+            SetStaticField("Ninja", "ninjaMarked", null!);
+            NextRoleAbilityAt[(bot.PlayerId, role.Name)] = Time.time + 0.35f;
+            _log?.LogInfo(
+                $"DeepBot Ninja sequence aborted safely: bot={Describe(bot)}, " +
+                $"mark={Describe(invalidMark)}, reason=marked target died or disconnected.");
+            return false;
+        }
+
+        switch (role.Name)
+        {
+            case "Morphling" when GetStaticFloat("Morphling", "morphTimer") > 0.05f:
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    true,
+                    null,
+                    "cover",
+                    "morph is active; follow through with a plausible cover route instead of standing still after transforming",
+                    0.89f,
+                    2.0f);
+                return true;
+            case "Morphling" when GetStaticField("Morphling", "sampledTarget") is PlayerControl sampled && sampled:
+            {
+                var stageReady = IsConfiguredRoleStageReady(bot, role.Name);
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    true,
+                    sampled.PlayerId,
+                    stageReady ? "role" : "cover",
+                    stageReady
+                        ? $"continue sample-to-morph sequence using sampled target {Describe(sampled)} after reaching concealment"
+                        : $"sampled {Describe(sampled)}; move into concealment while the native sample stage finishes",
+                    0.94f,
+                    stageReady ? 1.0f : RemainingConfiguredRoleStageSeconds(bot, role.Name));
+                return true;
+            }
+            case "Portalmaker" when GetStaticField("Portal", "firstPortal") is not null &&
+                                          GetStaticField("Portal", "secondPortal") is null:
+            {
+                var stageReady = IsConfiguredRoleStageReady(bot, role.Name);
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    true,
+                    null,
+                    stageReady ? "role" : "cover",
+                    stageReady
+                        ? "continue the two-portal plan by placing the separated second endpoint"
+                        : "move toward a separated second endpoint while the room-configured portal cooldown runs",
+                    0.91f,
+                    stageReady ? 1.0f : RemainingConfiguredRoleStageSeconds(bot, role.Name));
+                return true;
+            }
+            case "Trickster":
+            {
+                var boxes = GetStaticCollectionCount("JackInTheBox", "AllJackInTheBoxes");
+                var limit = Mathf.Max(1, GetStaticInt("JackInTheBox", "JackInTheBoxLimit"));
+                var converted = GetStaticBool("JackInTheBox", "boxesConvertedToVents");
+                var darkness = GetStaticFloat("Trickster", "lightsOutTimer") > 0.05f;
+                if (boxes > 0 && boxes < limit)
+                {
+                    var stageReady = IsConfiguredRoleStageReady(bot, role.Name);
+                    plan = new TorAbilitySequencePlan(
+                        true,
+                        true,
+                        null,
+                        stageReady ? "role" : "cover",
+                        stageReady
+                            ? $"place the next separated box; progress={boxes}/{limit}"
+                            : $"move toward the next separated box position while the room-configured placement cooldown runs; progress={boxes}/{limit}",
+                        0.91f,
+                        stageReady ? 1.0f : RemainingConfiguredRoleStageSeconds(bot, role.Name));
+                    return true;
+                }
+
+                if (boxes >= limit && !converted)
+                {
+                    plan = new TorAbilitySequencePlan(
+                        true,
+                        false,
+                        null,
+                        "hold",
+                        "box network is complete; wait for TOR's meeting conversion before using darkness or box vents",
+                        0.92f,
+                        2.5f);
+                    return true;
+                }
+
+                if (converted && darkness && CanUseVents(bot, role))
+                {
+                    plan = new TorAbilitySequencePlan(
+                        true,
+                        true,
+                        null,
+                        "vent",
+                        "darkness is active; use the converted box network for a concealed ambush or escape",
+                        0.86f,
+                        1.0f);
+                    return true;
+                }
+
+                var visibleOpponents = CountPersonallyVisibleOpponents(bot);
+                if (converted && !darkness && bot.killTimer <= 0.05f && visibleOpponents is >= 1 and <= 3)
+                {
+                    plan = new TorAbilitySequencePlan(
+                        true,
+                        true,
+                        null,
+                        "role",
+                        $"box network is ready and {visibleOpponents} opponents are visible; start darkness for a concrete hostile play",
+                        0.88f,
+                        1.0f);
+                    return true;
+                }
+
+                return false;
+            }
+            case "Ninja" when GetStaticField("Ninja", "ninjaMarked") is PlayerControl marked && marked:
+            {
+                var stageReady = IsConfiguredRoleStageReady(bot, role.Name);
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    stageReady,
+                    marked.PlayerId,
+                    stageReady ? "role" : "hold",
+                    stageReady
+                        ? $"continue mark-to-invisible-strike sequence against {Describe(marked)}"
+                        : $"keep the mark on {Describe(marked)} and wait for the native second-stage timer",
+                    0.91f,
+                    stageReady ? 1.0f : RemainingConfiguredRoleStageSeconds(bot, role.Name));
+                return true;
+            }
+            case "Warlock" when PendingWarlockCurses.TryGetValue(bot.PlayerId, out var pendingCurse):
+            {
+                var secondTarget = FindWarlockSecondTarget(bot, pendingCurse.VictimId);
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    secondTarget,
+                    secondTarget ? secondTarget!.PlayerId : null,
+                    secondTarget ? "role" : "hold",
+                    secondTarget
+                        ? $"curse carrier has approached legal second target {Describe(secondTarget)}; consciously complete the forced-kill stage"
+                        : "curse carrier is active; wait for that carrier to approach a legal second target",
+                    secondTarget ? 0.96f : 0.93f,
+                    secondTarget ? 0.35f : 0.8f);
+                return true;
+            }
+            case "Arsonist" when PendingDouses.ContainsKey(bot.PlayerId):
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    false,
+                    null,
+                    "hold",
+                    "douse channel is active; remain close until the configured channel completes",
+                    0.97f,
+                    0.5f);
+                return true;
+            case "Witch" when PendingWitchSpells.TryGetValue(bot.PlayerId, out var pendingSpell):
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    false,
+                    pendingSpell.TargetId,
+                    "hold",
+                    "spell channel is active; keep the original target in legal range and line of sight until TOR's configured cast time completes",
+                    0.98f,
+                    0.35f);
+                return true;
+            case "Vampire" when PendingVampireBites.ContainsKey(bot.PlayerId):
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    true,
+                    null,
+                    "evade",
+                    "bite is pending; leave the bite scene while the victim later dies at their own position",
+                    0.96f,
+                    1.0f);
+                return true;
+            case "Bomber" when GetStaticBool("Bomber", "isPlanted"):
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    true,
+                    null,
+                    "evade",
+                    "bomb is planted; clear the configured blast radius and build an alibi instead of waiting beside it",
+                    0.95f,
+                    1.0f);
+                return true;
+            case "Yoyo" when GetStaticField("Yoyo", "markedLocation") is not null &&
+                                     !PendingYoyoReturns.ContainsKey(bot.PlayerId):
+            {
+                var visibleOpponents = CountPersonallyVisibleOpponents(bot);
+                var strategicallyReady = visibleOpponents is >= 1 and <= 2 || bot.killTimer <= 0.05f;
+                var ready = strategicallyReady && IsConfiguredRoleStageReady(bot, role.Name);
+                plan = new TorAbilitySequencePlan(
+                    true,
+                    ready,
+                    null,
+                    ready ? "role" : "hold",
+                    ready
+                        ? "continue mark-to-blink sequence for an ambush, escape, or alibi"
+                        : strategicallyReady
+                            ? "return point is armed; wait for TOR's native post-mark timer before blinking"
+                            : "return point is armed; wait for a concrete nearby ambush or escape opportunity",
+                    ready ? 0.84f : 0.78f,
+                    ready ? 1.0f : Mathf.Max(0.5f, Mathf.Min(2.0f, RemainingConfiguredRoleStageSeconds(bot, role.Name))));
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+
+    internal static bool IsAbilitySequencePending(PlayerControl bot, TorRoleInfo role)
+    {
+        return TryGetAbilitySequencePlan(bot, role, out var plan) && plan.Active;
+    }
+
+    internal static bool CurrentAbilityStageRequiresCasterProximity(PlayerControl bot, TorRoleInfo role)
+    {
+        if (!bot)
+        {
+            return true;
+        }
+
+        var continuationActive = role.Name switch
+        {
+            "Morphling" => GetStaticField("Morphling", "sampledTarget") is not null,
+            "Ninja" => GetStaticField("Ninja", "ninjaMarked") is not null,
+            "Warlock" => PendingWarlockCurses.ContainsKey(bot.PlayerId),
+            _ => false
+        };
+        return StageRequiresCasterProximity(role.Name, continuationActive);
+    }
+
+    private static bool IsSequenceTargetAvailable(PlayerControl? target, bool allowVentConcealment)
+    {
+        return IsSequenceTargetStateAvailable(
+            target,
+            target && target!.Data is not null,
+            target && target!.Data?.IsDead == true,
+            target && target!.Data?.Disconnected == true,
+            target && BotPerceptionPolicy.IsConcealedByVent(target),
+            allowVentConcealment);
+    }
+
+    private static bool StageRequiresCasterProximity(string roleName, bool continuationActive)
+    {
+        return !continuationActive || roleName is not ("Morphling" or "Ninja" or "Warlock");
+    }
+
+    private static bool IsSequenceTargetStateAvailable(
+        bool targetExists,
+        bool hasData,
+        bool dead,
+        bool disconnected,
+        bool ventConcealed,
+        bool allowVentConcealment)
+    {
+        return targetExists && hasData && !dead && !disconnected &&
+               (allowVentConcealment || !ventConcealed);
+    }
+
+    private static bool IsConfiguredRoleStageReady(PlayerControl bot, string roleName)
+    {
+        return bot && IsRoleStageReadyAt(
+            Time.time,
+            NextRoleAbilityAt.GetValueOrDefault((bot.PlayerId, roleName)));
+    }
+
+    private static bool IsRoleStageReadyAt(float now, float readyAt)
+    {
+        return now >= readyAt;
+    }
+
+    private static float RemainingConfiguredRoleStageSeconds(PlayerControl bot, string roleName)
+    {
+        return !bot
+            ? 0.5f
+            : Mathf.Max(0.35f, NextRoleAbilityAt.GetValueOrDefault((bot.PlayerId, roleName)) - Time.time);
+    }
+
+    internal static bool TryGetAbilityStagingDestination(
+        PlayerControl bot,
+        TorRoleInfo role,
+        out Vector2 position,
+        out string stage,
+        out float arrivalDistance)
+    {
+        position = default;
+        stage = string.Empty;
+        arrivalDistance = 0.95f;
+        if (!bot || !GameRuleSettings.IsDeepBotSupportedMap())
+        {
+            return false;
+        }
+
+        if (role.Name == "SecurityGuard" && GameRuleSettings.IsMiraHqMap())
+        {
+            var vent = FindNearestUnsealedVent(bot, float.MaxValue);
+            if (!vent)
+            {
+                return false;
+            }
+
+            position = vent!.transform.position;
+            stage = $"security-guard-seal-vent-{vent.Id}";
+            arrivalDistance = 1.15f;
+            return true;
+        }
+
+        var progress = 0;
+        var minimumSeparation = 5f;
+        var preferCorner = false;
+        var maximumTravel = float.MaxValue;
+        List<Vector2> placements;
+        switch (role.Name)
+        {
+            case "Morphling" when GetStaticFloat("Morphling", "morphTimer") > 0.05f:
+                placements = [];
+                minimumSeparation = 3f;
+                maximumTravel = 9f;
+                stage = "morphling-active-cover-route";
+                break;
+            case "Morphling" when GetStaticField("Morphling", "sampledTarget") is PlayerControl &&
+                                     CountPersonallyVisibleOpponents(bot) > 0:
+                placements = [];
+                minimumSeparation = 7f;
+                preferCorner = true;
+                stage = "morphling-conceal-before-transform";
+                break;
+            case "Portalmaker" when GetStaticField("Portal", "firstPortal") is not null &&
+                                         GetStaticField("Portal", "secondPortal") is null:
+                placements = GetStrategicPlacements(bot, "Portalmaker", false);
+                progress = placements.Count;
+                minimumSeparation = 8f;
+                stage = "portalmaker-separated-second-endpoint";
+                break;
+            case "Trickster" when !GetStaticBool("JackInTheBox", "boxesConvertedToVents") &&
+                                      GetStaticCollectionCount("JackInTheBox", "AllJackInTheBoxes") <
+                                      Mathf.Max(1, GetStaticInt("JackInTheBox", "JackInTheBoxLimit")):
+                progress = GetStaticCollectionCount("JackInTheBox", "AllJackInTheBoxes");
+                placements = GetStrategicPlacements(bot, "Trickster", progress == 0);
+                minimumSeparation = 5.5f;
+                stage = $"trickster-box-{progress + 1}";
+                break;
+            case "Trapper":
+                progress = GetStaticInt("Trapper", "charges");
+                placements = GetStrategicPlacements(bot, "Trapper", false);
+                minimumSeparation = 4.5f;
+                stage = "trapper-informative-chokepoint";
+                break;
+            case "SecurityGuard":
+                progress = GetStaticInt("SecurityGuard", "placedCameras");
+                placements = GetStrategicPlacements(bot, "SecurityGuard", false);
+                minimumSeparation = 5.5f;
+                stage = "security-camera-chokepoint";
+                break;
+            default:
+                return false;
+        }
+
+        var current = bot.GetTruePosition();
+        var candidate = SkeldPathGraph.Instance.Nodes
+            .Where(node =>
+                SkeldPathGraph.Instance.IsNodeAllowed(node.Id) &&
+                node.Kind is NodeKind.Corner or NodeKind.Door or NodeKind.Hall or NodeKind.Landmark &&
+                Vector2.Distance(current, node.Position) >= 2.5f &&
+                Vector2.Distance(current, node.Position) <= maximumTravel &&
+                (placements.Count == 0 || placements.All(previous =>
+                    Vector2.Distance(previous, node.Position) >= minimumSeparation)))
+            .Select(node => new
+            {
+                Node = node,
+                Score = ScoreAbilityStagingNode(bot.PlayerId, progress, node, current, placements, preferCorner)
+            })
+            .OrderByDescending(item => item.Score)
+            .ThenBy(item => item.Node.Id, StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (candidate is null)
+        {
+            return false;
+        }
+
+        position = candidate.Node.Position;
+        stage += $":{candidate.Node.Id}";
+        return true;
+    }
+
+    internal static bool TryGetAbilityEscapeDestination(
+        PlayerControl bot,
+        TorRoleInfo role,
+        out Vector2 position,
+        out string stage,
+        out float arrivalDistance)
+    {
+        position = default;
+        stage = string.Empty;
+        arrivalDistance = 1.0f;
+        if (!bot || !GameRuleSettings.IsDeepBotSupportedMap())
+        {
+            return false;
+        }
+
+        Vector2 dangerPosition;
+        float minimumClearance;
+        switch (role.Name)
+        {
+            case "Vampire" when PendingVampireBites.TryGetValue(bot.PlayerId, out var bite):
+                dangerPosition = bite.Origin;
+                minimumClearance = 5.5f;
+                stage = $"vampire-post-bite-cover-{bite.TargetId}";
+                break;
+            case "Bomber" when TryGetBombPosition(out var bombPosition):
+                dangerPosition = bombPosition;
+                minimumClearance = Mathf.Max(4.5f, GetStaticFloat("Bomber", "destructionRange") + 2.5f);
+                stage = "bomber-clear-blast-radius";
+                break;
+            default:
+                return false;
+        }
+
+        var current = bot.GetTruePosition();
+        var candidate = SkeldPathGraph.Instance.Nodes
+            .Where(node =>
+                SkeldPathGraph.Instance.IsNodeAllowed(node.Id) &&
+                node.Kind is NodeKind.Corner or NodeKind.Door or NodeKind.Hall or NodeKind.Landmark)
+            .Select(node => new
+            {
+                Node = node,
+                Travel = Vector2.Distance(current, node.Position),
+                Clearance = Vector2.Distance(dangerPosition, node.Position),
+                NearbyPlayers = PlayerControl.AllPlayerControls.ToArray().Count(player =>
+                    player &&
+                    player.PlayerId != bot.PlayerId &&
+                    player.Data is not null &&
+                    !player.Data.IsDead &&
+                    !player.Data.Disconnected &&
+                    Vector2.Distance(player.GetTruePosition(), node.Position) <= 2.5f)
+            })
+            .Where(item => item.Travel is >= 2.5f and <= 13f && item.Clearance >= minimumClearance)
+            .OrderByDescending(item => item.Clearance - item.Travel * 0.42f - item.NearbyPlayers * 2.25f)
+            .ThenBy(item => item.Node.Id, StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (candidate is null)
+        {
+            return false;
+        }
+
+        position = candidate.Node.Position;
+        stage += $":{candidate.Node.Id}";
+        return true;
+    }
+
+    private static float ScoreAbilityStagingNode(
+        byte botId,
+        int progress,
+        NavNode node,
+        Vector2 current,
+        IReadOnlyList<Vector2> placements,
+        bool preferCorner)
+    {
+        var currentDistance = Vector2.Distance(current, node.Position);
+        var separation = placements.Count == 0
+            ? currentDistance
+            : placements.Min(previous => Vector2.Distance(previous, node.Position));
+        var kindBonus = node.Kind switch
+        {
+            NodeKind.Door => 4.2f,
+            NodeKind.Hall => 3.4f,
+            NodeKind.Corner when preferCorner => 5.5f,
+            NodeKind.Corner => 2.8f,
+            NodeKind.Landmark => 2.2f,
+            _ => 0f
+        };
+        var stableVariation = (StableTextHash(node.Id) + botId * 13 + progress * 29) % 17 * 0.11f;
+        var excessiveTravelPenalty = Mathf.Max(0f, currentDistance - 18f) * 0.35f;
+        return separation * 1.35f + kindBonus + stableVariation - excessiveTravelPenalty;
+    }
+
+    private static int StableTextHash(string value)
+    {
+        unchecked
+        {
+            var hash = 17;
+            foreach (var character in value)
+            {
+                hash = hash * 31 + character;
+            }
+            return Math.Abs(hash == int.MinValue ? int.MaxValue : hash);
+        }
+    }
+
+    private static int CountPersonallyVisibleOpponents(PlayerControl bot)
+    {
+        var position = bot.GetTruePosition();
+        var vision = BotPerceptionPolicy.GetCurrentVisionDistance(bot);
+        return PlayerControl.AllPlayerControls
+            .ToArray()
+            .Count(player =>
+                player &&
+                player.PlayerId != bot.PlayerId &&
+                player.Data is not null &&
+                !player.Data.IsDead &&
+                !player.Data.Disconnected &&
+                !IsImpostorTeam(player) &&
+                !BotPerceptionPolicy.IsConcealedByVent(player) &&
+                Vector2.Distance(position, player.GetTruePosition()) <= vision &&
+                !PhysicsHelpers.AnythingBetween(position, player.GetTruePosition(), Constants.ShipOnlyMask, false));
+    }
+
     internal static bool HasExclusiveKillAbilityPending(PlayerControl? bot)
     {
-        return bot && PendingVampireBites.ContainsKey(bot!.PlayerId);
+        return bot && (PendingVampireBites.ContainsKey(bot!.PlayerId) || PendingWitchSpells.ContainsKey(bot.PlayerId));
     }
 
     internal static bool CanUseOrdinaryMurder(PlayerControl? bot, out string reason)
@@ -504,7 +1367,10 @@ internal static class TorRoleAdapter
         if (IsRoleOwner(bot!, "Mafioso"))
         {
             var godfather = GetStaticField("Godfather", "godfather") as PlayerControl;
-            if (godfather && godfather!.Data is not null && !godfather.Data.IsDead && !godfather.Data.Disconnected)
+            var godfatherExists = godfather;
+            var godfatherAlive = godfather && godfather!.Data is not null && !godfather.Data.IsDead;
+            var godfatherDisconnected = godfather && godfather!.Data is not null && godfather.Data.Disconnected;
+            if (!IsMafiosoKillUnlocked(godfatherExists, godfatherAlive, godfatherDisconnected))
             {
                 reason = "mafioso kill button remains locked while the godfather is alive";
                 return false;
@@ -518,6 +1384,161 @@ internal static class TorRoleAdapter
         }
 
         return true;
+    }
+
+    internal static bool IsMafiosoKillUnlocked(
+        bool godfatherExists,
+        bool godfatherAlive,
+        bool godfatherDisconnected)
+    {
+        return !godfatherExists || !godfatherAlive || godfatherDisconnected;
+    }
+
+    internal static bool IsPreferredOrdinaryMurderTarget(PlayerControl killer, PlayerControl target)
+    {
+        if (!killer || !target || !TryGetRole(killer, out var role) || role.Name != "BountyHunter")
+        {
+            return false;
+        }
+
+        var bounty = GetStaticField("BountyHunter", "bounty") as PlayerControl;
+        return bounty &&
+               bounty!.PlayerId == target.PlayerId &&
+               target.Data is not null &&
+               !target.Data.IsDead &&
+               !target.Data.Disconnected &&
+               !AreLoverPartners(killer, target);
+    }
+
+    internal static float GetConfiguredOrdinaryMurderCooldown(
+        PlayerControl killer,
+        PlayerControl target,
+        float roomCooldown)
+    {
+        if (!killer || !target || !TryGetRole(killer, out var role) || role.Name != "BountyHunter")
+        {
+            return roomCooldown;
+        }
+
+        return ResolveBountyHunterCooldown(
+            IsPreferredOrdinaryMurderTarget(killer, target),
+            roomCooldown,
+            GetStaticFloat("BountyHunter", "bountyKillCooldown"),
+            GetStaticFloat("BountyHunter", "punishmentTime"));
+    }
+
+    internal static float ResolveBountyHunterCooldown(
+        bool killedBounty,
+        float roomCooldown,
+        float bountyCooldown,
+        float punishmentSeconds)
+    {
+        return killedBounty
+            ? Mathf.Max(0.05f, bountyCooldown)
+            : Mathf.Max(0.05f, roomCooldown + Mathf.Max(0f, punishmentSeconds));
+    }
+
+    private static float ResolveWitchAbilityCooldown(float baseCooldown, float currentAddition, float configuredAddition)
+    {
+        return Mathf.Max(0.05f, baseCooldown) +
+               Mathf.Max(0f, currentAddition + Mathf.Max(0f, configuredAddition));
+    }
+
+    private static float ResolveWitchKillCooldown(float roomCooldown, bool isMini, bool miniIsGrown)
+    {
+        var multiplier = !isMini ? 1f : miniIsGrown ? 0.66f : 2f;
+        return Mathf.Max(0f, roomCooldown) * multiplier;
+    }
+
+    internal static void LogRoleCoverageSelfTest(ManualLogSource log)
+    {
+        var activePrimaryNames = RoleSpecs
+            .Where(role => role.ActiveAbility)
+            .Select(role => role.Name)
+            .ToHashSet(StringComparer.Ordinal);
+        var missingActiveBranches = activePrimaryNames
+            .Where(roleName => !ImplementedActiveAbilityNames.Contains(roleName))
+            .OrderBy(roleName => roleName, StringComparer.Ordinal)
+            .ToArray();
+        var unexpectedBranches = ImplementedActiveAbilityNames
+            .Where(roleName => roleName != "Shifter" && !activePrimaryNames.Contains(roleName))
+            .OrderBy(roleName => roleName, StringComparer.Ordinal)
+            .ToArray();
+        var godfatherRecognizedAsOrdinaryKiller = RoleSpecs.Any(role =>
+            role.Name == "Godfather" && role.Alignment == "impostor" && !role.ActiveAbility);
+        var mafiosoRecognizedAsSuccessionKiller = RoleSpecs.Any(role =>
+            role.Name == "Mafioso" && role.Alignment == "impostor" && !role.ActiveAbility);
+        var mafiaSuccessionRulesValid =
+            !IsMafiosoKillUnlocked(true, true, false) &&
+            IsMafiosoKillUnlocked(true, false, false) &&
+            IsMafiosoKillUnlocked(true, true, true) &&
+            IsMafiosoKillUnlocked(false, false, false);
+        var requiredMultiStageRoles = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "Morphling", "Portalmaker", "Trickster", "Ninja", "Warlock",
+            "Arsonist", "Vampire", "Witch", "Bomber", "Yoyo"
+        };
+        var multiStageCoverageValid = ImplementedMultiStageAbilityNames.SetEquals(requiredMultiStageRoles) &&
+                                      ImplementedMultiStageAbilityNames.All(roleName =>
+                                          activePrimaryNames.Contains(roleName) && ImplementedActiveAbilityNames.Contains(roleName));
+        var bountyCooldownRulesValid =
+            Mathf.Approximately(ResolveBountyHunterCooldown(true, 30f, 5f, 15f), 5f) &&
+            Mathf.Approximately(ResolveBountyHunterCooldown(false, 30f, 5f, 15f), 45f);
+        var witchCastingRulesValid =
+            Mathf.Approximately(ResolveWitchAbilityCooldown(30f, 0f, 10f), 40f) &&
+            Mathf.Approximately(ResolveWitchAbilityCooldown(30f, 10f, 10f), 50f) &&
+            Mathf.Approximately(ResolveWitchKillCooldown(30f, false, false), 30f) &&
+            Mathf.Approximately(ResolveWitchKillCooldown(30f, true, true), 19.8f) &&
+            Mathf.Approximately(ResolveWitchKillCooldown(30f, true, false), 60f);
+        var stableStageSelection = StableTextHash("MIRA_Y_CENTER") == StableTextHash("MIRA_Y_CENTER") &&
+                                   StableTextHash("MIRA_Y_CENTER") != StableTextHash("MIRA_LAUNCHPAD_E");
+        var multiStageCooldownGateValid =
+            !IsRoleStageReadyAt(10f, 10.01f) &&
+            IsRoleStageReadyAt(10.01f, 10.01f) &&
+            IsRoleStageReadyAt(11f, 10.01f);
+        var remoteContinuationRulesValid =
+            StageRequiresCasterProximity("Morphling", false) &&
+            !StageRequiresCasterProximity("Morphling", true) &&
+            !StageRequiresCasterProximity("Ninja", true) &&
+            !StageRequiresCasterProximity("Warlock", true) &&
+            StageRequiresCasterProximity("Vampire", true);
+        var sequenceTargetAbortRulesValid =
+            IsSequenceTargetStateAvailable(true, true, false, false, true, true) &&
+            !IsSequenceTargetStateAvailable(true, true, true, false, false, true) &&
+            !IsSequenceTargetStateAvailable(true, true, false, true, false, true) &&
+            !IsSequenceTargetStateAvailable(false, false, false, false, false, true);
+        var ventOnlyRoleRoutingValid =
+            ShouldExposeStrategicRole(false, true) &&
+            !ShouldExposeStrategicRole(false, false);
+        var level = RoleSpecs.Length == 44 &&
+                    missingActiveBranches.Length == 0 &&
+                    unexpectedBranches.Length == 0 &&
+                    godfatherRecognizedAsOrdinaryKiller &&
+                     mafiosoRecognizedAsSuccessionKiller &&
+                     mafiaSuccessionRulesValid &&
+                     multiStageCoverageValid &&
+                     bountyCooldownRulesValid &&
+                     witchCastingRulesValid &&
+                     stableStageSelection &&
+                     multiStageCooldownGateValid &&
+                     remoteContinuationRulesValid &&
+                     sequenceTargetAbortRulesValid &&
+                     ventOnlyRoleRoutingValid
+            ? "ok"
+            : "error";
+        log.LogInfo(
+            $"DeepBot TOR role coverage self-test: level={level}, recognizedPrimary={RoleSpecs.Length}, " +
+            $"activePrimary={activePrimaryNames.Count}, implementedAbilityBranches={ImplementedActiveAbilityNames.Count}, " +
+            $"missingActive=[{string.Join(",", missingActiveBranches)}], unexpected=[{string.Join(",", unexpectedBranches)}], " +
+            $"godfatherOrdinaryKill={godfatherRecognizedAsOrdinaryKiller}, " +
+            $"mafiosoSuccession={mafiosoRecognizedAsSuccessionKiller && mafiaSuccessionRulesValid}, " +
+            $"multiStageCoverage={multiStageCoverageValid}, multiStageRoles=[{string.Join(",", ImplementedMultiStageAbilityNames.OrderBy(name => name, StringComparer.Ordinal))}], " +
+            $"multiStageCooldownGate={multiStageCooldownGateValid}, " +
+            $"remoteContinuationRules={remoteContinuationRulesValid}, sequenceTargetAbortRules={sequenceTargetAbortRulesValid}, " +
+            $"ventOnlyRoleRouting={ventOnlyRoleRoutingValid}, " +
+            $"bountyCooldownRules={bountyCooldownRulesValid}, " +
+            $"witchCastingRules={witchCastingRulesValid}, " +
+            $"stableStageSelection={stableStageSelection}.");
     }
 
     private static bool IsRoleOwner(PlayerControl bot, string roleName)
@@ -534,7 +1555,14 @@ internal static class TorRoleAdapter
 
     internal static float GetAbilityUseRange(string roleName)
     {
-        return roleName == "Arsonist" ? 2f : 3.5f;
+        return roleName switch
+        {
+            "Arsonist" => 2f,
+            "Sheriff" or "Deputy" or "Vampire" or "Warlock" or "Ninja" or
+            "Jackal" or "Sidekick" or "Pursuer" or "Thief" or "Eraser" or
+            "Witch" or "Shifter" => GameRuleSettings.GetKillDistance(1.8f),
+            _ => 3.5f
+        };
     }
 
     internal static bool IsRuleImmobilized(PlayerControl? player)
@@ -544,8 +1572,136 @@ internal static class TorRoleAdapter
             return false;
         }
 
+        if (PendingDouses.ContainsKey(player!.PlayerId) ||
+            PendingWitchSpells.ContainsKey(player.PlayerId) ||
+            PendingPortalTeleports.ContainsKey(player.PlayerId) ||
+            PendingRoleRoots.TryGetValue(player.PlayerId, out var channelRootUntil) && Time.time < channelRootUntil)
+        {
+            return true;
+        }
+
         var map = GetStaticField("Trap", "trapPlayerIdMap") as IDictionary;
-        return map?.Contains(player!.PlayerId) == true;
+        return map?.Contains(player!.PlayerId) == true ||
+               PendingRoleRoots.TryGetValue(player!.PlayerId, out var rootedUntil) && Time.time < rootedUntil;
+    }
+
+    internal static bool IsPortalTeleportPending(PlayerControl? player)
+    {
+        return player && PendingPortalTeleports.ContainsKey(player!.PlayerId);
+    }
+
+    internal static IReadOnlyList<TorPortalTraversalOption> GetPortalTraversalOptions(PlayerControl bot)
+    {
+        if (!bot || bot.Data is null || bot.Data.IsDead || bot.Data.Disconnected ||
+            bot.inVent || bot.walkingToVent || IsHandcuffed(bot) || MeetingHud.Instance || ExileController.Instance ||
+            Time.time < NextPortalUseAt.GetValueOrDefault(bot.PlayerId) ||
+            !TryGetPortalEndpoints(out var first, out var second, out var teleportDuration) ||
+            GetStaticBool("Portal", "isTeleporting"))
+        {
+            return Array.Empty<TorPortalTraversalOption>();
+        }
+
+        var options = new List<TorPortalTraversalOption>(2)
+        {
+            new(first, second, false, 0, teleportDuration),
+            new(second, first, false, 0, teleportDuration)
+        };
+
+        if (TryGetRole(bot, out var role) && role.Name == "Portalmaker" &&
+            GetStaticBool("Portalmaker", "canPortalFromAnywhere"))
+        {
+            var origin = bot.GetTruePosition();
+            options.Add(new TorPortalTraversalOption(origin, first, true, 1, teleportDuration));
+            options.Add(new TorPortalTraversalOption(origin, second, true, 2, teleportDuration));
+        }
+
+        return options;
+    }
+
+    internal static bool TryBeginPortalTeleport(
+        PlayerControl bot,
+        TorPortalTraversalOption option,
+        out string outcome)
+    {
+        outcome = string.Empty;
+        if (!bot || bot.Data is null || bot.Data.IsDead || bot.Data.Disconnected ||
+            !bot.moveable || bot.inVent || bot.walkingToVent || IsHandcuffed(bot) ||
+            MeetingHud.Instance || ExileController.Instance)
+        {
+            outcome = "player cannot legally enter a portal in the current game phase";
+            return false;
+        }
+
+        if (PendingPortalTeleports.ContainsKey(bot.PlayerId))
+        {
+            outcome = "portal travel is already in progress";
+            return false;
+        }
+
+        if (Time.time < NextPortalUseAt.GetValueOrDefault(bot.PlayerId))
+        {
+            outcome = "room-configured portal cooldown is still active";
+            return false;
+        }
+
+        if (GetStaticBool("Portal", "isTeleporting") ||
+            !TryGetPortalEndpoints(out var first, out var second, out var nativeDuration))
+        {
+            outcome = "the portal network is unavailable or currently occupied";
+            return false;
+        }
+
+        var position = bot.GetTruePosition();
+        var entryMatchesFirst = Vector2.Distance(option.Entry, first) <= 0.12f;
+        var entryMatchesSecond = Vector2.Distance(option.Entry, second) <= 0.12f;
+        var exitMatchesFirst = Vector2.Distance(option.Exit, first) <= 0.12f;
+        var exitMatchesSecond = Vector2.Distance(option.Exit, second) <= 0.12f;
+        if (option.Remote)
+        {
+            if (!TryGetRole(bot, out var role) || role.Name != "Portalmaker" ||
+                !GetStaticBool("Portalmaker", "canPortalFromAnywhere") ||
+                option.ExitMode is < 1 or > 2 ||
+                option.ExitMode == 1 && !exitMatchesFirst ||
+                option.ExitMode == 2 && !exitMatchesSecond)
+            {
+                outcome = "remote portal use is not legal for this player or endpoint";
+                return false;
+            }
+        }
+        else if ((!entryMatchesFirst || !exitMatchesSecond) && (!entryMatchesSecond || !exitMatchesFirst) ||
+                 Vector2.Distance(position, option.Entry) > 0.32f)
+        {
+            outcome = "ordinary portal use requires physical proximity to the matching entry";
+            return false;
+        }
+
+        var duration = Mathf.Max(0.1f, nativeDuration > 0.05f ? nativeDuration : option.Duration);
+        if (!option.Remote)
+        {
+            bot.NetTransform.RpcSnapTo(option.Entry);
+        }
+
+        SendRpc(bot, 146, writer =>
+        {
+            writer.Write(bot.PlayerId);
+            writer.Write(option.ExitMode);
+        });
+        InvokeProcedure("usePortal", bot.PlayerId, option.ExitMode);
+
+        bot.moveable = false;
+        bot.NetTransform.Halt();
+        StopRoleChannelMovement(bot);
+        PendingPortalTeleports[bot.PlayerId] = new PendingPortalTeleport(
+            option.Entry,
+            option.Exit,
+            Time.time + duration * 0.5f,
+            Time.time + duration,
+            false);
+        outcome = $"entered {(option.Remote ? "remote" : "nearby")} portal; nativeDuration={duration:0.00}s";
+        _log?.LogInfo(
+            $"DeepBot TOR portal travel started: bot={Describe(bot)}, entry={option.Entry}, exit={option.Exit}, " +
+            $"remote={option.Remote}, exitMode={option.ExitMode}, duration={duration:0.00}s.");
+        return true;
     }
 
     internal static bool IsMovementInverted(PlayerControl? player)
@@ -597,6 +1753,63 @@ internal static class TorRoleAdapter
         var secondLover = lover2!;
         return (firstLover.PlayerId == firstPlayer.PlayerId && secondLover.PlayerId == secondPlayer.PlayerId) ||
                (secondLover.PlayerId == firstPlayer.PlayerId && firstLover.PlayerId == secondPlayer.PlayerId);
+    }
+
+    internal static bool AreKnownAllies(PlayerControl? first, PlayerControl? second)
+    {
+        if (!first || !second || first!.PlayerId == second!.PlayerId)
+        {
+            return first && second && first!.PlayerId == second!.PlayerId;
+        }
+
+        if (AreLoverPartners(first, second) || IsImpostorTeam(first) && IsImpostorTeam(second))
+        {
+            return true;
+        }
+
+        return TryGetRole(first, out var firstRole) &&
+               TryGetRole(second, out var secondRole) &&
+               firstRole.Name is "Jackal" or "Sidekick" &&
+               secondRole.Name is "Jackal" or "Sidekick";
+    }
+
+    internal static bool ShouldProtectMeetingTarget(PlayerControl voter, PlayerControl? target)
+    {
+        if (!voter || !target || voter.PlayerId == target!.PlayerId)
+        {
+            return false;
+        }
+
+        if (AreKnownAllies(voter, target))
+        {
+            return true;
+        }
+
+        return TryGetRole(voter, out var voterRole) &&
+               voterRole.Name == "Lawyer" &&
+               GetStaticField("Lawyer", "target") is PlayerControl client &&
+               client &&
+               client.PlayerId == target.PlayerId;
+    }
+
+    internal static bool TryGetStrategicMeetingVoteTarget(PlayerControl voter, out byte targetId)
+    {
+        targetId = byte.MaxValue;
+        if (!voter ||
+            !TryGetRole(voter, out var voterRole) ||
+            voterRole.Name != "Prosecutor" ||
+            GetStaticField("Lawyer", "target") is not PlayerControl target ||
+            !target ||
+            target.Data is null ||
+            target.Data.IsDead ||
+            target.Data.Disconnected ||
+            target.PlayerId == voter.PlayerId)
+        {
+            return false;
+        }
+
+        targetId = target.PlayerId;
+        return true;
     }
 
     internal static void RegisterConfiguredCooldown(PlayerControl bot, TorRoleInfo role)
@@ -691,6 +1904,109 @@ internal static class TorRoleAdapter
         return true;
     }
 
+    internal static bool TryGetPublicRoleAlignment(string roleName, out string alignment)
+    {
+        var spec = RoleSpecs.FirstOrDefault(candidate =>
+            string.Equals(candidate.Name, roleName, StringComparison.OrdinalIgnoreCase));
+        alignment = spec?.Alignment ?? string.Empty;
+        return spec is not null;
+    }
+
+    internal static bool TryUseEvidenceBackedGuesserShot(
+        PlayerControl bot,
+        PlayerControl target,
+        string inferredRoleName,
+        float inferenceConfidence,
+        out string outcome)
+    {
+        outcome = string.Empty;
+        if (!bot || !target || !MeetingHud.Instance || bot.Data is null || target.Data is null ||
+            bot.Data.IsDead || target.Data.IsDead || target.Data.Disconnected ||
+            inferenceConfidence < 0.90f || ShouldProtectMeetingTarget(bot, target))
+        {
+            return false;
+        }
+
+        var guesserRole = IsRoleOwner(bot, "NiceGuesser")
+            ? "NiceGuesser"
+            : IsRoleOwner(bot, "EvilGuesser")
+                ? "EvilGuesser"
+                : string.Empty;
+        if (string.IsNullOrEmpty(guesserRole) ||
+            GetStaticInt("Guesser", guesserRole == "NiceGuesser"
+                ? "remainingShotsNiceGuesser"
+                : "remainingShotsEvilGuesser") <= 0 ||
+            !TryResolveTorRoleId(inferredRoleName, out var guessedRoleId))
+        {
+            return false;
+        }
+
+        if (!GetStaticBool("Utilities.HandleGuesser", "killsThroughShield") &&
+            GetStaticField("Medic", "shielded") is PlayerControl shielded &&
+            shielded && shielded.PlayerId == target.PlayerId)
+        {
+            outcome = $"held {guesserRole} shot because {Describe(target)} is visibly protected by TOR shield rules";
+            return false;
+        }
+
+        var guessedCorrectly = TryGetRole(target, out var actualRole) &&
+                               string.Equals(actualRole.Name, inferredRoleName, StringComparison.OrdinalIgnoreCase);
+        var dyingTarget = guessedCorrectly ? target : bot;
+        SendRpc(bot, 152, writer =>
+        {
+            writer.Write(bot.PlayerId);
+            writer.Write(dyingTarget.PlayerId);
+            writer.Write(target.PlayerId);
+            writer.Write(guessedRoleId);
+        });
+        InvokeProcedure("guesserShoot", bot.PlayerId, dyingTarget.PlayerId, target.PlayerId, guessedRoleId);
+        outcome = guessedCorrectly
+            ? $"{guesserRole} correctly inferred {Describe(target)} as {inferredRoleName} from personally visible behavior"
+            : $"{guesserRole} misguessed {Describe(target)} as {inferredRoleName} and TOR applied the normal self-elimination";
+        return true;
+    }
+
+    private static bool TryResolveTorRoleId(string roleName, out byte roleId)
+    {
+        roleId = byte.MaxValue;
+        if (!EnsureLoaded() || _assembly is null || string.IsNullOrWhiteSpace(roleName))
+        {
+            return false;
+        }
+
+        var roleInfoType = _assembly.GetType("TheOtherRoles.RoleInfo", false);
+        if (roleInfoType?.GetField("allRoleInfos", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                ?.GetValue(null) is not IEnumerable roleInfos)
+        {
+            return false;
+        }
+
+        foreach (var item in roleInfos)
+        {
+            if (item is null)
+            {
+                continue;
+            }
+
+            var itemType = item.GetType();
+            var id = itemType.GetField("roleId", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                ?.GetValue(item);
+            var displayName = itemType.GetField("name", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+                ?.GetValue(item) as string;
+            if (id is null ||
+                !string.Equals(id.ToString(), roleName, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(displayName, roleName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            roleId = Convert.ToByte(id);
+            return true;
+        }
+
+        return false;
+    }
+
     internal static DeadBody? FindVisibleUsableBody(PlayerControl bot)
     {
         if (!bot || bot.Data is null)
@@ -722,20 +2038,118 @@ internal static class TorRoleAdapter
 
     internal static bool CanUseVents(PlayerControl bot, TorRoleInfo role)
     {
-        if (!bot || bot.Data is null || IsHandcuffed(bot)) return false;
-        return role.Name switch
+        if (!bot || bot.Data is null || IsHandcuffed(bot) || !EnsureLoaded() || _helpersType is null)
         {
-            "Engineer" => true,
-            "Jackal" => GetStaticBool("Jackal", "canUseVents"),
-            "Sidekick" => GetStaticBool("Sidekick", "canUseVents"),
-            "Spy" => GetStaticBool("Spy", "canEnterVents"),
-            "Vulture" => GetStaticBool("Vulture", "canUseVents"),
-            "Thief" => GetStaticBool("Thief", "canUseVents"),
-            "Janitor" => false,
-            "Mafioso" when GetStaticField("Godfather", "godfather") is PlayerControl godfather &&
-                            godfather && godfather.Data is not null && !godfather.Data.IsDead => false,
-            _ => role.IsImpostorTeam && bot.Data.Role?.CanVent == true
-        };
+            return false;
+        }
+
+        try
+        {
+            _roleCanUseVentsMethod ??= _helpersType.GetMethod(
+                "roleCanUseVents",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                null,
+                new[] { typeof(PlayerControl) },
+                null);
+            var nativeAllowsVenting = _roleCanUseVentsMethod?.Invoke(null, new object[] { bot }) is true;
+            if (!nativeAllowsVenting)
+            {
+                return false;
+            }
+
+            return !string.Equals(role.Name, "Engineer", StringComparison.Ordinal) ||
+                   IsTorEngineerVentReady(bot, out _);
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(
+                $"DeepBot TOR native vent permission failed: player={bot.Data?.PlayerName}({bot.PlayerId}), " +
+                $"role={role.Name}, error={ex.GetBaseException().Message}");
+            return false;
+        }
+    }
+
+    private static bool IsTorEngineerVentReady(PlayerControl bot, out float remainingSeconds)
+    {
+        remainingSeconds = 0f;
+        if (!EnsureLoaded() || _assembly is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var type = _assembly.GetType(TorEngineerVentRulesTypeName, false);
+            var method = type?.GetMethod(
+                "CanEnter",
+                BindingFlags.Public | BindingFlags.Static,
+                null,
+                new[] { typeof(PlayerControl), typeof(float).MakeByRefType() },
+                null);
+            if (method is null)
+            {
+                return false;
+            }
+
+            object[] arguments = { bot, 0f };
+            var ready = method.Invoke(null, arguments) is true;
+            remainingSeconds = arguments[1] is float seconds ? Mathf.Max(0f, seconds) : 0f;
+            return ready;
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(
+                $"DeepBot TOR Engineer native vent readiness failed: player={bot.Data?.PlayerName}({bot.PlayerId}), " +
+                $"error={ex.GetBaseException().Message}");
+            return false;
+        }
+    }
+
+    internal static bool TryEnterTorEngineerVent(
+        PlayerControl bot,
+        int ventId,
+        out string outcome)
+    {
+        outcome = "TOR Engineer native vent rules unavailable";
+        if (!EnsureLoaded() || _assembly is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var assembly = _assembly;
+            if (assembly is null)
+            {
+                outcome = "TOR assembly is unavailable";
+                return false;
+            }
+
+            var type = assembly.GetType(TorEngineerVentRulesTypeName, false);
+            var method = type?.GetMethod(
+                "TryEnterVent",
+                BindingFlags.Public | BindingFlags.Static,
+                null,
+                new[] { typeof(PlayerControl), typeof(int), typeof(string).MakeByRefType() },
+                null);
+            if (method is null)
+            {
+                return false;
+            }
+
+            object[] arguments = { bot, ventId, string.Empty };
+            var entered = method.Invoke(null, arguments) is true;
+            outcome = arguments[2] as string ?? (entered ? "entered through TOR native rules" : "TOR rejected vent entry");
+            return entered;
+        }
+        catch (Exception ex)
+        {
+            outcome = $"TOR Engineer native vent invocation failed: {ex.GetBaseException().Message}";
+            _log?.LogWarning(
+                $"DeepBot TOR Engineer native vent invocation failed: player={bot.Data?.PlayerName}({bot.PlayerId}), " +
+                $"vent={ventId}, error={ex.GetBaseException()}");
+            return false;
+        }
     }
 
     internal static bool IsArsonistReadyToIgnite(PlayerControl bot)
@@ -750,6 +2164,36 @@ internal static class TorRoleAdapter
             .Where(player => IsLegalNearbyTarget(bot, player, role))
             .Where(player => role.Name != "Arsonist" || !IsDoused(player.PlayerId))
             .OrderBy(player => Vector2.Distance(bot.GetTruePosition(), player.GetTruePosition()))
+            .FirstOrDefault();
+    }
+
+    internal static PlayerControl? FindArsonistPursuitTarget(PlayerControl bot)
+    {
+        if (!bot || !TryGetRole(bot, out var role) || role.Name != "Arsonist")
+        {
+            return null;
+        }
+
+        return PlayerControl.AllPlayerControls
+            .ToArray()
+            .Where(player =>
+                IsLivingOpponent(bot, player, role) &&
+                !IsDoused(player.PlayerId) &&
+                BotPerceptionPolicy.CanBeOrdinarilyObserved(player))
+            .Select(player => new
+            {
+                Player = player,
+                Distance = Vector2.Distance(bot.GetTruePosition(), player.GetTruePosition()),
+                Blocked = PhysicsHelpers.AnythingBetween(
+                    bot.GetTruePosition(),
+                    player.GetTruePosition(),
+                    Constants.ShipOnlyMask,
+                    false)
+            })
+            .Where(item => item.Distance <= 8.5f && !item.Blocked)
+            .OrderBy(item => item.Distance)
+            .ThenBy(item => item.Player.PlayerId)
+            .Select(item => item.Player)
             .FirstOrDefault();
     }
 
@@ -785,7 +2229,7 @@ internal static class TorRoleAdapter
                     player.PlayerId != bot.PlayerId &&
                     player.Data is not null &&
                     !player.Data.Disconnected &&
-                    player.Data.Role?.IsImpostor == true)
+                    IsImpostorTeam(player))
                 .Select(Describe)
                 .ToArray();
             return WithModifierInformation(bot, allies.Length == 0
@@ -804,13 +2248,47 @@ internal static class TorRoleAdapter
         var impostor = string.Join(", ", RoleSpecs.Where(role => role.Alignment == "impostor").Select(role => role.Name));
         var neutral = string.Join(", ", RoleSpecs.Where(role => role.Alignment == "neutral").Select(role => role.Name));
         var modifiers = string.Join(", ", ModifierSpecs.Select(modifier => modifier.Name).Distinct(StringComparer.Ordinal));
+        var outcomeMap = string.Join(", ", RoleSpecs.Select(role =>
+            $"{role.Name}={BuildPublicWinConditionBrief(role.Name, role.Alignment)}"));
         return
             $"Public TOR role rulebook (possible roles, never secret assignments): crew=[{crew}]; impostor=[{impostor}]; neutral=[{neutral}]; modifiers=[{modifiers}]. " +
+            $"Public strategic outcome map (possible win goals, not assignments): {outcomeMap}. " +
             "Deduction constraints: a witnessed vent proves only a vent-capable role (ordinary impostor, Engineer, or a room-enabled Jackal/Sidekick/Spy/Vulture/Thief); " +
             "a witnessed kill proves a kill-capable role, which can also be Sheriff, Jackal faction, Vampire, Warlock, Ninja, Thief, Bomber, Arsonist, or another hostile custom role, so use target legality and aftermath to narrow it; " +
             "a disappearing body can indicate Janitor, Cleaner, Vulture, or another explicit body-removal skill; fake-task standing and task-bar motion alone do not prove crew; " +
             "Jester wants exile, Arsonist must douse everyone then ignite, Vulture must consume bodies, Lawyer/Prosecutor act around their assigned target, Pursuer prioritizes survival, and Jackal/Sidekick have an independent faction objective. " +
+            "Every player must optimize the actual goal of their own current role: crew protects crew victory, impostors protect impostor-team victory, and neutrals prioritize their independent win. " +
+            "A public Jester self-claim creates exile risk: faction players should not hand over a Jester win on speech alone; require stronger physical evidence or choose another candidate. " +
+            "Lovers must preserve the known partner, and an ungrown Mini must not be killed because that can immediately award the Mini outcome under TOR rules. " +
             "Only infer from personally visible actions and public claims; never read another player's hidden role from engine state.";
+    }
+
+    private static string BuildPublicWinConditionBrief(string roleName, string alignment)
+    {
+        if (string.Equals(alignment, "crewmate", StringComparison.Ordinal))
+        {
+            return "crew victory by tasks or removing every hostile faction";
+        }
+
+        if (string.Equals(alignment, "impostor", StringComparison.Ordinal))
+        {
+            return "impostor-team parity or fatal sabotage";
+        }
+
+        return roleName switch
+        {
+            "Jester" => "be voted out",
+            "Jackal" => "Jackal faction eliminates all outsiders",
+            "Sidekick" => "help or inherit the Jackal faction and eliminate outsiders",
+            "Arsonist" => "fully douse every other living player then ignite",
+            "Vulture" => "consume the configured number of bodies",
+            "Prosecutor" => "get the assigned prosecution target voted out",
+            "Lawyer" => "keep the assigned client alive and make the client faction win, or convert after client loss",
+            "Pursuer" => "survive through a non-impostor victory",
+            "Thief" => "legally steal a hostile role then inherit that faction goal",
+            "Shifter" => "shift into another role then pursue the inherited role goal",
+            _ => $"independent {roleName} objective"
+        };
     }
 
     internal static bool TryGetNearestMediumSoulPosition(PlayerControl bot, out Vector2 position)
@@ -829,6 +2307,24 @@ internal static class TorRoleAdapter
     {
         var live = role.Name switch
         {
+            "Engineer" => $"Repairs remaining={GetStaticInt("Engineer", "remainingFixes")}; reserve a charge for a dangerous active emergency and otherwise use room-legal vents only for a purposeful rotation.",
+            "Mayor" => $"Remote meetings remaining={GetStaticInt("Mayor", "remoteMeetingsLeft")}; call one only when retained evidence is strong enough to justify interrupting the round.",
+            "Medic" => GetStaticBool("Medic", "usedShield")
+                ? "Shield is already committed; observe whether the protected player is pressured and use that information later without revealing hidden mechanics."
+                : "Shield one exposed, useful, or credibly trusted player; do not select a random nearest body merely because the button is ready.",
+            "Sheriff" => "The shot is lethal evidence enforcement, not a scouting tool. Require a witnessed hostile act or a strong retained meeting case and account for room-enabled neutral/Spy/Mini rules before firing.",
+            "Deputy" => $"Handcuffs remaining={GetStaticFloat("Deputy", "remainingHandcuffs"):0}; restrain an evidence-backed threat before it can use a kill or special ability, then reassess after the configured duration.",
+            "Tracker" => GetStaticBool("Tracker", "usedTracker")
+                ? "A tracking target is already committed; use the resulting route information as evidence instead of repeatedly searching for another target."
+                : "Track a trusted escort or a concrete suspect whose future route answers a real question.",
+            "TimeMaster" => GetStaticBool("TimeMaster", "shieldActive")
+                ? "Time shield is active; stay close enough to the threatened area for a rewind to matter."
+                : "Raise the shield only around credible immediate danger, not in an empty room.",
+            "Camouflager" => GetStaticFloat("Camouflager", "camouflageTimer") > 0.05f
+                ? "Camouflage is active; execute the planned rotation, rescue, or elimination and leave before identities become reliable again."
+                : "Wait for a concrete kill, escape, or identity-confusion opportunity before spending camouflage.",
+            "Hacker" => $"Information charges: admin={GetStaticInt("Hacker", "chargesAdminTable")}, vitals={GetStaticInt("Hacker", "chargesVitals")}; spend the source that resolves the current uncertainty, then remember the anonymous nature of admin information.",
+            "Medium" => $"Available souls={GetStaticCollectionCount("Medium", "deadBodies")}; approach a legal soul and retain only the clue TOR actually supplies.",
             "Arsonist" => BuildArsonistProgress(bot),
             "Vulture" => $"Progress: eaten={GetStaticInt("Vulture", "eatenBodies")}/{GetStaticInt("Vulture", "vultureNumberToWin")}; seek an accessible body and consume it instead of reporting when safe.",
             "Jackal" => GetStaticBool("Jackal", "canCreateSidekick")
@@ -854,6 +2350,47 @@ internal static class TorRoleAdapter
             "Ninja" => GetStaticField("Ninja", "ninjaMarked") is PlayerControl marked && marked
                 ? $"Marked target={Describe(marked)}; strike only when the remote assassination and invisibility create a credible escape."
                 : "Mark an isolated useful target first; do not mark randomly when witnesses make the later strike obvious.",
+            "Morphling" => GetStaticField("Morphling", "sampledTarget") is PlayerControl sampled && sampled
+                ? $"Phase: sampled {Describe(sampled)}. Move out of other players' sight, then trigger the second stage to morph; never skip the sample stage."
+                : "Phase: choose and approach one credible disguise target, sample them first, then disengage before transforming.",
+            "Portalmaker" => GetStaticField("Portal", "firstPortal") is not null && GetStaticField("Portal", "secondPortal") is null
+                ? "Phase: first portal is placed; travel to a meaningfully separated useful room and place the second endpoint."
+                : GetStaticBool("Portal", "bothPlacedAndEnabled")
+                    ? "Phase: both endpoints are active. Use the native timed portal only when its entry, animation, and exit make the current route meaningfully shorter."
+                    : "Phase: place the first endpoint where later rotations matter, then complete the pair in a distant room.",
+            "Trickster" => BuildTricksterProgress(bot),
+            "Cleaner" or "Janitor" => "A body-removal skill must be used only on a physically visible nearby corpse when witness risk is acceptable; after cleaning, leave or construct ordinary cover instead of standing on the vanished body.",
+            "Eraser" => GetStaticCollectionCount("Eraser", "futureErased") > 0
+                ? "An erasure is already scheduled for the next resolution; preserve cover and do not treat the hidden target as public knowledge."
+                : "Schedule erasure on a high-value opposing role only when personal evidence makes that target strategically credible.",
+            "Witch" => PendingWitchSpells.TryGetValue(bot.PlayerId, out var spell)
+                ? $"Spell channel is active on playerId={spell.TargetId}; stay in native range and line of sight until completion or abort cleanly if legality changes."
+                : "Select an isolated high-value opponent, complete the configured cast without moving, then leave before the meeting resolves the spell.",
+            "Shifter" => GetStaticField("Shifter", "futureShift") is PlayerControl futureShift && futureShift
+                ? $"A shift with {Describe(futureShift)} is scheduled; survive until TOR resolves it and then adopt the inherited objective."
+                : "Shift only when observed evidence makes the target role worth inheriting; a blind nearest-player shift can destroy the current objective.",
+            "Trapper" => $"Trap charges remaining={GetStaticInt("Trapper", "charges")}; place separated information traps on real traffic lines and interpret only TOR-revealed trigger data.",
+            "SecurityGuard" => $"Screws remaining={GetStaticInt("SecurityGuard", "remainingScrews")}; on MIRA seal a reachable vent, otherwise choose between a separated camera and vent seal according to map legality and information value.",
+            "Bomber" => GetStaticBool("Bomber", "isPlanted")
+                ? "A bomb is active; clear its native blast area, avoid exposing ownership, and let TOR handle arming, defuse, and explosion outcomes."
+                : "Plant only where predicted traffic and timing create a deliberate split or elimination, then immediately execute an escape/alibi stage.",
+            "Yoyo" => GetStaticField("Yoyo", "markedLocation") is not null
+                ? "Phase: return point is armed; blink only for a concrete ambush, alibi, escape, or concealed rotation, then let the timed return resolve."
+                : "Phase: mark a defensible return point first, then move elsewhere before using the second-stage blink.",
+            "Godfather" => "Lead ordinary kills while alive; protect the Mafioso's cover and choose targets by isolation, faction value, and escape feasibility rather than always preferring the human host.",
+            "Mafioso" => GetStaticField("Godfather", "godfather") is PlayerControl godfather && godfather.Data is not null && !godfather.Data.IsDead && !godfather.Data.Disconnected
+                ? $"Godfather {Describe(godfather)} is alive, so ordinary killing is locked; fake tasks, gather cover, and support the team until succession unlocks."
+                : "The Godfather is gone or disconnected; succession has unlocked ordinary kills, so adopt the killer role without remaining idle.",
+            "BountyHunter" => GetStaticField("BountyHunter", "bounty") is PlayerControl bounty && bounty
+                ? $"Current bounty={Describe(bounty)}; prefer it only when the chase is safe, otherwise abandon pursuit and accept TOR's configured cooldown penalty."
+                : "No live bounty is currently assigned; maintain normal impostor cover and target selection.",
+            "NiceGuesser" or "EvilGuesser" => "Meeting shot only: guess an exact role solely from a uniquely identifying witnessed action or equivalent strong evidence; a blind guess can kill the guesser.",
+            "Swapper" => "Meeting only: swap two vote columns only when the predicted tally and personal objective make the changed outcome better than leaving votes untouched.",
+            "Lighter" => "Use improved vision as an observation advantage, not as permission to claim events through walls or outside current light radius.",
+            "Detective" => "Build deductions from personal footprints and timelines; distinguish a route clue from proof of a hidden role.",
+            "Seer" => "Retain only soul information TOR visibly exposes and combine it with later public evidence without revealing engine-only identities.",
+            "Snitch" => "Prioritize completing real assigned tasks while avoiding obvious isolation near the final-task reveal threshold.",
+            "Spy" => "Use impostor-facing information carefully while preserving an ordinary crew route; vent use depends on the room option and remains publicly suspicious.",
             "Jester" => "Phase: create believable inconsistencies and attract votes gradually; do not perform an obvious role confession that rational players would ignore.",
             _ => string.Empty
         };
@@ -863,16 +2400,86 @@ internal static class TorRoleAdapter
                (string.IsNullOrWhiteSpace(modifierPlan) ? string.Empty : $" {modifierPlan}");
     }
 
-    internal static void Update()
+    private static string BuildTricksterProgress(PlayerControl bot)
     {
+        var boxes = GetStaticCollectionCount("JackInTheBox", "AllJackInTheBoxes");
+        var limit = Mathf.Max(1, GetStaticInt("JackInTheBox", "JackInTheBoxLimit"));
+        var converted = GetStaticBool("JackInTheBox", "boxesConvertedToVents");
+        var darkness = GetStaticFloat("Trickster", "lightsOutTimer") > 0.05f;
+        if (boxes < limit)
+        {
+            return $"Phase: build separated box network; progress={boxes}/{limit}. Route to a different useful room before each placement.";
+        }
+
+        if (!converted)
+        {
+            return $"Phase: all {limit} boxes are placed; wait for TOR's next-meeting conversion instead of repeatedly pressing the skill.";
+        }
+
+        return darkness
+            ? "Phase: darkness is active; use the converted box vents for a concealed ambush or escape, then leave the scene."
+            : "Phase: converted box network is ready; trigger darkness only with a concrete target, kill, escape, or time-pressure plan.";
+    }
+
+    internal static void Update(int matchSerial)
+    {
+        SynchronizeMatchState(matchSerial);
         UpdateVirtualBotHandcuffs();
         UpdateVirtualBotTrapTriggers();
+        UpdatePortalAvailabilityAndTravel();
+
+        foreach (var pair in PendingRoleRoots.ToArray())
+        {
+            var rooted = FindPlayer(pair.Key);
+            if (Time.time < pair.Value && rooted && rooted!.Data is not null && !rooted.Data.IsDead)
+            {
+                rooted.moveable = false;
+                StopRoleChannelMovement(rooted);
+                continue;
+            }
+
+            PendingRoleRoots.Remove(pair.Key);
+            if (rooted && rooted!.Data is not null && !rooted.Data.IsDead &&
+                !MeetingHud.Instance && !ExileController.Instance && !IsRuleImmobilized(rooted))
+            {
+                rooted.moveable = true;
+            }
+            _log?.LogInfo($"DeepBot TOR role root expired: bot={Describe(rooted)}.");
+        }
+
+        foreach (var pair in PendingWitchSpells.ToArray())
+        {
+            var bot = FindPlayer(pair.Key);
+            var target = FindPlayer(pair.Value.TargetId);
+            var witchRole = default(TorRoleInfo);
+            var roleMatches = bot && TryGetRole(bot!, out witchRole) && witchRole.Name == "Witch";
+            var targetRemainsLegal = roleMatches &&
+                                     target &&
+                                     IsLegalNearbyTarget(bot!, target, witchRole) &&
+                                     GetStaticField("Witch", "spellCastingTarget") is PlayerControl castingTarget &&
+                                     castingTarget &&
+                                     castingTarget.PlayerId == target!.PlayerId;
+            if (!targetRemainsLegal)
+            {
+                CancelPendingWitchSpell(pair.Key, bot, target, "target changed, became hidden, moved out of range, or lost line of sight");
+                continue;
+            }
+
+            StopRoleChannelMovement(bot!);
+            if (Time.time < pair.Value.CompleteAt)
+            {
+                continue;
+            }
+
+            CompletePendingWitchSpell(bot!, target!, witchRole);
+        }
 
         foreach (var pair in PendingDouses.ToArray())
         {
             var bot = FindPlayer(pair.Key);
             var target = FindPlayer(pair.Value.TargetId);
             if (!bot || !target || bot!.Data is null || target!.Data is null || bot.Data.IsDead || target.Data.IsDead ||
+                BotPerceptionPolicy.IsConcealedByVent(target) ||
                 Vector2.Distance(bot.GetTruePosition(), target.GetTruePosition()) > 2.25f)
             {
                 PendingDouses.Remove(pair.Key);
@@ -896,6 +2503,12 @@ internal static class TorRoleAdapter
             }
 
             AddDousedPlayer(target);
+            SendRpc(bot, 179, writer =>
+            {
+                writer.Write(bot.PlayerId);
+                writer.Write((byte)2);
+                writer.Write(target.PlayerId);
+            });
             PendingDouses.Remove(pair.Key);
             NextRoleAbilityAt[(pair.Key, "Arsonist")] = Time.time + Mathf.Max(0.05f, GetStaticFloat("Arsonist", "cooldown"));
             _log?.LogInfo($"DeepBot Arsonist douse completed: bot={Describe(bot)}, target={Describe(target)}, {BuildArsonistProgress(bot)}");
@@ -906,7 +2519,6 @@ internal static class TorRoleAdapter
             if (Time.time < pair.Value.CompleteAt) continue;
             var bot = FindPlayer(pair.Key);
             var target = FindPlayer(pair.Value.TargetId);
-            PendingVampireBites.Remove(pair.Key);
 
             var killed = false;
             var result = "bite target no longer valid";
@@ -919,6 +2531,14 @@ internal static class TorRoleAdapter
                     result = "TOR murder validator unavailable; delayed bite was safely cancelled";
                 }
             }
+
+            // Keep the pending marker alive while MurderPlayer runs.  The
+            // VampireDelayedDeathPositionPatch uses it to distinguish this
+            // delayed, animation-free death from an ordinary kill and prevent
+            // the vampire from being snapped to the victim by native kill
+            // presentation code.  Clearing it before the murder made that
+            // invariant impossible to recognize.
+            PendingVampireBites.Remove(pair.Key);
 
             if (bot)
             {
@@ -939,30 +2559,20 @@ internal static class TorRoleAdapter
             var bot = FindPlayer(pair.Key);
             var victim = FindPlayer(pair.Value.VictimId);
             if (!bot || !victim || bot!.Data is null || victim!.Data is null || bot.Data.IsDead || victim.Data.IsDead ||
-                !TryGetRole(bot, out var warlockRole) || warlockRole.Name != "Warlock" ||
-                Time.time >= pair.Value.ExpiresAt)
+                victim.Data.Disconnected || !TryGetRole(bot, out var warlockRole) || warlockRole.Name != "Warlock" ||
+                MeetingHud.Instance || ExileController.Instance)
             {
-                ClearWarlockCurse(pair.Key, "curse expired or carrier became unavailable");
+                ClearWarlockCurse(pair.Key, "meeting started or curse carrier became unavailable");
                 continue;
             }
 
-            var forcedTarget = PlayerControl.AllPlayerControls
-                .ToArray()
-                .Where(player =>
-                    player &&
-                    player.PlayerId != bot.PlayerId &&
-                    player.PlayerId != victim.PlayerId &&
-                    player.Data is not null &&
-                    !player.Data.IsDead &&
-                    !player.Data.Disconnected &&
-                    player.Data.Role?.IsImpostor != true &&
-                    Vector2.Distance(victim.GetTruePosition(), player.GetTruePosition()) <= 2.0f)
-                .OrderBy(player => Vector2.Distance(victim.GetTruePosition(), player.GetTruePosition()))
-                .FirstOrDefault();
-            if (!forcedTarget) continue;
+            if (BotPerceptionPolicy.IsConcealedByVent(victim))
+            {
+                SetStaticField("Warlock", "curseVictimTarget", null!);
+                continue;
+            }
 
-            var handled = TryExecuteRuleAwareMurder(bot, forcedTarget!, out var killed, out var result, showAnimation: false);
-            ClearWarlockCurse(pair.Key, $"redirected target={Describe(forcedTarget)}, handled={handled}, killed={killed}, result={result}");
+            SetStaticField("Warlock", "curseVictimTarget", FindWarlockSecondTarget(bot, victim.PlayerId)!);
         }
 
         foreach (var pair in PendingNinjaReveals.ToArray())
@@ -1000,6 +2610,95 @@ internal static class TorRoleAdapter
             NextRoleAbilityAt[(bot.PlayerId, "Yoyo")] =
                 Time.time + Mathf.Max(0.05f, GetStaticFloat("Yoyo", "markCooldown"));
             _log?.LogInfo($"DeepBot Yoyo strategic return completed: bot={Describe(bot)}.");
+        }
+    }
+
+    private static void SynchronizeMatchState(int matchSerial)
+    {
+        if (matchSerial <= 0 || matchSerial == _observedMatchSerial)
+        {
+            return;
+        }
+
+        _observedMatchSerial = matchSerial;
+        LoggedAssignments.Clear();
+        LoggedAssignmentConflicts.Clear();
+        PendingDouses.Clear();
+        PendingVampireBites.Clear();
+        PendingWarlockCurses.Clear();
+        PendingWitchSpells.Clear();
+        PendingRoleRoots.Clear();
+        PendingNinjaReveals.Clear();
+        PendingYoyoReturns.Clear();
+        PendingPortalTeleports.Clear();
+        NextPortalUseAt.Clear();
+        NextRoleAbilityAt.Clear();
+        StrategicPlacements.Clear();
+        _portalsWereEnabled = false;
+        _nextVirtualTrapScanAt = 0f;
+        _log?.LogInfo($"DeepBot TOR staged-role state reset for new match: match={matchSerial}.");
+    }
+
+    private static void UpdatePortalAvailabilityAndTravel()
+    {
+        var portalsEnabled = GetStaticBool("Portal", "bothPlacedAndEnabled");
+        if (portalsEnabled && !_portalsWereEnabled)
+        {
+            var cooldown = Mathf.Max(0f, GetStaticFloat("Portalmaker", "usePortalCooldown"));
+            if (PlayerControl.AllPlayerControls is not null)
+            {
+                foreach (var bot in PlayerControl.AllPlayerControls.ToArray().Where(DeepBotIdentity.IsBot))
+                {
+                    NextPortalUseAt[bot.PlayerId] = Time.time + cooldown;
+                }
+            }
+            _log?.LogInfo($"DeepBot TOR portal network enabled: initialCooldown={cooldown:0.00}s.");
+        }
+        else if (!portalsEnabled && _portalsWereEnabled)
+        {
+            NextPortalUseAt.Clear();
+        }
+        _portalsWereEnabled = portalsEnabled;
+
+        foreach (var pair in PendingPortalTeleports.ToArray())
+        {
+            var bot = FindPlayer(pair.Key);
+            var travel = pair.Value;
+            if (!bot || bot!.Data is null || bot.Data.IsDead || bot.Data.Disconnected ||
+                MeetingHud.Instance || ExileController.Instance || !portalsEnabled)
+            {
+                PendingPortalTeleports.Remove(pair.Key);
+                if (bot && bot!.Data is not null && !bot.Data.IsDead && !IsHandcuffed(bot))
+                {
+                    bot.moveable = !MeetingHud.Instance && !ExileController.Instance;
+                }
+                _log?.LogInfo($"DeepBot TOR portal travel cancelled safely: bot={Describe(bot)}, portalEnabled={portalsEnabled}.");
+                continue;
+            }
+
+            bot.moveable = false;
+            bot.NetTransform.Halt();
+            StopRoleChannelMovement(bot);
+            if (!travel.Moved && Time.time >= travel.MidpointAt)
+            {
+                bot.NetTransform.RpcSnapTo(travel.Exit);
+                travel = travel with { Moved = true };
+                PendingPortalTeleports[pair.Key] = travel;
+                _log?.LogInfo($"DeepBot TOR portal midpoint reached: bot={Describe(bot)}, exit={travel.Exit}.");
+            }
+
+            if (Time.time < travel.CompleteAt)
+            {
+                continue;
+            }
+
+            PendingPortalTeleports.Remove(pair.Key);
+            NextPortalUseAt[pair.Key] = Time.time + Mathf.Max(0f, GetStaticFloat("Portalmaker", "usePortalCooldown"));
+            if (!IsHandcuffed(bot) && !MeetingHud.Instance && !ExileController.Instance)
+            {
+                bot.moveable = true;
+            }
+            _log?.LogInfo($"DeepBot TOR portal travel completed: bot={Describe(bot)}, exit={travel.Exit}.");
         }
     }
 
@@ -1041,10 +2740,14 @@ internal static class TorRoleAdapter
 
     private static void UpdateVirtualBotTrapTriggers()
     {
-        if (!EnsureLoaded() || AmongUsClient.Instance is null || !AmongUsClient.Instance.AmHost)
+        if (Time.time < _nextVirtualTrapScanAt ||
+            !EnsureLoaded() ||
+            AmongUsClient.Instance is null ||
+            !AmongUsClient.Instance.AmHost)
         {
             return;
         }
+        _nextVirtualTrapScanAt = Time.time + VirtualTrapScanIntervalSeconds;
 
         try
         {
@@ -1064,7 +2767,8 @@ internal static class TorRoleAdapter
 
             foreach (var bot in PlayerControl.AllPlayerControls.ToArray().Where(DeepBotIdentity.IsBot))
             {
-                if (!bot || bot.Data is null || bot.Data.IsDead || bot.Data.Disconnected || bot.inVent || !bot.moveable ||
+                if (!bot || bot.Data is null || bot.Data.IsDead || bot.Data.Disconnected ||
+                    BotPerceptionPolicy.IsConcealedByVent(bot) || !bot.moveable ||
                     trapper && trapper!.PlayerId == bot.PlayerId || IsRuleImmobilized(bot))
                 {
                     continue;
@@ -1114,7 +2818,18 @@ internal static class TorRoleAdapter
         out string outcome)
     {
         outcome = string.Empty;
-        if (!IsAbilityReady(bot, role) || !AmongUsClient.Instance)
+        var abilityReady = IsAbilityReady(bot, role);
+        var hasSequence = TryGetAbilitySequencePlan(bot, role, out var sequence);
+        var sequenceRoleCoolingDown = hasSequence &&
+                                      string.Equals(sequence.AbilityAction, "role", StringComparison.Ordinal) &&
+                                      !IsConfiguredRoleStageReady(bot, role.Name);
+        if (!BotBehaviorPolicy.CanContinueAbilityThroughReadinessGate(
+                abilityReady,
+                hasSequence && sequence.Active,
+                hasSequence && sequence.ShouldUse,
+                hasSequence ? sequence.AbilityAction : null) ||
+            sequenceRoleCoolingDown ||
+            !AmongUsClient.Instance)
         {
             outcome = "TOR ability is unavailable or cooling down";
             return false;
@@ -1124,14 +2839,27 @@ internal static class TorRoleAdapter
         var ninjaMarked = role.Name == "Ninja"
             ? GetStaticField("Ninja", "ninjaMarked") as PlayerControl
             : null;
+        var morphSampled = role.Name == "Morphling"
+            ? GetStaticField("Morphling", "sampledTarget") as PlayerControl
+            : null;
         if (ninjaMarked)
         {
             target = ninjaMarked;
         }
+        else if (morphSampled)
+        {
+            target = morphSampled;
+        }
 
-        var targetIsLegal = role.Name == "Ninja" && ninjaMarked
-            ? IsLivingOpponent(bot, target, role)
-            : IsLegalNearbyTarget(bot, target, role);
+        var targetIsLegal = role.Name == "Warlock" && PendingWarlockCurses.TryGetValue(bot.PlayerId, out var pendingCurse)
+            ? IsLegalWarlockSecondTarget(bot, pendingCurse.VictimId, target)
+            : role.Name == "Morphling" && morphSampled
+                ? IsSequenceTargetAvailable(morphSampled, allowVentConcealment: true) &&
+                  !AreLoverPartners(bot, morphSampled) &&
+                  (!role.IsImpostorTeam || !IsImpostorTeam(morphSampled))
+            : role.Name == "Ninja" && ninjaMarked
+                ? IsLivingOpponent(bot, target, role)
+                : IsLegalNearbyTarget(bot, target, role);
         if (NeedsLivingTarget(role.Name) && !targetIsLegal)
         {
             outcome = "no legal nearby target";
@@ -1198,10 +2926,7 @@ internal static class TorRoleAdapter
                     outcome = "raised the time shield near danger";
                     return true;
                 case "Morphling":
-                    SendRpc(bot, 130, writer => writer.Write(target!.PlayerId));
-                    InvokeProcedure("morphlingMorph", target!.PlayerId);
-                    outcome = $"morphed into {Describe(target)}";
-                    return true;
+                    return TryUseMorphling(bot, target!, out outcome);
                 case "Camouflager":
                     SendRpc(bot, 131);
                     InvokeProcedure("camouflagerCamouflage");
@@ -1285,10 +3010,7 @@ internal static class TorRoleAdapter
                     outcome = $"scheduled erasure of {Describe(target)}";
                     return true;
                 case "Witch":
-                    SendRpc(bot, 143, writer => writer.Write(target!.PlayerId));
-                    InvokeProcedure("setFutureSpelled", target!.PlayerId);
-                    outcome = $"spelled {Describe(target)} for the next meeting";
-                    return true;
+                    return TryStartWitchSpell(bot, target!, out outcome);
                 case "Shifter":
                     SendRpc(bot, 141, writer => writer.Write(target!.PlayerId));
                     InvokeProcedure("setFutureShifted", target!.PlayerId);
@@ -1303,7 +3025,7 @@ internal static class TorRoleAdapter
                 case "Trickster":
                     return TryUseTrickster(bot, out outcome);
                 case "SecurityGuard":
-                    return TryPlaceSecurityCamera(bot, out outcome);
+                    return TryUseSecurityGuard(bot, out outcome);
                 case "Bomber":
                     return TryPlantBomb(bot, out outcome);
                 case "Yoyo":
@@ -1321,6 +3043,98 @@ internal static class TorRoleAdapter
         }
     }
 
+    private static bool TryStartWitchSpell(PlayerControl bot, PlayerControl target, out string outcome)
+    {
+        var duration = Mathf.Max(0.05f, GetStaticFloat("Witch", "spellCastingDuration"));
+        SetStaticField("Witch", "currentTarget", target);
+        SetStaticField("Witch", "spellCastingTarget", target);
+        PendingWitchSpells[bot.PlayerId] = new PendingWitchSpell(target.PlayerId, Time.time + duration);
+        StopRoleChannelMovement(bot);
+        outcome = $"began {duration:0.0}s spell channel on {Describe(target)}";
+        _log?.LogInfo(
+            $"DeepBot Witch spell channel started: bot={Describe(bot)}, target={Describe(target)}, " +
+            $"duration={duration:0.00}s, range={GetAbilityUseRange("Witch"):0.00}.");
+        return true;
+    }
+
+    private static void CompletePendingWitchSpell(PlayerControl bot, PlayerControl target, TorRoleInfo role)
+    {
+        PendingWitchSpells.Remove(bot.PlayerId);
+        var handled = TryCheckRuleAwareMurder(bot, target, out var result);
+        var performsSpell = handled && string.Equals(result, "PerformKill", StringComparison.Ordinal);
+        var consumesCooldown = performsSpell || handled && string.Equals(result, "BlankKill", StringComparison.Ordinal);
+
+        if (performsSpell)
+        {
+            SendRpc(bot, 143, writer => writer.Write(target.PlayerId));
+            InvokeProcedure("setFutureSpelled", target.PlayerId);
+        }
+
+        if (consumesCooldown)
+        {
+            var priorAddition = GetStaticFloat("Witch", "currentCooldownAddition");
+            var configuredAddition = GetStaticFloat("Witch", "cooldownAddition");
+            var nextAddition = Mathf.Max(0f, priorAddition + Mathf.Max(0f, configuredAddition));
+            SetStaticField("Witch", "currentCooldownAddition", nextAddition);
+            NextRoleAbilityAt[(bot.PlayerId, role.Name)] =
+                Time.time + ResolveWitchAbilityCooldown(GetStaticFloat("Witch", "cooldown"), priorAddition, configuredAddition);
+
+            if (GetStaticBool("Witch", "triggerBothCooldowns"))
+            {
+                var mini = GetStaticField("Mini", "mini") as PlayerControl;
+                var isMini = mini && mini!.PlayerId == bot.PlayerId;
+                bot.killTimer = Mathf.Max(
+                    bot.killTimer,
+                    ResolveWitchKillCooldown(
+                        GameRuleSettings.GetKillCooldown(bot.killTimer),
+                        isMini,
+                        isMini && InvokeStaticBool("Mini", "isGrownUp")));
+            }
+        }
+        else
+        {
+            NextRoleAbilityAt[(bot.PlayerId, role.Name)] = Time.time + 0.35f;
+        }
+
+        ClearWitchCastingFields();
+        _log?.LogInfo(
+            $"DeepBot Witch spell channel resolved: bot={Describe(bot)}, target={Describe(target)}, " +
+            $"handled={handled}, result={result}, spelled={performsSpell}, cooldownConsumed={consumesCooldown}.");
+    }
+
+    private static void CancelPendingWitchSpell(byte botId, PlayerControl? bot, PlayerControl? target, string reason)
+    {
+        PendingWitchSpells.Remove(botId);
+        NextRoleAbilityAt[(botId, "Witch")] = Time.time + 0.35f;
+        ClearWitchCastingFields();
+        if (bot)
+        {
+            StopRoleChannelMovement(bot!);
+        }
+        _log?.LogInfo(
+            $"DeepBot Witch spell channel interrupted: bot={Describe(bot)}, target={Describe(target)}, reason={reason}.");
+    }
+
+    private static void ClearWitchCastingFields()
+    {
+        SetStaticField("Witch", "spellCastingTarget", null!);
+        SetStaticField("Witch", "currentTarget", null!);
+    }
+
+    private static void StopRoleChannelMovement(PlayerControl bot)
+    {
+        if (!bot.MyPhysics)
+        {
+            return;
+        }
+
+        bot.MyPhysics.SetNormalizedVelocity(Vector2.zero);
+        if (bot.MyPhysics.body)
+        {
+            bot.MyPhysics.body.velocity = Vector2.zero;
+        }
+    }
+
     private static bool TryUseEngineerRepair(PlayerControl bot, out string outcome)
     {
         var repairable = bot.myTasks?.ToArray()
@@ -1330,37 +3144,42 @@ internal static class TorRoleAdapter
             outcome = "no active repairable emergency";
             return false;
         }
+        var repairTaskType = repairable!.TaskType;
 
-        SendRpc(bot, 122);
-        InvokeProcedure("engineerUsedRepair");
-        switch (repairable!.TaskType)
+        try
         {
-            case TaskTypes.FixLights:
-                SendRpc(bot, 120);
-                InvokeProcedure("engineerFixLights");
-                break;
-            case TaskTypes.RestoreOxy:
-                ShipStatus.Instance.UpdateSystem(SystemTypes.LifeSupp, bot, 0 | 64);
-                ShipStatus.Instance.UpdateSystem(SystemTypes.LifeSupp, bot, 1 | 64);
-                break;
-            case TaskTypes.ResetReactor:
-                ShipStatus.Instance.UpdateSystem(SystemTypes.Reactor, bot, 16);
-                break;
-            case TaskTypes.ResetSeismic:
-                ShipStatus.Instance.UpdateSystem(SystemTypes.Laboratory, bot, 16);
-                break;
-            case TaskTypes.FixComms:
-                ShipStatus.Instance.UpdateSystem(SystemTypes.Comms, bot, 16 | 0);
-                ShipStatus.Instance.UpdateSystem(SystemTypes.Comms, bot, 16 | 1);
-                break;
-            case TaskTypes.StopCharles:
-                ShipStatus.Instance.UpdateSystem(SystemTypes.Reactor, bot, 0 | 16);
-                ShipStatus.Instance.UpdateSystem(SystemTypes.Reactor, bot, 1 | 16);
-                break;
-        }
+            var assembly = _assembly;
+            if (assembly is null)
+            {
+                outcome = "TOR assembly is unavailable";
+                return false;
+            }
 
-        outcome = $"spent one room-configured repair charge on {repairable.TaskType}";
-        return true;
+            var type = assembly.GetType(TorEngineerVentRulesTypeName, false);
+            var method = type?.GetMethod(
+                "TryRepairEmergency",
+                BindingFlags.Public | BindingFlags.Static,
+                null,
+                new[] { typeof(PlayerControl), typeof(int), typeof(string).MakeByRefType() },
+                null);
+            if (method is null)
+            {
+                outcome = "TOR native Engineer repair bridge is unavailable";
+                return false;
+            }
+
+            var args = new object[] { bot, (int)repairTaskType, string.Empty };
+            var repaired = method.Invoke(null, args) is true;
+            outcome = args[2] as string ?? (repaired
+                ? $"TOR native Engineer repaired {repairTaskType}"
+                : $"TOR native Engineer declined {repairTaskType}");
+            return repaired;
+        }
+        catch (Exception ex)
+        {
+            outcome = $"TOR native Engineer repair failed: {ex.GetBaseException().Message}";
+            return false;
+        }
     }
 
     private static bool TryPlacePortal(PlayerControl bot, out string outcome)
@@ -1386,6 +3205,26 @@ internal static class TorRoleAdapter
         NextRoleAbilityAt[(bot.PlayerId, "Portalmaker")] =
             Time.time + Mathf.Max(0.05f, GetStaticFloat("Portalmaker", "cooldown"));
         outcome = $"placed portal {placements.Count}/2 at {SkeldPathGraph.Instance.NearestNode(position).Id}";
+        return true;
+    }
+
+    private static bool TryUseMorphling(PlayerControl bot, PlayerControl target, out string outcome)
+    {
+        var sampled = GetStaticField("Morphling", "sampledTarget") as PlayerControl;
+        if (!sampled)
+        {
+            SetStaticField("Morphling", "sampledTarget", target);
+            NextRoleAbilityAt[(bot.PlayerId, "Morphling")] = Time.time + 1.05f;
+            outcome = $"sampled {Describe(target)}; first stage complete, now disengage and transform from concealment";
+            return true;
+        }
+
+        SendRpc(bot, 130, writer => writer.Write(sampled!.PlayerId));
+        InvokeProcedure("morphlingMorph", sampled!.PlayerId);
+        SetStaticField("Morphling", "sampledTarget", null!);
+        NextRoleAbilityAt[(bot.PlayerId, "Morphling")] =
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Morphling", "cooldown"));
+        outcome = $"completed second stage and morphed into sampled player {Describe(sampled)}";
         return true;
     }
 
@@ -1426,6 +3265,38 @@ internal static class TorRoleAdapter
             Time.time + Mathf.Max(0.05f, GetStaticFloat("Trickster", "placeBoxCooldown"));
         outcome = $"placed Jack-in-the-box {boxes + 1}/{limit} at {SkeldPathGraph.Instance.NearestNode(position).Id}";
         return true;
+    }
+
+    private static bool TryUseSecurityGuard(PlayerControl bot, out string outcome)
+    {
+        var remaining = GetStaticInt("SecurityGuard", "remainingScrews");
+        var ventPrice = Mathf.Max(1, GetStaticInt("SecurityGuard", "ventPrice"));
+        var camPrice = Mathf.Max(1, GetStaticInt("SecurityGuard", "camPrice"));
+        var nearbyVent = FindNearestUnsealedVent(bot, 1.75f);
+        var mustSealVent = GameRuleSettings.IsMiraHqMap();
+        var shouldSealVent = nearbyVent &&
+                             remaining >= ventPrice &&
+                             (mustSealVent || remaining < camPrice || GetStaticInt("SecurityGuard", "placedCameras") > 0);
+        if (shouldSealVent)
+        {
+            SendRpc(bot, 150, writer => writer.WritePacked(nearbyVent!.Id));
+            InvokeProcedure("sealVent", nearbyVent!.Id);
+            SetStaticField("SecurityGuard", "ventTarget", null!);
+            NextRoleAbilityAt[(bot.PlayerId, "SecurityGuard")] =
+                Time.time + Mathf.Max(0.05f, GetStaticFloat("SecurityGuard", "cooldown"));
+            outcome = $"scheduled vent {nearbyVent.Id} for sealing using the room-configured screw cost {ventPrice}";
+            return true;
+        }
+
+        if (mustSealVent)
+        {
+            outcome = nearbyVent
+                ? "not enough room-configured screws to seal the nearby MIRA vent"
+                : "MIRA Security Guard must approach an unsealed vent; portable cameras are not legal on this map";
+            return false;
+        }
+
+        return TryPlaceSecurityCamera(bot, out outcome);
     }
 
     private static bool TryPlaceSecurityCamera(PlayerControl bot, out string outcome)
@@ -1499,7 +3370,8 @@ internal static class TorRoleAdapter
         InvokeProcedure("vampireSetBitten", target.PlayerId, (byte)0);
         PendingVampireBites[bot.PlayerId] = new PendingVampireBite(
             target.PlayerId,
-            Time.time + Mathf.Max(0.05f, GetStaticFloat("Vampire", "delay")));
+            Time.time + Mathf.Max(0.05f, GetStaticFloat("Vampire", "delay")),
+            bot.GetTruePosition());
         outcome = $"bit isolated target {Describe(target)}; delayed kill will resolve after the room-configured delay";
         return true;
     }
@@ -1529,17 +3401,87 @@ internal static class TorRoleAdapter
 
     private static bool TryUseWarlockCurse(PlayerControl bot, PlayerControl target, out string outcome)
     {
-        if (PendingWarlockCurses.ContainsKey(bot.PlayerId))
+        if (PendingWarlockCurses.TryGetValue(bot.PlayerId, out var pending))
         {
-            outcome = "a curse carrier is already active";
-            return false;
+            if (!IsLegalWarlockSecondTarget(bot, pending.VictimId, target))
+            {
+                outcome = "curse carrier has no legal second target in TOR kill range";
+                return false;
+            }
+
+            var handled = TryExecuteRuleAwareMurder(bot, target, out var killed, out var result, showAnimation: false);
+            if (!handled)
+            {
+                outcome = "TOR murder validator unavailable; forced-kill stage safely held";
+                return false;
+            }
+
+            if (result.Contains("result=SuppressKill", StringComparison.Ordinal))
+            {
+                outcome = $"forced-kill stage was suppressed by TOR and remains armed ({result})";
+                return true;
+            }
+
+            var rootSeconds = Mathf.Max(0f, GetStaticFloat("Warlock", "rootTime"));
+            ClearWarlockCurse(bot.PlayerId, $"second stage target={Describe(target)}, killed={killed}, result={result}");
+            bot.killTimer = Mathf.Max(bot.killTimer, Mathf.Max(0.05f, GetStaticFloat("Warlock", "cooldown")));
+            if (rootSeconds > 0f)
+            {
+                PendingRoleRoots[bot.PlayerId] = Time.time + rootSeconds;
+                bot.moveable = false;
+                StopRoleChannelMovement(bot);
+            }
+            outcome = $"completed curse against {Describe(target)}; killed={killed}; rooted={rootSeconds:0.0}s ({result})";
+            return true;
         }
 
         SetStaticField("Warlock", "curseVictim", target);
         SetStaticField("Warlock", "curseVictimTarget", null!);
-        PendingWarlockCurses[bot.PlayerId] = new PendingWarlockCurse(target.PlayerId, Time.time + 30f);
+        PendingWarlockCurses[bot.PlayerId] = new PendingWarlockCurse(target.PlayerId);
         outcome = $"cursed mobile carrier {Describe(target)} and will redirect a kill only if that carrier approaches a legal opponent";
         return true;
+    }
+
+    private static PlayerControl? FindWarlockSecondTarget(PlayerControl bot, byte victimId)
+    {
+        var victim = FindPlayer(victimId);
+        if (!victim || victim!.Data is null || victim.Data.IsDead || victim.Data.Disconnected ||
+            BotPerceptionPolicy.IsConcealedByVent(victim))
+        {
+            return null;
+        }
+
+        return PlayerControl.AllPlayerControls
+            .ToArray()
+            .Where(player => IsLegalWarlockSecondTarget(bot, victimId, player))
+            .OrderBy(player => Vector2.Distance(victim.GetTruePosition(), player.GetTruePosition()))
+            .ThenBy(player => player.PlayerId)
+            .FirstOrDefault();
+    }
+
+    private static bool IsLegalWarlockSecondTarget(PlayerControl bot, byte victimId, PlayerControl? target)
+    {
+        var victim = FindPlayer(victimId);
+        if (!victim || !target ||
+            target!.PlayerId == victimId ||
+            target.PlayerId == bot.PlayerId ||
+            target.Data is null ||
+            target.Data.IsDead ||
+            target.Data.Disconnected ||
+            BotPerceptionPolicy.IsConcealedByVent(target) ||
+            IsImpostorTeam(target) ||
+            AreLoverPartners(bot, target))
+        {
+            return false;
+        }
+
+        var carrierPosition = victim!.GetTruePosition();
+        return Vector2.Distance(carrierPosition, target.GetTruePosition()) <= GameRuleSettings.GetKillDistance(1.8f) &&
+               !PhysicsHelpers.AnythingBetween(
+                   carrierPosition,
+                   target.GetTruePosition(),
+                   Constants.ShipOnlyMask,
+                   false);
     }
 
     private static void ClearWarlockCurse(byte botId, string reason)
@@ -1606,14 +3548,51 @@ internal static class TorRoleAdapter
             return false;
         }
 
+        if (!TryCheckRuleAwareMurder(bot, bot, out var placementCheck, ignoreMedic: true))
+        {
+            outcome = "bomb placement safely cancelled because TOR's native placement precheck was unavailable";
+            return false;
+        }
+
+        if (string.Equals(placementCheck, "BlankKill", StringComparison.Ordinal))
+        {
+            // TOR consumes the blank instead of creating a bomb. Keep the
+            // world free of a fake planted state so the next legal cooldown
+            // cycle can use the native button path again.
+            SetStaticField("Bomber", "isPlanted", false);
+            NextRoleAbilityAt[(bot.PlayerId, "Bomber")] =
+                Time.time + Mathf.Max(0.05f, GetStaticFloat("Bomber", "bombCooldown"));
+            outcome = "TOR blocked bomb placement with BlankKill; no bomb object was created";
+            return true;
+        }
+
         var position = bot.GetTruePosition();
+        var blastRadius = Mathf.Max(0.1f, GetStaticFloat("Bomber", "destructionRange"));
+        var endangeredLover = PlayerControl.AllPlayerControls
+            .ToArray()
+            .FirstOrDefault(player =>
+                player &&
+                player.Data is not null &&
+                !player.Data.IsDead &&
+                !player.Data.Disconnected &&
+                AreLoverPartners(bot, player) &&
+                Vector2.Distance(position, player.GetTruePosition()) <= blastRadius + 0.75f);
+        if (endangeredLover)
+        {
+            outcome = $"bomb placement cancelled because known Lover partner {Describe(endangeredLover)} is inside the predicted blast area";
+            return false;
+        }
+
         var buffer = BuildPositionBuffer(position);
         SendRpc(bot, 165, writer => writer.WriteBytesAndSize(buffer));
         InvokeProcedure("placeBomb", buffer);
         SetStaticField("Bomber", "isPlanted", true);
         NextRoleAbilityAt[(bot.PlayerId, "Bomber")] =
             Time.time + Mathf.Max(0.05f, GetStaticFloat("Bomber", "bombCooldown"));
-        outcome = $"planted a room-configured bomb at {SkeldPathGraph.Instance.NearestNode(position).Id} for a deliberate split or elimination";
+        outcome =
+            $"planted a room-configured bomb at {SkeldPathGraph.Instance.NearestNode(position).Id} " +
+            $"for a deliberate split or elimination; armsAfter={GetStaticFloat("Bomber", "bombActiveAfter"):0.0}s, " +
+            $"explodesAfterArmed={GetStaticFloat("Bomber", "destructionTime"):0.0}s, radius={blastRadius:0.0}";
         return true;
     }
 
@@ -1799,6 +3778,72 @@ internal static class TorRoleAdapter
         return buffer;
     }
 
+    private static Vent? FindNearestUnsealedVent(PlayerControl bot, float maximumDistance)
+    {
+        if (!bot)
+        {
+            return null;
+        }
+
+        var position = bot.GetTruePosition();
+        return UnityEngine.Object.FindObjectsOfType<Vent>()
+            .Where(vent => vent && !IsVentScheduledOrSealed(vent))
+            .Select(vent => new
+            {
+                Vent = vent,
+                Distance = Vector2.Distance(position, vent.transform.position)
+            })
+            .Where(item => item.Distance <= maximumDistance)
+            .OrderBy(item => item.Distance)
+            .ThenBy(item => item.Vent.Id)
+            .Select(item => item.Vent)
+            .FirstOrDefault();
+    }
+
+    private static bool IsVentScheduledOrSealed(Vent vent)
+    {
+        if (!vent)
+        {
+            return true;
+        }
+
+        var name = vent!.name ?? string.Empty;
+        if (name.StartsWith("JackInTheBoxVent_", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("SealedVent", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (GetStaticField("TORMapOptions", "ventsToSeal") is IEnumerable scheduled)
+        {
+            foreach (var item in scheduled)
+            {
+                if (item is Vent scheduledVent && scheduledVent && scheduledVent.Id == vent.Id)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetBombPosition(out Vector2 position)
+    {
+        position = default;
+        var bomb = GetStaticField("Bomber", "bomb");
+        var gameObject = bomb?.GetType()
+            .GetField("bomb", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?
+            .GetValue(bomb) as GameObject;
+        if (!gameObject)
+        {
+            return false;
+        }
+
+        position = gameObject!.transform.position;
+        return true;
+    }
+
     private static List<Vector2> GetStrategicPlacements(PlayerControl bot, string role, bool reset)
     {
         var key = (bot.PlayerId, role);
@@ -1898,7 +3943,8 @@ internal static class TorRoleAdapter
             target!.PlayerId == bot.PlayerId ||
             target.Data is null ||
             target.Data.IsDead ||
-            target.Data.Disconnected)
+            target.Data.Disconnected ||
+            BotPerceptionPolicy.IsConcealedByVent(target))
         {
             return false;
         }
@@ -1908,12 +3954,17 @@ internal static class TorRoleAdapter
             return false;
         }
 
-        return !role.IsImpostorTeam || target.Data.Role?.IsImpostor != true;
+        if (role.Name == "Witch" && role.IsImpostorTeam && GetStaticBool("Witch", "canSpellAnyone"))
+        {
+            return true;
+        }
+
+        return !role.IsImpostorTeam || !IsImpostorTeam(target);
     }
 
     private static bool IsSheriffKillLegal(PlayerControl target)
     {
-        if (target.Data?.Role?.IsImpostor == true)
+        if (IsImpostorTeam(target))
         {
             var mini = GetStaticField("Mini", "mini") as PlayerControl;
             if (mini && mini!.PlayerId == target.PlayerId && !InvokeStaticBool("Mini", "isGrownUp"))
@@ -2053,7 +4104,7 @@ internal static class TorRoleAdapter
             return true;
         }
 
-        var eligible = target.Data?.Role?.IsImpostor == true;
+        var eligible = IsImpostorTeam(target);
         if (TryGetRole(target, out var targetRole))
         {
             eligible |= targetRole.Name is "Jackal" or "Sidekick" ||
@@ -2077,7 +4128,13 @@ internal static class TorRoleAdapter
     private static bool IsLegalNearbyTarget(PlayerControl bot, PlayerControl? target, TorRoleInfo role)
     {
         if (!IsLivingOpponent(bot, target, role) ||
-            Vector2.Distance(bot.GetTruePosition(), target!.GetTruePosition()) > (role.Name == "Arsonist" ? 2.0f : 3.5f))
+            !BotPerceptionPolicy.CanBeOrdinarilyObserved(target) ||
+            Vector2.Distance(bot.GetTruePosition(), target!.GetTruePosition()) > GetAbilityUseRange(role.Name) ||
+            PhysicsHelpers.AnythingBetween(
+                bot.GetTruePosition(),
+                target.GetTruePosition(),
+                Constants.ShipOnlyMask,
+                false))
         {
             return false;
         }
@@ -2094,7 +4151,7 @@ internal static class TorRoleAdapter
 
             if (role.Name == "Jackal" &&
                 GetStaticBool("Jackal", "canCreateSidekick") &&
-                target.Data.Role?.IsImpostor == true &&
+                IsImpostorTeam(target) &&
                 !GetStaticBool("Jackal", "canCreateSidekickFromImpostor"))
             {
                 return false;
@@ -2109,6 +4166,39 @@ internal static class TorRoleAdapter
         return PlayerControl.AllPlayerControls
             .ToArray()
             .FirstOrDefault(player => player && player.PlayerId == playerId);
+    }
+
+    private static bool TryGetPortalEndpoints(out Vector2 first, out Vector2 second, out float duration)
+    {
+        first = default;
+        second = default;
+        duration = 0f;
+        if (!GetStaticBool("Portal", "bothPlacedAndEnabled") ||
+            GetStaticField("Portal", "firstPortal") is not { } firstPortal ||
+            GetStaticField("Portal", "secondPortal") is not { } secondPortal ||
+            !TryGetPortalPosition(firstPortal, out first) ||
+            !TryGetPortalPosition(secondPortal, out second))
+        {
+            return false;
+        }
+
+        duration = Mathf.Max(0.1f, GetStaticFloat("Portal", "teleportDuration"));
+        return true;
+    }
+
+    private static bool TryGetPortalPosition(object portal, out Vector2 position)
+    {
+        position = default;
+        var gameObject = portal.GetType()
+            .GetField("portalGameObject", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)?
+            .GetValue(portal) as GameObject;
+        if (!gameObject)
+        {
+            return false;
+        }
+
+        position = gameObject!.transform.position;
+        return true;
     }
 
     private static void AddRoleOwner(List<string> allies, string typeName, string fieldName, byte selfId)
@@ -2363,8 +4453,15 @@ internal static class TorRoleAdapter
         string Description);
 
     private readonly record struct PendingDouse(byte TargetId, float CompleteAt);
-    private readonly record struct PendingVampireBite(byte TargetId, float CompleteAt);
-    private readonly record struct PendingWarlockCurse(byte VictimId, float ExpiresAt);
+    private readonly record struct PendingVampireBite(byte TargetId, float CompleteAt, Vector2 Origin);
+    private readonly record struct PendingWarlockCurse(byte VictimId);
+    private readonly record struct PendingWitchSpell(byte TargetId, float CompleteAt);
+    private readonly record struct PendingPortalTeleport(
+        Vector2 Entry,
+        Vector2 Exit,
+        float MidpointAt,
+        float CompleteAt,
+        bool Moved);
 }
 
 internal readonly record struct TorRoleInfo(
@@ -2379,3 +4476,26 @@ internal readonly record struct TorRoleInfo(
 }
 
 internal readonly record struct TorModifierInfo(string Name, string Description);
+
+internal readonly record struct TorAbilitySequencePlan(
+    bool Active,
+    bool ShouldUse,
+    byte? TargetPlayerId,
+    string AbilityAction,
+    string Reason,
+    float Confidence,
+    float RecheckSeconds);
+
+internal readonly record struct TorPortalTraversalOption(
+    Vector2 Entry,
+    Vector2 Exit,
+    bool Remote,
+    byte ExitMode,
+    float Duration);
+
+internal readonly record struct TorIntroRoleInfo(
+    string Name,
+    string Description,
+    Color Color,
+    string Alignment,
+    string RoleId);
