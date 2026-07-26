@@ -17,6 +17,7 @@ $DeepBotDll = [IO.Path]::GetFullPath($DeepBotDll)
 $TheOtherRolesDll = [IO.Path]::GetFullPath($TheOtherRolesDll)
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 $installerProject = Join-Path $PSScriptRoot 'installer\DeepBotInstaller.csproj'
+$uninstallerProject = Join-Path $PSScriptRoot 'uninstaller\DeepBotUninstaller.csproj'
 $generatedRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'installer\generated'))
 
 foreach ($required in @(
@@ -25,7 +26,8 @@ foreach ($required in @(
     (Join-Path $GameDirectory 'doorstop_config.ini'),
     $DeepBotDll,
     $TheOtherRolesDll,
-    $installerProject
+    $installerProject,
+    $uninstallerProject
 )) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required installer input is missing: $required"
@@ -177,7 +179,29 @@ foreach ($build in @(
     Copy-Item -LiteralPath $published -Destination (Join-Path $OutputDirectory $build.Name) -Force
 }
 
-$assets = Get-ChildItem -LiteralPath $OutputDirectory -File | Where-Object Name -like 'AmongUs-DeepBot-*-Installer.exe'
+foreach ($build in @(
+    @{ Mode = 'Host'; Name = 'AmongUs-DeepBot-Host-Uninstaller.exe' },
+    @{ Mode = 'Client'; Name = 'AmongUs-DeepBot-Client-Uninstaller.exe' }
+)) {
+    dotnet publish $uninstallerProject -c Release -r win-x64 --self-contained true `
+        /p:UninstallerMode=$($build.Mode) `
+        /p:PublishSingleFile=true `
+        /p:EnableCompressionInSingleFile=true
+    if ($LASTEXITCODE -ne 0) {
+        throw "Uninstaller publish failed for $($build.Mode)."
+    }
+    $published = Join-Path $PSScriptRoot "uninstaller\bin\Release\net8.0-windows\win-x64\publish\$($build.Name)"
+    Copy-Item -LiteralPath $published -Destination (Join-Path $OutputDirectory $build.Name) -Force
+}
+
+$assets = Get-ChildItem -LiteralPath $OutputDirectory -File | Where-Object {
+    $_.Name -in @(
+        'AmongUs-DeepBot-Host-Installer.exe',
+        'AmongUs-DeepBot-Client-Installer.exe',
+        'AmongUs-DeepBot-Host-Uninstaller.exe',
+        'AmongUs-DeepBot-Client-Uninstaller.exe'
+    )
+}
 $checksums = foreach ($asset in $assets) {
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset.FullName).Hash.ToLowerInvariant()
     "$hash  $($asset.Name)"

@@ -2,10 +2,12 @@
 
 ## 1. Choose the correct installer
 
-Download both installers from the same GitHub Release version:
+Download the installer for this computer and keep its matching uninstaller from the same GitHub Release version:
 
 - `AmongUs-DeepBot-Host-Installer.exe` is for the player who creates the Local/LAN lobby. It installs TOR 4.6.0, DeepBot, host configuration, and the local API-key setup tool.
 - `AmongUs-DeepBot-Client-Installer.exe` is for every other human player. It installs the matching runtime and TOR build, but sets `BotCount = 0` and disables local bot decisions.
+- `AmongUs-DeepBot-Host-Uninstaller.exe` removes the host package and restores files that existed before installation.
+- `AmongUs-DeepBot-Client-Uninstaller.exe` removes the client package and restores files that existed before installation.
 
 Every participant must use the same Among Us, BepInEx, TOR, and DeepBot versions. Do not mix the host and client packages from different releases.
 
@@ -17,7 +19,7 @@ Every participant must use the same Among Us, BepInEx, TOR, and DeepBot versions
 4. Review the detected target and choose **Install**.
 5. Keep the desktop-shortcut option enabled if you want a direct game shortcut.
 
-The installer searches only a small bounded area under `steamapps\common`. It does not install or redistribute the Among Us game itself. Before overwriting an existing mod file, it creates a timestamped copy under `DeepBot Installer Backups` inside the selected game folder.
+The installer searches only a small bounded area under `steamapps\common`. It does not install or redistribute the Among Us game itself. Before overwriting an existing mod file, it creates a timestamped copy under `DeepBot Installer Backups` inside the selected game folder. It also writes a local install receipt containing relative paths and SHA-256 hashes; the receipt never contains an API key.
 
 ## 3. Host setup
 
@@ -91,6 +93,11 @@ The log must never contain the API-key value.
 
 ## 9. Remove or roll back
 
-Delete `BepInEx\plugins\AmongUsDeepSeekBots.dll` to disable DeepBot. To restore the complete previous mod set, copy the desired files back from `DeepBot Installer Backups` or from your own full game backup.
+1. Close Among Us.
+2. Run the uninstaller that matches the installed package: Host or Client.
+3. Select the same Steam root or exact game directory used during installation.
+4. Review the detected target and choose **Uninstall**.
 
-Deleting `%LOCALAPPDATA%\AmongUsDeepSeekBots` also removes the locally stored API key and post-match evolution data.
+The uninstaller reads the local installation receipt. If an installed file replaced an older file, that older file is restored from `DeepBot Installer Backups`. If the file did not previously exist, it is removed. A file changed by the user after installation is preserved and reported instead of being deleted. When no trustworthy receipt exists, the legacy fallback removes only DeepBot-owned files and leaves shared TOR/BepInEx runtime files untouched.
+
+The Host uninstaller offers a separate unchecked option to delete `%LOCALAPPDATA%\AmongUsDeepSeekBots\api-key.txt`. Post-match evolution data is not deleted automatically. To roll back without uninstalling, restore the desired files from `DeepBot Installer Backups` or from your own full game backup.

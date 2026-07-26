@@ -1220,12 +1220,18 @@ internal sealed class BotSocialDirector
         state.DecisionApplied = true;
         var analyzedNewHumanStatement =
             state.PendingHumanTranscriptVersion > state.LastAnalyzedHumanTranscriptVersion;
+        if (state.MeetingDecision is not null)
+        {
+            state.MeetingDecision = EnforceProtectedAllyMeetingDecision(bot, state.MeetingDecision);
+        }
         var receivedDecision = state.PendingMeetingDecision;
         if (receivedDecision is not null)
         {
+            receivedDecision = EnforceProtectedAllyMeetingDecision(bot, receivedDecision);
             receivedDecision = StabilizeMeetingDecision(bot, state, receivedDecision);
             receivedDecision = EnforceGroundedMeetingDecision(bot, state, receivedDecision);
             receivedDecision = EnforceCrossMeetingSuspicionContinuity(bot, state, receivedDecision);
+            receivedDecision = EnforceProtectedAllyMeetingDecision(bot, receivedDecision);
         }
         if (TryGetActionableWitnessedKiller(bot, out var witnessedKiller))
         {
@@ -1308,6 +1314,12 @@ internal sealed class BotSocialDirector
             return;
         }
 
+        line = RewriteProtectedAllyDisclosure(bot, line, out var allyDisclosureRewritten);
+        if (allyDisclosureRewritten)
+        {
+            source += "-ally-secrecy-guard";
+        }
+
         line = EnforcePrivateEvidenceBoundary(bot, line, out var evidenceRewritten);
         if (evidenceRewritten)
         {
@@ -1354,6 +1366,76 @@ internal sealed class BotSocialDirector
         {
             _injectingChat = false;
         }
+    }
+
+    private BotMeetingDecision EnforceProtectedAllyMeetingDecision(
+        PlayerControl bot,
+        BotMeetingDecision decision)
+    {
+        var targetId = GetDecisionTarget(decision);
+        var voteTarget = targetId.HasValue ? FindPlayer(targetId.Value) : null;
+        var protectedVote = voteTarget is not null &&
+                            TorRoleAdapter.ShouldProtectMeetingTarget(bot, voteTarget);
+        var protectedMention = string.IsNullOrWhiteSpace(decision.Message)
+            ? null
+            : EnumerateLivingPlayers().FirstOrDefault(player =>
+                player.PlayerId != bot.PlayerId &&
+                TorRoleAdapter.ShouldProtectMeetingTarget(bot, player) &&
+                MentionsPlayer(decision.Message!, player));
+        if (!ShouldBlockProtectedAllyDisclosure(protectedMention is not null, protectedVote))
+        {
+            return decision;
+        }
+
+        var protectedPlayer = voteTarget is not null && protectedVote ? voteTarget : protectedMention;
+        _log.LogWarning(
+            $"DeepBot protected-ally meeting guard blocked disclosure/vote: meeting={_meetingSerial}, " +
+            $"bot={bot.Data?.PlayerName}({bot.PlayerId}), ally={protectedPlayer?.Data?.PlayerName}({protectedPlayer?.PlayerId}), " +
+            $"messageMention={protectedMention is not null}, voteTarget={protectedVote}.");
+        return decision with
+        {
+            Message = protectedMention is null
+                ? decision.Message
+                : "这条说法没有给出可核对的现场目击，我先看尸体附近的公开线索。",
+            VotePlayerId = protectedVote ? null : decision.VotePlayerId,
+            SkipVote = protectedVote || decision.SkipVote,
+            Reason = "Protected ally guard: private teammate identity or ability knowledge cannot be used for public accusation or exile.",
+            Confidence = protectedVote ? Mathf.Min(decision.Confidence, 0.45f) : decision.Confidence,
+            FollowPlayerId = protectedVote ? null : decision.FollowPlayerId,
+            FollowIntent = protectedVote ? "none" : decision.FollowIntent
+        };
+    }
+
+    private string RewriteProtectedAllyDisclosure(PlayerControl bot, string line, out bool rewritten)
+    {
+        rewritten = false;
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return string.Empty;
+        }
+
+        var protectedMention = EnumerateLivingPlayers().FirstOrDefault(player =>
+            player.PlayerId != bot.PlayerId &&
+            TorRoleAdapter.ShouldProtectMeetingTarget(bot, player) &&
+            MentionsPlayer(line, player));
+        if (!ShouldBlockProtectedAllyDisclosure(protectedMention is not null, false))
+        {
+            return line;
+        }
+
+        rewritten = true;
+        _log.LogWarning(
+            $"DeepBot protected-ally speech guard removed public ally disclosure: meeting={_meetingSerial}, " +
+            $"bot={bot.Data?.PlayerName}({bot.PlayerId}), ally={protectedMention!.Data?.PlayerName}({protectedMention.PlayerId}), " +
+            $"original={line}.");
+        return "这条说法没有给出可核对的现场目击，我先看尸体附近的公开线索。";
+    }
+
+    private static bool ShouldBlockProtectedAllyDisclosure(
+        bool protectedAllyMentioned,
+        bool protectedAllyVote)
+    {
+        return protectedAllyMentioned || protectedAllyVote;
     }
 
     private string RewriteUnsafeSpeakerAttribution(
@@ -2280,6 +2362,10 @@ internal sealed class BotSocialDirector
         var deliberateReplies = urgentDirectWindow.Minimum >= 1.8f &&
                                 cautiousWindow.Minimum > urgentDirectWindow.Minimum &&
                                 cautiousWindow.Maximum > cautiousWindow.Minimum;
+        var protectedAllyDisclosureBlocked =
+            ShouldBlockProtectedAllyDisclosure(true, false) &&
+            ShouldBlockProtectedAllyDisclosure(false, true) &&
+            !ShouldBlockProtectedAllyDisclosure(false, false);
         var level = repeatedCounterAccusationBlocked &&
                     corroboratedEvidenceAllowsChange &&
                     witnessedKillAllowsChange &&
@@ -2294,7 +2380,8 @@ internal sealed class BotSocialDirector
                     freshVentFallbackIsConcrete &&
                     personalityVoteThresholdsDiffer &&
                     factionReportStrategyVaries &&
-                    deliberateReplies
+                    deliberateReplies &&
+                    protectedAllyDisclosureBlocked
             ? "ok"
             : "error";
         log.LogInfo(
@@ -2311,7 +2398,8 @@ internal sealed class BotSocialDirector
             $"freshVentFallbackIsConcrete={freshVentFallbackIsConcrete}, " +
             $"personalityVoteThresholdsDiffer={personalityVoteThresholdsDiffer}, " +
             $"factionReportStrategyVaries={factionReportStrategyVaries}, " +
-            $"deliberateReplies={deliberateReplies}, fastestReplyMin={urgentDirectWindow.Minimum:0.0}s.");
+            $"deliberateReplies={deliberateReplies}, protectedAllyDisclosureBlocked={protectedAllyDisclosureBlocked}, " +
+            $"fastestReplyMin={urgentDirectWindow.Minimum:0.0}s.");
     }
 
     private string BuildContextualFallbackMeetingLine(PlayerControl bot, SocialState state)

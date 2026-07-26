@@ -48,6 +48,8 @@ DeepBot does not force every bot to play an identical optimal strategy. Personal
 
 - Separate self-contained Windows installers configure the host and passive LAN clients from a selected Steam folder. Existing mod files are backed up before replacement.
 - Living bots no longer receive an unvalidated side-step when every avoidance direction is blocked, preventing corner escape from pushing a bot outside the hull.
+- Ninja, Chameleon, and base-game Phantom concealment now feed the same observer-aware perception gate. Hidden players are not exposed through bot prompts, pursuit targets, private memories, or witnessed-action records, while TOR's native teammate visibility rules remain intact.
+- Known allies may retain TOR-authorized teammate visibility, but a final local meeting guard prevents bots from naming an ally's secret ability, using an ally as a trial accusation, or voting for a protected teammate/client/partner.
 - Meetings continuously re-check native vote completion and detect TOR ghost roles, preventing a completed vote from freezing the round after a later meeting.
 - Vampire is excluded from every ordinary-kill pursuit entry point and uses the native TOR bite sequence: the victim dies at the original position after the configured delay.
 - Multi-stage role decisions keep TOR's native sequence authoritative while allowing a new tactical decision at legal checkpoints for Morphling, Trickster, Ninja, Warlock, Vampire, Bomber, and Yoyo.
@@ -92,6 +94,8 @@ Open [GitHub Releases](https://github.com/shimiaoshui/among-us-deepbot/releases/
 
 - `AmongUs-DeepBot-Host-Installer.exe`: for the player who creates the Local/LAN lobby and controls the bots.
 - `AmongUs-DeepBot-Client-Installer.exe`: for every other human player; it installs the matching passive client configuration and never creates bots.
+- `AmongUs-DeepBot-Host-Uninstaller.exe`: removes a recorded host installation and restores files that existed before installation.
+- `AmongUs-DeepBot-Client-Uninstaller.exe`: removes a recorded client installation and restores files that existed before installation.
 
 Basic installation:
 
@@ -100,6 +104,8 @@ Basic installation:
 3. The host runs `Configure-DeepBot-Key.cmd` once if model-backed meetings are wanted.
 4. The host creates a Local/LAN lobby, selects the bot count in TOR settings, and starts the game.
 5. Clients use the client installer from the same Release version.
+
+The matching uninstaller accepts the same Steam root or exact game directory. It uses the install receipt and SHA-256 hashes to restore overwritten files, delete only files installed by that package, and preserve files changed after installation.
 
 The [complete English user guide](docs/USER_GUIDE.md) covers host/client installation, version checks, upgrades, rollback, and troubleshooting. Verify downloaded files against `SHA256SUMS.txt` from the Release page.
 

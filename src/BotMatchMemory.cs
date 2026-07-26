@@ -129,6 +129,12 @@ internal sealed class BotMatchMemory
                 continue;
             }
 
+            if (!BotPerceptionPolicy.CanBeOrdinarilyObserved(observer, killer) ||
+                !BotPerceptionPolicy.CanBeOrdinarilyObserved(observer, victim))
+            {
+                continue;
+            }
+
             var observerPosition = observer.GetTruePosition();
             var killerPosition = killer.GetTruePosition();
             var victimPosition = victim.GetTruePosition();
@@ -200,6 +206,11 @@ internal sealed class BotMatchMemory
                 state.VisiblePlayerIds.Contains(killer.PlayerId) &&
                 state.VisiblePlayerIds.Contains(victim.PlayerId);
             var capturedBeforeAnimation = preEventWitnessIds?.Contains(observer.PlayerId) == true;
+            if (!BotPerceptionPolicy.CanBeOrdinarilyObserved(observer, killer))
+            {
+                rejectedByGeometry++;
+                continue;
+            }
             if (!capturedBeforeAnimation &&
                 !BotPerceptionPolicy.CanWitnessMurder(
                     recentlySawPair,
@@ -543,7 +554,8 @@ internal sealed class BotMatchMemory
                 player.PlayerId == observer.PlayerId ||
                 player.Data is null ||
                 player.Data.IsDead ||
-                player.Data.Disconnected)
+                player.Data.Disconnected ||
+                BotPerceptionPolicy.IsInvisibleFromOrdinaryObservation(observer, player))
             {
                 continue;
             }
@@ -748,7 +760,7 @@ internal sealed class BotMatchMemory
     {
         if (!observer || observer.Data is null || observer.Data.IsDead || observer.Data.Disconnected ||
             !actor || actor.Data is null || actor.Data.Disconnected || observer.PlayerId == actor.PlayerId ||
-            BotPerceptionPolicy.IsConcealedByVent(actor))
+            !BotPerceptionPolicy.CanBeOrdinarilyObserved(observer, actor))
         {
             return false;
         }
@@ -815,6 +827,9 @@ internal sealed class BotMatchMemory
         var entryConcealed = BotPerceptionPolicy.IsConcealedByVent(false, true);
         var transitConcealed = BotPerceptionPolicy.IsConcealedByVent(true, false);
         var ordinaryMovementVisible = !BotPerceptionPolicy.IsConcealedByVent(false, false);
+        var torInvisibilityConcealed = BotPerceptionPolicy.IsConcealedFromOrdinaryObservation(false, false, true);
+        var nativeInvisibilityConcealed = BotPerceptionPolicy.IsConcealedFromOrdinaryObservation(false, true, false);
+        var fullyVisibleNotConcealed = !BotPerceptionPolicy.IsConcealedFromOrdinaryObservation(false, false, false);
         var murderInsideVision = BotPerceptionPolicy.CanWitnessMurderGeometry(4.9f, 5.1f, 5f, false, true);
         var murderOutsideVision = !BotPerceptionPolicy.CanWitnessMurderGeometry(5.5f, 5.5f, 5f, false, false);
         var murderFullyOccluded = !BotPerceptionPolicy.CanWitnessMurderGeometry(2f, 2f, 5f, true, true);
@@ -830,14 +845,17 @@ internal sealed class BotMatchMemory
             InferObservedRole("place a Jack-in-the-box") == ("Trickster", 0.97f) &&
             InferObservedRole("enter/use a vent").RoleName is null;
         var level = entryConcealed && transitConcealed && ordinaryMovementVisible &&
+                    torInvisibilityConcealed && nativeInvisibilityConcealed && fullyVisibleNotConcealed &&
                     murderInsideVision && murderOutsideVision && murderFullyOccluded &&
                     murderRecentPairSurvivesAnimation && stalePairRejected && observedActionSemanticsValid
             ? "ok"
             : "error";
         log.LogInfo(
-            $"DeepBot vent perception self-test: level={level}, " +
+            $"DeepBot concealment perception self-test: level={level}, " +
             $"entryConcealed={entryConcealed}, transitConcealed={transitConcealed}, " +
-            $"ordinaryMovementVisible={ordinaryMovementVisible}, murderInsideVision={murderInsideVision}, " +
+            $"ordinaryMovementVisible={ordinaryMovementVisible}, torInvisibilityConcealed={torInvisibilityConcealed}, " +
+            $"nativeInvisibilityConcealed={nativeInvisibilityConcealed}, fullyVisibleNotConcealed={fullyVisibleNotConcealed}, " +
+            $"murderInsideVision={murderInsideVision}, " +
             $"murderOutsideVision={murderOutsideVision}, murderFullyOccluded={murderFullyOccluded}, " +
             $"murderRecentPairSurvivesAnimation={murderRecentPairSurvivesAnimation}, stalePairRejected={stalePairRejected}, " +
             $"observedActionSemantics={observedActionSemanticsValid}.");

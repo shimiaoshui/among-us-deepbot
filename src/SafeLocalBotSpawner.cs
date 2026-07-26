@@ -815,7 +815,8 @@ internal sealed class SafeLocalBotSpawner
             var legitimatePhantomInvisibility =
                 character.Data.RoleType == RoleTypes.Phantom &&
                 character.shouldAppearInvisible;
-            if (legitimatePhantomInvisibility)
+            var legitimateTorConcealment = TorRoleAdapter.IsTorVisualConcealmentEffectActive(character);
+            if (legitimatePhantomInvisibility || legitimateTorConcealment)
             {
                 continue;
             }

@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <Version>0.10.0</Version>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(UninstallerMode)' == 'Host'">
+    <AssemblyName>AmongUs-DeepBot-Host-Uninstaller</AssemblyName>
+    <DefineConstants>$(DefineConstants);HOST_UNINSTALLER</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(UninstallerMode)' == 'Client'">
+    <AssemblyName>AmongUs-DeepBot-Client-Uninstaller</AssemblyName>
+    <DefineConstants>$(DefineConstants);CLIENT_UNINSTALLER</DefineConstants>
+  </PropertyGroup>
+
+  <Target Name="ValidateUninstallerMode" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(UninstallerMode)' != 'Host' and '$(UninstallerMode)' != 'Client'"
+           Text="Set UninstallerMode to Host or Client." />
+  </Target>
+</Project>

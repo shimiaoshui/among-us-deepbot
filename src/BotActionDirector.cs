@@ -3383,7 +3383,7 @@ internal sealed class BotActionDirector
         {
             if (!player ||
                 player.PlayerId == observer.PlayerId ||
-                !BotPerceptionPolicy.CanBeOrdinarilyObserved(player))
+                !BotPerceptionPolicy.CanBeOrdinarilyObserved(observer, player))
             {
                 continue;
             }

@@ -1,6 +1,8 @@
 using System.IO.Compression;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text.Json;
 using Microsoft.Win32;
 
 namespace DeepBotInstaller;
@@ -245,7 +247,13 @@ internal sealed class InstallerForm : Form
                             ?? throw new InvalidOperationException("The embedded payload is missing.");
         using var archive = new ZipArchive(payload, ZipArchiveMode.Read, leaveOpen: false);
         var root = Path.GetFullPath(gameDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var installed = new List<string>();
+        var receiptDirectory = Path.Combine(gameDirectory, "DeepBot Installer Records");
+        var receiptPath = Path.Combine(receiptDirectory, $"DeepBot-{Program.Mode}-Install.json");
+        var previousReceipt = LoadReceipt(receiptPath);
+        var previousEntries = previousReceipt?.Files.ToDictionary(
+            entry => entry.RelativePath,
+            StringComparer.OrdinalIgnoreCase) ?? new Dictionary<string, InstalledFileReceipt>(StringComparer.OrdinalIgnoreCase);
+        var installed = new List<InstalledFileReceipt>();
 
         foreach (var entry in archive.Entries)
         {
@@ -273,18 +281,51 @@ internal sealed class InstallerForm : Form
             }
 
             Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            string? originalBackupRelativePath = null;
+            string? originalBackupSha256 = null;
+            if (previousEntries.TryGetValue(relative, out var previousEntry))
+            {
+                // Preserve the pre-DeepBot origin across upgrades. Otherwise
+                // uninstalling a newer build would merely restore the previous
+                // DeepBot build instead of the user's original file.
+                originalBackupRelativePath = previousEntry.OriginalBackupRelativePath;
+                originalBackupSha256 = previousEntry.OriginalBackupSha256;
+            }
             if (File.Exists(destination))
             {
-                var backup = Path.Combine(backupDirectory, relative);
-                Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
-                File.Copy(destination, backup, overwrite: true);
+                if (!previousEntries.ContainsKey(relative))
+                {
+                    var backup = Path.Combine(backupDirectory, relative);
+                    Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+                    File.Copy(destination, backup, overwrite: true);
+                    originalBackupRelativePath = Path.GetRelativePath(root, backup);
+                    originalBackupSha256 = ComputeSha256(backup);
+                }
             }
 
-            using var source = entry.Open();
-            using var target = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None);
-            source.CopyTo(target);
-            installed.Add(relative);
+            using (var source = entry.Open())
+            using (var target = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                source.CopyTo(target);
+            }
+            installed.Add(new InstalledFileReceipt(
+                relative,
+                ComputeSha256(destination),
+                originalBackupRelativePath,
+                originalBackupSha256));
         }
+
+        Directory.CreateDirectory(receiptDirectory);
+        var receipt = new InstallReceipt(
+            Program.Mode,
+            DateTimeOffset.Now,
+            backupDirectory,
+            installed);
+        var receiptTempPath = receiptPath + ".tmp";
+        File.WriteAllText(
+            receiptTempPath,
+            JsonSerializer.Serialize(receipt, new JsonSerializerOptions { WriteIndented = true }));
+        File.Move(receiptTempPath, receiptPath, overwrite: true);
 
         if (createShortcut)
         {
@@ -295,10 +336,35 @@ internal sealed class InstallerForm : Form
             Path.Combine(gameDirectory, "DeepBot-Installer.log"),
             new[]
             {
-                $"{DateTime.Now:O} mode={Program.Mode} files={installed.Count}",
+                $"{DateTime.Now:O} mode={Program.Mode} files={installed.Count} receipt={receiptPath}",
                 $"target={gameDirectory}",
                 $"backup={backupDirectory}"
             });
+    }
+
+    private static InstallReceipt? LoadReceipt(string receiptPath)
+    {
+        if (!File.Exists(receiptPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<InstallReceipt>(File.ReadAllText(receiptPath));
+        }
+        catch
+        {
+            // A corrupt old receipt must not prevent installation. Existing
+            // files are backed up as a fresh origin in this case.
+            return null;
+        }
+    }
+
+    private static string ComputeSha256(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(stream));
     }
 
     private static void CreateDesktopShortcut(string gameDirectory)
@@ -393,3 +459,15 @@ internal sealed class InstallerForm : Form
         return Directory.Exists(standard) ? standard : null;
     }
 }
+
+internal sealed record InstallReceipt(
+    string Mode,
+    DateTimeOffset InstalledAt,
+    string BackupDirectory,
+    List<InstalledFileReceipt> Files);
+
+internal sealed record InstalledFileReceipt(
+    string RelativePath,
+    string InstalledSha256,
+    string? OriginalBackupRelativePath,
+    string? OriginalBackupSha256);

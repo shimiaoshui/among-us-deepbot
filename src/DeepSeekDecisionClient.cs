@@ -246,12 +246,16 @@ internal sealed class DeepSeekDecisionClient
             truncatedMeeting.Replace("\"vote_player_id\":2", "\"vote_player_id\":7", StringComparison.Ordinal),
             "0,2,8",
             out _);
+        var illegalCompleteVoteRejected = EnforceLegalMeetingVote(
+            new BotMeetingDecision("test", 7, false, "test", 0.9f, null, "none"),
+            "0,2,8") is { SkipVote: true, VotePlayerId: null };
         log.LogInfo(
             $"DeepBot LLM decision parser self-test: " +
-            $"level={(visibleNameResolves && hiddenNameRejected && completeLeadingMeetingFieldsRecovered && illegalRecoveredVoteRejected ? "ok" : "error")}, " +
+            $"level={(visibleNameResolves && hiddenNameRejected && completeLeadingMeetingFieldsRecovered && illegalRecoveredVoteRejected && illegalCompleteVoteRejected ? "ok" : "error")}, " +
             $"visibleNameResolves={visibleNameResolves}, hiddenNameRejected={hiddenNameRejected}, " +
             $"truncatedMeetingRecovered={completeLeadingMeetingFieldsRecovered}, " +
-            $"illegalRecoveredVoteRejected={illegalRecoveredVoteRejected}.");
+            $"illegalRecoveredVoteRejected={illegalRecoveredVoteRejected}, " +
+            $"illegalCompleteVoteRejected={illegalCompleteVoteRejected}.");
     }
 
     public async Task<BotMeetingDecision?> GetMeetingDecisionAsync(BotMeetingPrompt prompt, CancellationToken cancellationToken)
@@ -303,7 +307,8 @@ internal sealed class DeepSeekDecisionClient
 
         try
         {
-            return JsonSerializer.Deserialize<BotMeetingDecision>(content, JsonOptions);
+            var decision = JsonSerializer.Deserialize<BotMeetingDecision>(content, JsonOptions);
+            return EnforceLegalMeetingVote(decision, prompt.LegalVotePlayerIds);
         }
         catch (Exception ex)
         {
@@ -311,7 +316,8 @@ internal sealed class DeepSeekDecisionClient
             {
                 try
                 {
-                    return JsonSerializer.Deserialize<BotMeetingDecision>(json, JsonOptions);
+                    var decision = JsonSerializer.Deserialize<BotMeetingDecision>(json, JsonOptions);
+                    return EnforceLegalMeetingVote(decision, prompt.LegalVotePlayerIds);
                 }
                 catch (Exception inner)
                 {
@@ -338,6 +344,36 @@ internal sealed class DeepSeekDecisionClient
             _log($"DeepSeek meeting JSON parse failed: {ex.Message}, body={Truncate(content, 240)}");
             return null;
         }
+    }
+
+    private static BotMeetingDecision? EnforceLegalMeetingVote(
+        BotMeetingDecision? decision,
+        string legalVotePlayerIds)
+    {
+        if (decision is null)
+        {
+            return null;
+        }
+
+        var legalIds = Regex.Matches(legalVotePlayerIds ?? string.Empty, @"\d{1,3}")
+            .Cast<Match>()
+            .Select(match => int.TryParse(match.Value, out var id) ? id : -1)
+            .Where(id => id is >= byte.MinValue and <= byte.MaxValue)
+            .ToHashSet();
+        if (decision.SkipVote || !decision.VotePlayerId.HasValue)
+        {
+            return decision with { VotePlayerId = null, SkipVote = true };
+        }
+
+        return legalIds.Contains(decision.VotePlayerId.Value)
+            ? decision
+            : decision with
+            {
+                VotePlayerId = null,
+                SkipVote = true,
+                Reason = "Rejected a vote target outside the authoritative legal meeting candidate set.",
+                Confidence = Math.Min(decision.Confidence, 0.45f)
+            };
     }
 
     private static bool TryRecoverTruncatedMeetingDecision(
@@ -774,7 +810,7 @@ Never turn your own earlier model conclusion, vote, suspicion score, or wording 
 Continuity still matters: lack of fresh evidence does not make a previously suspected living player innocent. Keep a prior suspicion as a fallible belief until a credible alibi, contradictory observation, role change, or stronger alternative weakens it. Never call a carried suspect clear, safe, innocent, or trustworthy merely because the current meeting added nothing. A bold or intuitive personality may vote on a strong but incomplete inference; label it as personal judgment rather than pretending it is proven. A cautious personality may keep suspecting while skipping.
 Two players repeating a conclusion is not meaningful corroboration unless each gives a distinct concrete observation that can be checked. Never claim "cross-verified" or "several people proved it" when the transcript contains only opinions, denials, or copied accusations.
 Crew must reason honestly from evidence, admit uncertainty, and avoid fabricated alibis.
-Impostors must conceal their role, protect known impostor teammates, maintain a plausible story, and redirect suspicion without revealing hidden information.
+Impostors must conceal their role, protect known impostor teammates, maintain a plausible story, and redirect suspicion without revealing hidden information. Knowledge that an ally vanished, killed, vented, sabotaged, transformed, or used another role ability is private teammate information: never name, accuse, probe, vote, or sacrifice that ally because of it, and never disclose the ally's ability or exact role. A "trial accusation" against an ally is forbidden; redirect toward a legal opponent or skip instead.
 All players know the public possible-role outcome map even though they do not know hidden assignments. Before voting, consider whether the exile advances an opponent's special win condition. A claimed or suspected Jester wants to be voted out, so a faction player must not grant that outcome from suspicious speech alone. A neutral player must prioritize its own listed independent win condition; crew and impostors prioritize their own faction victory.
 For an impostor, [murder], [murder_plan], [murder_escape], and private ability-kill details are secret perpetrator knowledge. They may guide deception internally, but must never be stated as public corpse location, timing, victim route, or eyewitness fact unless that exact fact was already disclosed by MeetingReason or the public transcript. Seeing a player marked dead on the public roster reveals only that they are dead, not where or how they died.
 An impostor or hidden neutral must NEVER use confession as a bluff or discussion tactic. Never say or imply "我杀了/我刚杀/我刀了/我是内鬼/有人看到我杀人了吗", "I killed", "I am the impostor", or reveal a sabotage, bite, poison, bomb, body removal, or secret ability you performed. Private perpetrator memory is input for constructing a believable cover story, alibi, deflection, and vote only. If asked about your route, answer as an ordinary player would without repeating the secret action or its private location.

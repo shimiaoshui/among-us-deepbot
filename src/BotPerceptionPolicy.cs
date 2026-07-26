@@ -1,3 +1,4 @@
+using AmongUs.GameOptions;
 using UnityEngine;
 
 namespace AmongUsDeepSeekBots;
@@ -17,13 +18,64 @@ internal static class BotPerceptionPolicy
         return inVent || walkingToVent;
     }
 
+    internal static bool IsConcealedFromOrdinaryObservation(
+        bool ventConcealed,
+        bool nativeInvisibility,
+        bool torInvisibility)
+    {
+        return ventConcealed || nativeInvisibility || torInvisibility;
+    }
+
+    internal static bool IsConcealedFromOrdinaryObservation(
+        PlayerControl? observer,
+        PlayerControl? target)
+    {
+        if (!target)
+        {
+            return false;
+        }
+
+        return IsConcealedByVent(target) || IsInvisibleFromOrdinaryObservation(observer, target);
+    }
+
+    internal static bool IsInvisibleFromOrdinaryObservation(
+        PlayerControl? observer,
+        PlayerControl? target)
+    {
+        if (!target)
+        {
+            return false;
+        }
+
+        var nativePhantomInvisible =
+            target!.Data is not null &&
+            target.Data.RoleType == RoleTypes.Phantom &&
+            target.shouldAppearInvisible &&
+            !CanObserverSeeFriendlyInvisibility(observer, target);
+        var torInvisible = TorRoleAdapter.IsConcealedFromLivingObserver(observer, target);
+        return nativePhantomInvisible || torInvisible;
+    }
+
+    private static bool CanObserverSeeFriendlyInvisibility(PlayerControl? observer, PlayerControl target)
+    {
+        return observer &&
+               observer!.Data is not null &&
+               (observer.Data.IsDead ||
+                (TorRoleAdapter.IsImpostorTeam(observer) && TorRoleAdapter.IsImpostorTeam(target)));
+    }
+
     internal static bool CanBeOrdinarilyObserved(PlayerControl? player)
+    {
+        return CanBeOrdinarilyObserved(null, player);
+    }
+
+    internal static bool CanBeOrdinarilyObserved(PlayerControl? observer, PlayerControl? player)
     {
         return player &&
                player!.Data is not null &&
                !player.Data.IsDead &&
                !player.Data.Disconnected &&
-               !IsConcealedByVent(player);
+               !IsConcealedFromOrdinaryObservation(observer, player);
     }
 
     internal static float GetCurrentVisionDistance(PlayerControl? observer)

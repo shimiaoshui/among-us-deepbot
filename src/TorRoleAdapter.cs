@@ -157,6 +157,87 @@ internal static class TorRoleAdapter
                killer.PlayerId != target.PlayerId;
     }
 
+    internal static bool IsConcealedFromLivingObserver(PlayerControl? observer, PlayerControl? target)
+    {
+        if (!target || target!.Data is null || target.Data.IsDead || target.Data.Disconnected || !EnsureLoaded())
+        {
+            return false;
+        }
+
+        var ninja = GetStaticField("Ninja", "ninja") as PlayerControl;
+        if (ninja &&
+            ninja!.PlayerId == target.PlayerId &&
+            (GetStaticBool("Ninja", "isInvisble") || GetStaticFloat("Ninja", "invisibleTimer") > 0.01f))
+        {
+            // TOR deliberately leaves a faint outline for dead players and
+            // impostor teammates. Living opponents must not receive the
+            // Ninja's position, route, actions, or murder identity.
+            return !observer ||
+                   observer!.Data is null ||
+                   (!observer.Data.IsDead && !IsImpostorTeam(observer));
+        }
+
+        return TryGetChameleonVisibility(target!, out var visibility) &&
+               visibility <= 0.251f;
+    }
+
+    internal static bool IsTorVisualConcealmentEffectActive(PlayerControl? target)
+    {
+        if (!target || !EnsureLoaded())
+        {
+            return false;
+        }
+
+        var ninja = GetStaticField("Ninja", "ninja") as PlayerControl;
+        if (ninja &&
+            ninja!.PlayerId == target!.PlayerId &&
+            (GetStaticBool("Ninja", "isInvisble") || GetStaticFloat("Ninja", "invisibleTimer") > 0.01f))
+        {
+            return true;
+        }
+
+        // Chameleon fades progressively. Preserve the whole TOR-managed fade
+        // instead of allowing the generic render-repair pass to force alpha=1.
+        return TryGetChameleonVisibility(target!, out var visibility) && visibility < 0.995f;
+    }
+
+    private static bool TryGetChameleonVisibility(PlayerControl target, out float visibility)
+    {
+        visibility = 1f;
+        if (GetStaticField("Chameleon", "chameleon") is not IEnumerable owners)
+        {
+            return false;
+        }
+
+        var ownsModifier = false;
+        foreach (var value in owners)
+        {
+            if (value is PlayerControl owner && owner && owner.PlayerId == target.PlayerId)
+            {
+                ownsModifier = true;
+                break;
+            }
+        }
+
+        if (!ownsModifier)
+        {
+            return false;
+        }
+
+        try
+        {
+            visibility = Convert.ToSingle(InvokeRoleMethod("Chameleon", "visibility", target.PlayerId));
+            return true;
+        }
+        catch
+        {
+            // If TOR changes the helper signature, preserving the renderer is
+            // safer than falsely revealing a role-managed hidden player.
+            visibility = GetStaticFloat("Chameleon", "minVisibility");
+            return true;
+        }
+    }
+
     internal static int GetLobbyConfiguredBotCount(int fallback)
     {
         if (!EnsureLoaded() || _assembly is null)
