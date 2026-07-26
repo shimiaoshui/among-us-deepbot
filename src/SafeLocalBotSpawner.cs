@@ -12,17 +12,9 @@ namespace AmongUsDeepSeekBots;
 
 internal sealed class SafeLocalBotSpawner
 {
+    private const float LobbyBotCountStableSeconds = 2f;
     private static readonly MethodInfo? CreatePlayerMethod =
         AccessTools.Method(typeof(AmongUsClient), "CreatePlayer");
-
-    private static readonly string[] SpawnNodeIds =
-    [
-        "CAF_SPAWN",
-        "CAF_TABLE_N",
-        "CAF_UL",
-        "CAF_UR",
-        "CAF_BOTTOM"
-    ];
 
     private readonly ManualLogSource _log;
     private readonly List<TrackedBotClient> _tracked = [];
@@ -30,10 +22,12 @@ internal sealed class SafeLocalBotSpawner
     private readonly HashSet<byte> _renderDiagnosticsLogged = [];
     private readonly HashSet<byte> _disabledBotLightIds = [];
     private readonly Dictionary<int, string> _appliedLobbyAppearances = [];
+    private readonly LobbyBotCountStabilizer _botCountStabilizer = new(LobbyBotCountStableSeconds);
     private float _nextSpawnAt;
     private float _nextStatusAt;
     private float _nextGuestStatusAt;
     private bool _spawnBlocked;
+    private bool _startedSpawnBlockLogged;
     private bool _hostLightRepairLogged;
     private PlayerControl? _hostPlayer;
 
@@ -69,13 +63,32 @@ internal sealed class SafeLocalBotSpawner
             return;
         }
 
-        var targetCount = TorRoleAdapter.GetLobbyConfiguredBotCount(config.LocalBotCount.Value);
+        var observedRequestedCount = TorRoleAdapter.GetLobbyConfiguredBotCount(config.LocalBotCount.Value);
+        var requestedCount = _botCountStabilizer.Observe(
+            observedRequestedCount,
+            Time.time,
+            client.GameState == InnerNetClient.GameStates.Started,
+            out var countTransition);
+        if (countTransition is not null)
+        {
+            _log.LogInfo($"DeepBot lobby bot-count stabilized: {countTransition}");
+        }
         CaptureHostPlayer(client);
         var existingCount = CountManagedClients(client);
+        var realPlayerCount = CountNonManagedClients(client);
+        var lobbyCapacity = GameRuleSettings.GetMaxPlayers();
+        var targetCount = Mathf.Clamp(
+            requestedCount,
+            0,
+            Mathf.Max(0, lobbyCapacity - realPlayerCount));
         if (client.GameState != InnerNetClient.GameStates.Started && existingCount > targetCount)
         {
             PruneExcessLobbyBots(client, targetCount);
             existingCount = CountManagedClients(client);
+        }
+        if (client.GameState != InnerNetClient.GameStates.Started)
+        {
+            PruneOrphanedManagedPlayerInfos(client, targetCount);
         }
         ConfigureTrackedClients(client);
         if (client.GameState != InnerNetClient.GameStates.Started)
@@ -87,7 +100,22 @@ internal sealed class SafeLocalBotSpawner
         if (Time.time >= _nextStatusAt)
         {
             _nextStatusAt = Time.time + 8f;
-            _log.LogInfo($"DeepBot spawn preflight ok: dryRun={config.DryRun.Value}, target={targetCount}, existing={existingCount}, clients={client.allClients.Count}, gameState={client.GameState}.");
+            _log.LogInfo(
+                $"DeepBot spawn preflight ok: dryRun={config.DryRun.Value}, requested={requestedCount}, target={targetCount}, " +
+                $"existing={existingCount}, realPlayers={realPlayerCount}, capacity={lobbyCapacity}, " +
+                $"clients={client.allClients.Count}, gameState={client.GameState}.");
+        }
+
+        if (client.GameState == InnerNetClient.GameStates.Started && existingCount < targetCount)
+        {
+            if (!_startedSpawnBlockLogged)
+            {
+                _startedSpawnBlockLogged = true;
+                _log.LogError(
+                    $"DeepBot refused unsafe mid-intro spawn: configured={targetCount}, ready={existingCount}. " +
+                    "Bots must finish native lobby creation before BeginGame so TOR cannot bind HUD/role state to a temporary bot LocalPlayer.");
+            }
+            return;
         }
 
         if (config.DryRun.Value || _spawnBlocked || existingCount >= targetCount || Time.time < _nextSpawnAt)
@@ -99,9 +127,105 @@ internal sealed class SafeLocalBotSpawner
         TryCreateOne(client, FindNextBotIndex(client, targetCount));
     }
 
+    internal static bool AreConfiguredLobbyBotsReady(out string reason)
+    {
+        reason = string.Empty;
+        var client = AmongUsClient.Instance;
+        if (!client || !client.AmHost || client.NetworkMode != NetworkModes.LocalGame)
+        {
+            return true;
+        }
+
+        var requested = TorRoleAdapter.GetLobbyConfiguredBotCount(Plugin.Settings.LocalBotCount.Value);
+        var realPlayers = 0;
+        var readyBots = 0;
+        for (var index = 0; index < client.allClients.Count; index++)
+        {
+            var candidate = client.allClients[index];
+            if (candidate is null)
+            {
+                continue;
+            }
+
+            if (!DeepBotIdentity.TryGetBotIndex(candidate, out _))
+            {
+                realPlayers++;
+                continue;
+            }
+
+            if (candidate.InScene && candidate.IsReady && !candidate.IsBeingCreated &&
+                candidate.Character && candidate.Character.Data is not null &&
+                candidate.Character.MyPhysics && candidate.Character.NetTransform)
+            {
+                readyBots++;
+            }
+        }
+
+        var target = Mathf.Clamp(requested, 0, Mathf.Max(0, GameRuleSettings.GetMaxPlayers() - realPlayers));
+        var managedPlayerInfos = GameData.Instance
+            ? GameData.Instance.AllPlayers.ToArray().Count(info =>
+                info is not null && DeepBotIdentity.IsReservedClientId(info.ClientId))
+            : readyBots;
+        if (IsExactLobbyRosterReady(readyBots, managedPlayerInfos, target))
+        {
+            return true;
+        }
+
+        reason = readyBots > target || managedPlayerInfos > target
+            ? $"configured={target}, nativeLobbyReady={readyBots}, playerInfos={managedPlayerInfos}; removing excess AI entries"
+            : $"configured={target}, nativeLobbyReady={readyBots}, playerInfos={managedPlayerInfos}; wait for the remaining {Math.Max(0, target - readyBots)} bot(s)";
+        return false;
+    }
+
+    private static bool IsExactLobbyRosterReady(int readyBots, int managedPlayerInfos, int target)
+    {
+        return readyBots == target && managedPlayerInfos == target;
+    }
+
+    private void PruneOrphanedManagedPlayerInfos(AmongUsClient client, int targetCount)
+    {
+        if (!GameData.Instance)
+        {
+            return;
+        }
+
+        var liveByClientId = new Dictionary<int, byte>();
+        for (var index = 0; index < client.allClients.Count; index++)
+        {
+            var candidate = client.allClients[index];
+            if (candidate is null || !DeepBotIdentity.TryGetBotIndex(candidate, out var botIndex) || botIndex >= targetCount ||
+                !candidate.Character || candidate.Character.Data is null)
+            {
+                continue;
+            }
+
+            liveByClientId[candidate.Id] = candidate.Character.PlayerId;
+        }
+
+        foreach (var info in GameData.Instance.AllPlayers.ToArray())
+        {
+            if (info is null || !DeepBotIdentity.IsReservedClientId(info.ClientId))
+            {
+                continue;
+            }
+
+            var belongsToLiveClient = liveByClientId.TryGetValue(info.ClientId, out var livePlayerId) &&
+                                      livePlayerId == info.PlayerId;
+            if (belongsToLiveClient)
+            {
+                continue;
+            }
+
+            GameData.Instance.RemovePlayer(info.PlayerId);
+            _log.LogWarning(
+                $"DeepBot pruned orphaned lobby player info: client={info.ClientId}, playerId={info.PlayerId}, " +
+                $"target={targetCount}, remaining={GameData.Instance.AllPlayers.Count}.");
+        }
+    }
+
     private void PruneExcessLobbyBots(AmongUsClient client, int targetCount)
     {
-        var managed = new List<(int ClientListIndex, ClientData Client, int BotIndex)>();
+        var managed = new List<(ClientData Client, int BotIndex)>();
         for (var i = 0; i < client.allClients.Count; i++)
         {
             var candidate = client.allClients[i];
@@ -112,24 +236,65 @@ internal sealed class SafeLocalBotSpawner
 
             if (DeepBotIdentity.TryGetBotIndex(candidate, out var botIndex))
             {
-                managed.Add((i, candidate, botIndex));
+                managed.Add((candidate, botIndex));
             }
         }
 
         foreach (var item in managed
                      .OrderByDescending(item => item.BotIndex)
-                     .ThenByDescending(item => item.ClientListIndex)
-                     .Take(Math.Max(0, managed.Count - targetCount))
-                     .OrderByDescending(item => item.ClientListIndex))
+                     .ThenByDescending(item => item.Client.Id)
+                     .Take(Math.Max(0, managed.Count - targetCount)))
         {
-            if (item.Client.Character)
+            var character = item.Client.Character;
+            var playerId = character && character.Data is not null
+                ? (byte?)character.PlayerId
+                : null;
+            try
             {
-                UnityEngine.Object.Destroy(item.Client.Character.gameObject);
+                // Use the game's own client-removal path first. It removes the
+                // ClientData, network object and GameData.PlayerInfo together.
+                // The previous Destroy + allClients.RemoveAt left stale player
+                // infos behind, so changing 8 -> 1 -> 8 displayed 16/15.
+                client.RemovePlayer(item.Client.Id, DisconnectReasons.Destroy);
             }
-            client.allClients.RemoveAt(item.ClientListIndex);
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    $"DeepBot native lobby removal failed for client={item.Client.Id}; applying local cleanup: {ex.GetBaseException().Message}");
+            }
+
+            if (playerId.HasValue && GameData.Instance)
+            {
+                GameData.Instance.RemovePlayer(playerId.Value);
+            }
+
+            var remainingIndex = -1;
+            for (var index = 0; index < client.allClients.Count; index++)
+            {
+                if (client.allClients[index]?.Id == item.Client.Id)
+                {
+                    remainingIndex = index;
+                    break;
+                }
+            }
+
+            if (remainingIndex >= 0)
+            {
+                client.allClients.RemoveAt(remainingIndex);
+            }
+
+            if (character)
+            {
+                client.RemoveNetObject(character);
+                UnityEngine.Object.Destroy(character.gameObject);
+            }
+
             _tracked.RemoveAll(tracked => tracked.ClientId == item.Client.Id);
             _appliedLobbyAppearances.Remove(item.Client.Id);
-            _log.LogInfo($"DeepBot lobby roster reduced: removed=DeepBot {item.BotIndex + 1}, target={targetCount}.");
+            _log.LogInfo(
+                $"DeepBot lobby roster reduced: removed=DeepBot {item.BotIndex + 1}, client={item.Client.Id}, " +
+                $"playerId={playerId?.ToString() ?? "unknown"}, target={targetCount}, " +
+                $"gameDataPlayers={(GameData.Instance ? GameData.Instance.AllPlayers.Count : -1)}.");
         }
     }
 
@@ -231,7 +396,8 @@ internal sealed class SafeLocalBotSpawner
             var color = DeepBotAppearance.ResolveColor(tracked.Index, appearance.ColorSelection);
             character.SetColor(color);
             character.RpcSetColor((byte)color);
-            character.NetTransform.SnapTo(GetSpawnPoint(tracked.Index));
+            var spawnPoint = GetSpawnPoint(client, tracked.Index, out var spawnSource);
+            character.NetTransform.SnapTo(spawnPoint);
 
             AssignRuntimeOwnership(client, character, tracked.ClientId);
             EnsureHostLocalPlayer(client, $"configured {name}");
@@ -239,7 +405,8 @@ internal sealed class SafeLocalBotSpawner
 
             _log.LogInfo(
                 $"DeepBot local bot ready: player={character.PlayerId}, client={tracked.ClientId}, " +
-                $"owner={character.OwnerId}, netOwner={character.NetTransform.OwnerId}, physicsOwner={character.MyPhysics.OwnerId}, name={character.Data.PlayerName}.");
+                $"owner={character.OwnerId}, netOwner={character.NetTransform.OwnerId}, physicsOwner={character.MyPhysics.OwnerId}, " +
+                $"name={character.Data.PlayerName}, spawn={spawnPoint}, spawnSource={spawnSource}.");
 
             _tracked.RemoveAt(i);
         }
@@ -346,9 +513,9 @@ internal sealed class SafeLocalBotSpawner
             return false;
         }
 
-        if (!GameRuleSettings.IsSkeldMap())
+        if (!GameRuleSettings.IsDeepBotSupportedMap())
         {
-            reason = $"mapId={GameRuleSettings.GetMapId()} (Skeld only)";
+            reason = $"mapId={GameRuleSettings.GetMapId()} ({GameRuleSettings.GetMapName()}; supported=The Skeld,MIRA HQ)";
             return false;
         }
 
@@ -826,6 +993,22 @@ internal sealed class SafeLocalBotSpawner
         return managedIds.Count;
     }
 
+    private static int CountNonManagedClients(AmongUsClient client)
+    {
+        var clientIds = new HashSet<int>();
+        for (var index = 0; index < client.allClients.Count; index++)
+        {
+            var candidate = client.allClients[index];
+            if (candidate is not null &&
+                !DeepBotIdentity.IsBot(candidate))
+            {
+                clientIds.Add(candidate.Id);
+            }
+        }
+
+        return clientIds.Count;
+    }
+
     private int FindNextBotIndex(AmongUsClient client, int targetCount)
     {
         var occupied = new HashSet<int>();
@@ -889,16 +1072,52 @@ internal sealed class SafeLocalBotSpawner
         player.MyPhysics.OwnerId = client.ClientId;
     }
 
-    private static Vector2 GetSpawnPoint(int index)
+    private static Vector2 GetSpawnPoint(AmongUsClient client, int index, out string source)
     {
-        var nodeId = SpawnNodeIds[Mathf.Abs(index) % SpawnNodeIds.Length];
+        var lobby = LobbyBehaviour.Instance;
+        if (client.GameState != InnerNetClient.GameStates.Started &&
+            lobby &&
+            lobby.SpawnPositions is { Length: > 0 } lobbySpawns)
+        {
+            source = "native-lobby";
+            return lobbySpawns[Mathf.Abs(index) % lobbySpawns.Length];
+        }
+
+        var spawnNodeIds = SkeldPathGraph.Instance.SpawnNodeIds;
+        var nodeId = spawnNodeIds[Mathf.Abs(index) % spawnNodeIds.Count];
+        source = $"map:{GameRuleSettings.GetMapName()}:{nodeId}";
         return SkeldPathGraph.Instance.FindNode(nodeId)?.Position ?? SkeldPathGraph.Instance.NearestNode(Vector2.zero).Position;
+    }
+
+    internal static void LogLobbySpawnSelfTest(ManualLogSource log)
+    {
+        var stabilizer = new LobbyBotCountStabilizer(LobbyBotCountStableSeconds);
+        var initialEight = stabilizer.Observe(8, 0f, false, out _) == 8;
+        var transientOneHeld = stabilizer.Observe(1, 0.5f, false, out _) == 8;
+        var restoredEightHeld = stabilizer.Observe(8, 0.75f, false, out _) == 8;
+        var deliberateOnePending = stabilizer.Observe(1, 2f, false, out _) == 8;
+        var deliberateOneAccepted = stabilizer.Observe(1, 4.1f, false, out _) == 1;
+        var startedMatchFrozen = stabilizer.Observe(8, 8f, true, out _) == 1;
+        stabilizer.Reset();
+        var resetAcceptsFreshValue = stabilizer.Observe(5, 9f, false, out _) == 5;
+        var exactRosterRequired = IsExactLobbyRosterReady(5, 5, 5) &&
+                                  !IsExactLobbyRosterReady(8, 8, 5) &&
+                                  !IsExactLobbyRosterReady(5, 7, 5);
+        var level = initialEight && transientOneHeld && restoredEightHeld && deliberateOnePending &&
+                    deliberateOneAccepted && startedMatchFrozen && resetAcceptsFreshValue && exactRosterRequired
+            ? "ok"
+            : "error";
+        log.LogInfo(
+            $"DeepBot lobby spawn self-test: level={level}, transientCountHeld={transientOneHeld && restoredEightHeld}, " +
+            $"deliberateCountAccepted={deliberateOneAccepted}, startedMatchFrozen={startedMatchFrozen}, " +
+            $"resetAcceptsFreshValue={resetAcceptsFreshValue}, exactRosterRequired={exactRosterRequired}, nativeLobbySpawnRequired=true.");
     }
 
     private void ResetTransientState()
     {
         _tracked.Clear();
         _spawnBlocked = false;
+        _startedSpawnBlockLogged = false;
         _nextSpawnAt = 0f;
         _hostPlayer = null;
         _visibilityRestored.Clear();
@@ -906,7 +1125,107 @@ internal sealed class SafeLocalBotSpawner
         _disabledBotLightIds.Clear();
         _appliedLobbyAppearances.Clear();
         _hostLightRepairLogged = false;
+        _botCountStabilizer.Reset();
     }
 
     private sealed record TrackedBotClient(int ClientId, int Index, ClientData Client);
+
+    private sealed class LobbyBotCountStabilizer
+    {
+        private readonly float _stableSeconds;
+        private int? _stableValue;
+        private int? _pendingValue;
+        private float _pendingSince;
+
+        internal LobbyBotCountStabilizer(float stableSeconds)
+        {
+            _stableSeconds = Mathf.Max(0f, stableSeconds);
+        }
+
+        internal int Observe(int candidate, float now, bool freeze, out string? transition)
+        {
+            transition = null;
+            candidate = Mathf.Clamp(candidate, 1, 8);
+            if (!_stableValue.HasValue)
+            {
+                _stableValue = candidate;
+                _pendingValue = null;
+                transition = $"initialized={candidate}";
+                return candidate;
+            }
+
+            if (freeze)
+            {
+                _pendingValue = null;
+                return _stableValue.Value;
+            }
+
+            if (candidate == _stableValue.Value)
+            {
+                _pendingValue = null;
+                return _stableValue.Value;
+            }
+
+            if (_pendingValue != candidate)
+            {
+                _pendingValue = candidate;
+                _pendingSince = now;
+                transition = $"pending={candidate}, stable={_stableValue.Value}, hold={_stableSeconds:0.0}s";
+                return _stableValue.Value;
+            }
+
+            if (now - _pendingSince < _stableSeconds)
+            {
+                return _stableValue.Value;
+            }
+
+            var previous = _stableValue.Value;
+            _stableValue = candidate;
+            _pendingValue = null;
+            transition = $"accepted={candidate}, previous={previous}, stableFor={now - _pendingSince:0.0}s";
+            return candidate;
+        }
+
+        internal void Reset()
+        {
+            _stableValue = null;
+            _pendingValue = null;
+            _pendingSince = 0f;
+        }
+    }
+}
+
+[HarmonyPatch(typeof(GameStartManager), nameof(GameStartManager.BeginGame))]
+internal static class DeepBotLobbyReadyStartGuard
+{
+    private static float _nextLogAt;
+
+    [HarmonyPrefix]
+    private static bool Prefix(GameStartManager __instance)
+    {
+        if (!Plugin.Settings.Enabled.Value || Plugin.Settings.DryRun.Value ||
+            SafeLocalBotSpawner.AreConfiguredLobbyBotsReady(out var reason))
+        {
+            return true;
+        }
+
+        if (__instance)
+        {
+            var startText = AccessTools.Property(typeof(GameStartManager), "GameStartText")?.GetValue(__instance) ??
+                            AccessTools.Field(typeof(GameStartManager), "GameStartText")?.GetValue(__instance);
+            if (startText is not null)
+            {
+                AccessTools.Property(startText.GetType(), "text")?.SetValue(
+                    startText,
+                    $"AI 玩家仍在生成，请稍候\n{reason}");
+                AccessTools.Property(startText.GetType(), "color")?.SetValue(startText, Color.yellow);
+            }
+        }
+        if (Time.time >= _nextLogAt)
+        {
+            _nextLogAt = Time.time + 1.5f;
+            Plugin.LogSource.LogWarning($"DeepBot blocked premature lobby start: {reason}.");
+        }
+        return false;
+    }
 }

@@ -11,20 +11,6 @@ namespace AmongUsDeepSeekBots;
 internal sealed class BotActionDirector
 {
     private static readonly float[] AvoidanceAngles = [28f, 52f, 78f, -28f, -52f, -78f];
-    private static readonly string[] PlausibleFakeTaskNodes =
-    [
-        "WEAP_DOWNLOAD",
-        "NAV_STEER",
-        "NAV_DOWNLOAD",
-        "O2_FILTER",
-        "UPPER_FUEL",
-        "LOWER_FUEL",
-        "ELEC_WIRES",
-        "ADMIN_CARD",
-        "COMMS_UPLOAD",
-        "MED_SAMPLE"
-    ];
-
     private const float NodeArrivalDistance = 0.25f;
     private const float SoftDeviationDistance = 0.85f;
     private const float HardDeviationDistance = 2.8f;
@@ -41,6 +27,7 @@ internal sealed class BotActionDirector
     private const float StuckEscapeProbeDistance = 0.90f;
     private const int MaxStuckEscapeAttemptsPerTarget = 3;
     private const int RouteLookAheadNodes = 4;
+    private const float RouteLookAheadDistance = 1.55f;
     private const float EmergencyInterruptCooldown = 0.75f;
     private const float DecisionInterval = 4.5f;
     private const float UnreachableTargetCooldownSeconds = 45f;
@@ -65,15 +52,29 @@ internal sealed class BotActionDirector
     private const float ThreatApproachDistance = 3.2f;
     private const float ThreatEvadeSeconds = 6f;
     private const float ActionWindowStableSeconds = 1.5f;
+    private const float MiraDeconActivationDistance = 1.85f;
 
     private readonly ManualLogSource _log;
     private readonly DeepSeekDecisionClient _deepSeek;
     private readonly BotMatchMemory _memory;
     private readonly Dictionary<byte, BotRuntimeState> _states = [];
+    private int _observedMatchSerial = -1;
     private bool _playClockStarted;
     private float _playClockStartedAt;
     private bool _meetingTransitionActive;
     private float _transitionReadySince;
+    private float _postMeetingBotUnlockAt;
+    private int _roundResumeEpoch;
+    private string _roundResumeReason = string.Empty;
+    private float _roundResumeStartedAt;
+    private bool _roundResumeSummaryLogged;
+    private float _nextRoundResumeWarningAt;
+    private DeconSystem[] _miraDeconSystems = [];
+    private DeconControl[] _miraDeconControls = [];
+    private int _miraDeconShipInstanceId;
+    private float _nextMiraDeconRefreshAt;
+    private float _nextMiraDeconCommandAt;
+    private string _lastEmergencyConsoleInventory = string.Empty;
 
     public BotActionDirector(ManualLogSource log, DeepSeekDecisionClient deepSeek, BotMatchMemory memory)
     {
@@ -90,21 +91,22 @@ internal sealed class BotActionDirector
             return;
         }
 
-        // moveable can briefly become true while the role card is still on
-        // screen. HudManager.IsIntroDisplayed is the authoritative UI signal;
-        // resetting here also prevents a previous match's play clock from
-        // leaking into the next role reveal.
-        if (IsIntroPresentationActive())
-        {
-            ResetActivePlayGate();
-            return;
-        }
-
         if (MeetingHud.Instance || ExileController.Instance)
         {
             FreezeKillCooldownSamples();
             _meetingTransitionActive = _playClockStarted;
             _transitionReadySince = 0f;
+            return;
+        }
+
+        // moveable can briefly become true while the role card is still on
+        // screen. HudManager.IsIntroDisplayed is the authoritative UI signal;
+        // resetting here also prevents a previous match's play clock from
+        // leaking into the next role reveal. Meetings are checked first so a
+        // stale IntroCutscene singleton cannot erase the post-meeting gate.
+        if (IsIntroPresentationActive())
+        {
+            ResetActivePlayGate();
             return;
         }
 
@@ -129,6 +131,7 @@ internal sealed class BotActionDirector
 
         if (_meetingTransitionActive)
         {
+            RepairVirtualBotPostMeetingMovementLocks();
             if (!IsTransitionReadyStable(out _))
             {
                 return;
@@ -189,15 +192,39 @@ internal sealed class BotActionDirector
             if (!isDeadCrewmate &&
                 TryAssignEmergencyRoute(bot, state, "decision"))
             {
+                CompleteRoundResumeIntent(bot, state, "emergency");
                 continue;
             }
 
             if (state.HasActiveRoute)
             {
+                CompleteRoundResumeIntent(
+                    bot,
+                    state,
+                    $"existing-{state.ActionKind.ToString().ToLowerInvariant()}");
+                continue;
+            }
+
+            if (state.RoundResumeIntentPending)
+            {
+                TryAssignRoundResumeIntent(bot, state, isDeadCrewmate);
                 continue;
             }
 
             if (IsImpostor(bot) && TryAssignImpostorOpeningCover(bot, state))
+            {
+                continue;
+            }
+
+            // Once the room-configured cooldown is ready, an ordinary killer's
+            // concrete opportunity outranks generic LLM roaming. Previously a
+            // newly-arrived idle/fake-task reply could repeatedly consume the
+            // only route slot and starve Godfather (or promoted Mafioso) kills.
+            if (IsImpostor(bot) &&
+                bot.killTimer <= 0f &&
+                !TorRoleAdapter.HasExclusiveKillAbilityPending(bot) &&
+                Time.time >= state.NextMurderPlanAt &&
+                TryAssignAutonomousMurderTarget(bot, state))
             {
                 continue;
             }
@@ -230,15 +257,6 @@ internal sealed class BotActionDirector
             }
 
             if (!isDeadCrewmate && TryApplyPostMeetingSocialIntent(bot, state))
-            {
-                continue;
-            }
-
-            if (IsImpostor(bot) &&
-                bot.killTimer <= 0f &&
-                !TorRoleAdapter.HasExclusiveKillAbilityPending(bot) &&
-                Time.time >= state.NextMurderPlanAt &&
-                TryAssignAutonomousMurderTarget(bot, state))
             {
                 continue;
             }
@@ -322,11 +340,243 @@ internal sealed class BotActionDirector
                 // waits motionless for a network response.
                 TryAssignImpostorAmbientBehavior(bot, state);
             }
+            else
+            {
+                // A crew bot must never depend on a network reply to move. The
+                // LLM remains advisory, while this local route keeps MIRA (and
+                // any transient 429/timeout) playable and gives the crew a
+                // varied short activity between real tasks.
+                TryAssignCrewAmbientBehavior(bot, state);
+            }
+        }
+
+        LogRoundResumeStatus();
+    }
+
+    internal void OnMeetingStarted()
+    {
+        if (_playClockStarted)
+        {
+            _meetingTransitionActive = true;
+        }
+
+        _transitionReadySince = 0f;
+        _postMeetingBotUnlockAt = 0f;
+    }
+
+    internal void OnMeetingEnded()
+    {
+        if (_playClockStarted)
+        {
+            _meetingTransitionActive = true;
+        }
+
+        _transitionReadySince = 0f;
+        _postMeetingBotUnlockAt = Time.time + 0.25f;
+    }
+
+    private void RepairVirtualBotPostMeetingMovementLocks()
+    {
+        if (_postMeetingBotUnlockAt <= 0f ||
+            Time.time < _postMeetingBotUnlockAt ||
+            MeetingHud.Instance ||
+            ExileController.Instance ||
+            IsIntroPresentationActive() ||
+            !PlayerControl.LocalPlayer ||
+            !PlayerControl.LocalPlayer.moveable)
+        {
+            return;
+        }
+
+        _postMeetingBotUnlockAt = 0f;
+        var repaired = new List<string>();
+        foreach (var bot in EnumerateDeepBots())
+        {
+            var alive = bot && bot.Data is not null && !bot.Data.IsDead && !bot.Data.Disconnected;
+            var ruleImmobilized = bot && TorRoleAdapter.IsRuleImmobilized(bot);
+            if (!bot ||
+                bot.moveable ||
+                !ShouldReleaseVirtualPostMeetingLock(alive, bot.inVent, bot.walkingToVent, ruleImmobilized))
+            {
+                continue;
+            }
+
+            bot.moveable = true;
+            if (bot.NetTransform)
+            {
+                bot.NetTransform.Halt();
+            }
+
+            Stop(bot.MyPhysics);
+            repaired.Add($"{bot.Data?.PlayerName}({bot.PlayerId})");
+        }
+
+        if (repaired.Count > 0)
+        {
+            _log.LogWarning(
+                $"DeepBot post-meeting virtual movement locks repaired: [{string.Join(", ", repaired)}].");
+        }
+    }
+
+    private static bool ShouldReleaseVirtualPostMeetingLock(
+        bool alive,
+        bool inVent,
+        bool walkingToVent,
+        bool ruleImmobilized)
+    {
+        return alive && !inVent && !walkingToVent && !ruleImmobilized;
+    }
+
+    private void TryAssignRoundResumeIntent(
+        PlayerControl bot,
+        BotRuntimeState state,
+        bool isDeadCrewmate)
+    {
+        state.RoundResumeAttempts++;
+
+        // Match start is deliberately action-first for every living bot.  The
+        // role changes the believable destination, never whether the bot gets
+        // a physical plan.  After meetings, remembered social intent may own
+        // the first route, but failure still falls through to a local plan.
+        if (string.Equals(state.RoundResumeReason, "post-meeting", StringComparison.Ordinal) &&
+            !isDeadCrewmate &&
+            TryApplyPostMeetingSocialIntent(bot, state) &&
+            state.HasActiveRoute)
+        {
+            CompleteRoundResumeIntent(bot, state, "meeting-memory");
+            return;
+        }
+
+        if (IsImpostor(bot) &&
+            string.Equals(state.RoundResumeReason, "match-start", StringComparison.Ordinal) &&
+            TryAssignImpostorOpeningCover(bot, state) &&
+            state.HasActiveRoute)
+        {
+            CompleteRoundResumeIntent(bot, state, "opening-fake-task");
+            return;
+        }
+
+        if (IsTaskCompletingRole(bot) &&
+            TryFindAssignedTaskTarget(bot, state, out var taskTarget))
+        {
+            AssignRoute(
+                bot,
+                state,
+                taskTarget.Position,
+                $"TASK_{taskTarget.Task.Id}",
+                $"round-resume:{state.RoundResumeReason}:task:{taskTarget.Task.TaskType}:{taskTarget.Source}",
+                TaskDwellSecondsMin,
+                TaskDwellSecondsMax,
+                BotActionKind.Task,
+                taskTarget.Task.Id,
+                null,
+                taskTarget.UseDistance);
+            if (state.HasActiveRoute)
+            {
+                state.TaskSelectionEpoch++;
+                CompleteRoundResumeIntent(bot, state, "real-task");
+                return;
+            }
+        }
+
+        var assignedAmbient = IsImpostor(bot)
+            ? TryAssignImpostorAmbientBehavior(bot, state)
+            : TryAssignCrewAmbientBehavior(bot, state);
+        if (assignedAmbient && state.HasActiveRoute)
+        {
+            CompleteRoundResumeIntent(
+                bot,
+                state,
+                IsImpostor(bot) ? "impostor-cover-or-patrol" : "crew-or-neutral-activity");
+            return;
+        }
+
+        state.RoundResumeIntentPending =
+            BotBehaviorPolicy.ShouldKeepRoundResumePending(state.HasActiveRoute);
+        state.NextDecisionAt = Mathf.Min(state.NextDecisionAt, Time.time + 0.35f);
+        if (Time.time >= state.NextRoundResumeDiagnosticAt)
+        {
+            state.NextRoundResumeDiagnosticAt = Time.time + 2f;
+            _log.LogWarning(
+                $"DeepBot round resume still awaiting a physical route: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+                $"team={(IsImpostor(bot) ? "impostor" : "non-impostor")}, reason={state.RoundResumeReason}, " +
+                $"attempt={state.RoundResumeAttempts}, graph={SkeldPathGraph.Instance.Summary}.");
+        }
+    }
+
+    private void CompleteRoundResumeIntent(
+        PlayerControl bot,
+        BotRuntimeState state,
+        string intent)
+    {
+        if (!state.RoundResumeIntentPending)
+        {
+            return;
+        }
+
+        state.RoundResumeIntentPending = false;
+        state.RoundResumeIntent = intent;
+        _memory.RecordAction(
+            bot,
+            "round_resume_decision",
+            $"reason={state.RoundResumeReason}; intent={intent}; attempts={state.RoundResumeAttempts}");
+        _log.LogInfo(
+            $"DeepBot independent round resume decision: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+            $"team={(IsImpostor(bot) ? "impostor" : "non-impostor")}, reason={state.RoundResumeReason}, " +
+            $"intent={intent}, attempts={state.RoundResumeAttempts}.");
+    }
+
+    private void LogRoundResumeStatus()
+    {
+        if (_roundResumeSummaryLogged || string.IsNullOrWhiteSpace(_roundResumeReason))
+        {
+            return;
+        }
+
+        var livingBots = EnumerateDeepBots()
+            .Where(bot =>
+                bot.Data is not null &&
+                !bot.Data.IsDead &&
+                !bot.Data.Disconnected)
+            .ToArray();
+        if (livingBots.Length == 0)
+        {
+            return;
+        }
+
+        var pending = livingBots
+            .Where(bot => GetState(bot).RoundResumeIntentPending)
+            .ToArray();
+        if (pending.Length == 0)
+        {
+            _roundResumeSummaryLogged = true;
+            var decisions = string.Join(
+                ", ",
+                livingBots.Select(bot =>
+                {
+                    var state = GetState(bot);
+                    return $"{bot.Data?.PlayerName}({(IsImpostor(bot) ? "I" : "N")}):{state.RoundResumeIntent}";
+                }));
+            _log.LogInfo(
+                $"DeepBot round resume complete: epoch={_roundResumeEpoch}, reason={_roundResumeReason}, " +
+                $"livingBots={livingBots.Length}, decisions=[{decisions}].");
+            return;
+        }
+
+        if (Time.time - _roundResumeStartedAt >= 5f && Time.time >= _nextRoundResumeWarningAt)
+        {
+            _nextRoundResumeWarningAt = Time.time + 3f;
+            _log.LogWarning(
+                $"DeepBot round resume incomplete: epoch={_roundResumeEpoch}, reason={_roundResumeReason}, " +
+                $"elapsed={Time.time - _roundResumeStartedAt:0.0}s, pending=[" +
+                string.Join(", ", pending.Select(bot =>
+                    $"{bot.Data?.PlayerName}({bot.PlayerId},{(IsImpostor(bot) ? "I" : "N")})")) + "].");
         }
     }
 
     public void UpdateMovement(PluginConfig config, float deltaTime)
     {
+        SynchronizeMatchState();
         if (!IsHostAuthority())
         {
             return;
@@ -351,6 +601,13 @@ internal sealed class BotActionDirector
             }
 
             var state = GetState(bot);
+            if (TorRoleAdapter.IsRuleImmobilized(bot))
+            {
+                Stop(bot.MyPhysics);
+                state.DesiredMoveDirection = Vector2.zero;
+                state.DesiredMoveUntil = 0f;
+                continue;
+            }
             if (!bot.moveable && !bot.inVent)
             {
                 Stop(bot.MyPhysics);
@@ -425,6 +682,27 @@ internal sealed class BotActionDirector
         }
     }
 
+    private void SynchronizeMatchState()
+    {
+        var serial = _memory.MatchSerial;
+        if (serial <= 0 || serial == _observedMatchSerial)
+        {
+            return;
+        }
+
+        _observedMatchSerial = serial;
+        _states.Clear();
+        ResetActivePlayGate();
+        _roundResumeEpoch = 0;
+        _roundResumeReason = string.Empty;
+        _roundResumeSummaryLogged = false;
+        _miraDeconSystems = [];
+        _miraDeconControls = [];
+        _miraDeconShipInstanceId = 0;
+        _lastEmergencyConsoleInventory = string.Empty;
+        _log.LogInfo($"DeepBot action state reset for new match: match={serial}.");
+    }
+
     private void EnterGhostTaskMode(PlayerControl bot, BotRuntimeState state)
     {
         state.PendingDecision = null;
@@ -485,7 +763,10 @@ internal sealed class BotActionDirector
             return;
         }
 
-        if (!physics.myPlayer.moveable || physics.myPlayer.inVent || physics.myPlayer.walkingToVent)
+        if (!physics.myPlayer.moveable ||
+            physics.myPlayer.inVent ||
+            physics.myPlayer.walkingToVent ||
+            TorRoleAdapter.IsRuleImmobilized(physics.myPlayer))
         {
             physics.SetNormalizedVelocity(Vector2.zero);
             if (physics.body)
@@ -595,6 +876,46 @@ internal sealed class BotActionDirector
         return state.ActionKind == BotActionKind.Ability && state.HasActiveRoute;
     }
 
+    internal bool TryRouteToRoleEscape(
+        PlayerControl bot,
+        Vector2 targetPosition,
+        string targetLabel,
+        float arrivalDistance)
+    {
+        if (!IsHostAuthority() || !bot || bot.Data is null || bot.Data.IsDead)
+        {
+            return false;
+        }
+
+        var state = GetState(bot);
+        if (state.ActionKind is BotActionKind.Emergency or BotActionKind.Report)
+        {
+            return false;
+        }
+
+        if (state.ActionKind == BotActionKind.Ability &&
+            state.CurrentTargetPosition.HasValue &&
+            Vector2.Distance(state.CurrentTargetPosition.Value, targetPosition) <= 0.1f &&
+            state.HasActiveRoute)
+        {
+            return true;
+        }
+
+        AssignRoute(
+            bot,
+            state,
+            targetPosition,
+            targetLabel,
+            "role-ability-escape",
+            1.2f,
+            2.4f,
+            BotActionKind.Ability,
+            null,
+            null,
+            arrivalDistance);
+        return state.ActionKind == BotActionKind.Ability && state.HasActiveRoute;
+    }
+
     internal void CompleteRoleAbilityRoute(PlayerControl bot, string reason)
     {
         if (!bot)
@@ -614,11 +935,35 @@ internal sealed class BotActionDirector
         _memory.RecordAction(bot, "ability_route", $"completed ability route; reason={reason}");
     }
 
+    internal void OnWitnessedMurder(
+        PlayerControl killer,
+        PlayerControl victim,
+        IReadOnlyList<byte> witnessIds)
+    {
+        foreach (var witnessId in witnessIds)
+        {
+            var witness = FindPlayerControl(witnessId);
+            if (!witness || witness!.Data is null || witness.Data.IsDead || witness.Data.Disconnected)
+            {
+                continue;
+            }
+
+            var state = GetState(witness);
+            state.NextBodyCheckAt = 0f;
+            state.NextThreatScanAt = 0f;
+            state.ThreatEvadeUntil = 0f;
+            state.NextDecisionAt = Mathf.Min(state.NextDecisionAt, Time.time + 0.05f);
+            _log.LogInfo(
+                $"DeepBot witnessed murder response armed: observer={witness.Data.PlayerName}({witness.PlayerId}), " +
+                $"killer={killer.Data?.PlayerName}({killer.PlayerId}), victim={victim.Data?.PlayerName}({victim.PlayerId}), " +
+                $"bodyCheck=immediate, threatCheck=immediate.");
+        }
+    }
+
     private bool TryInterruptForVisibleBody(PlayerControl bot, BotRuntimeState state, PluginConfig config)
     {
         if (!config.SocialInteraction.Value ||
             !config.AutoReportBodies.Value ||
-            IsImpostor(bot) ||
             Time.time < state.NextBodyCheckAt)
         {
             return state.ActionKind == BotActionKind.Report;
@@ -676,27 +1021,79 @@ internal sealed class BotActionDirector
                 $"reserved visible body playerId={nearest.Body.ParentId} for Vulture eat before report");
             return true;
         }
+        var activeEmergency = FindActiveSabotageTask();
+        var criticalEmergency = activeEmergency is not null && IsCriticalEmergency(activeEmergency.TaskType);
+        if (nearest.Body && IsImpostor(bot))
+        {
+            var visibleWitnesses = CountBodyWitnesses(bot, nearest.Body);
+            var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
+            var socialWillingness = (personality.SocialSuggestibility + personality.VoteBoldness) * 0.5f;
+            var ownRecentVictim = state.LastMurderVictimId == nearest.Body.ParentId;
+            var personalRoll = StableBodyChoiceRoll(bot.PlayerId, nearest.Body.ParentId);
+            if (!BotBehaviorPolicy.ShouldImpostorReportBody(
+                    ownRecentVictim,
+                    visibleWitnesses,
+                    socialWillingness,
+                    personalRoll))
+            {
+                if (Time.time >= state.NextBodyDecisionLogAt)
+                {
+                    state.NextBodyDecisionLogAt = Time.time + 4f;
+                    _memory.RecordAction(
+                        bot,
+                        "body_report_held",
+                        $"impostor independently held report; victim={nearest.Body.ParentId}; ownVictim={ownRecentVictim}; witnesses={visibleWitnesses}");
+                    _log.LogInfo(
+                        $"DeepBot impostor body-report decision: bot={bot.Data?.PlayerName}, victim={nearest.Body.ParentId}, " +
+                        $"report=false, ownVictim={ownRecentVictim}, visibleWitnesses={visibleWitnesses}, roll={personalRoll:0.00}.");
+                }
+                return false;
+            }
+        }
         var reportDistance = DeadBodyPerception.GetReportDistance(bot);
         var withinImmediateReportRange = nearest.Body && nearest.Distance <= reportDistance;
         if (withinImmediateReportRange)
         {
-            var interruptedAction = state.ActionKind;
-            if (TryReportBody(bot, nearest.Body.ParentId))
+            if (state.ActionKind == BotActionKind.Report && state.TargetPlayerId == nearest.Body.ParentId)
             {
-                Stop(bot.MyPhysics);
-                state.ClearRoute();
-                state.ClearEmergency();
-                state.NextBodyCheckAt = Time.time + 1.5f;
-                _memory.RecordAction(
-                    bot,
-                    "body_report_priority",
-                    $"reported visible body during {interruptedAction}; distance={nearest.Distance:0.0}");
                 return true;
             }
+
+            var interruptedAction = state.ActionKind;
+            var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
+            var observationDelay = BotBehaviorPolicy.GetBodyObservationDelay(
+                personality.EyewitnessReliance,
+                IsImpostor(bot),
+                criticalEmergency);
+            if (interruptedAction == BotActionKind.Emergency)
+            {
+                state.ClearEmergency();
+            }
+            AssignRoute(
+                bot,
+                state,
+                nearest.Body.TruePosition,
+                $"BODY_{nearest.Body.ParentId}",
+                $"body-observation-before-report:{nearest.Body.ParentId}:distance={nearest.Distance:0.00}",
+                observationDelay,
+                observationDelay,
+                BotActionKind.Report,
+                null,
+                nearest.Body.ParentId,
+                Mathf.Clamp(reportDistance - 0.25f, 0.75f, 1.5f));
+            state.PostTaskPauseUntil = 0f;
+            state.PostTaskWanderPending = false;
+            var nearbyNames = DescribeBodyWitnesses(bot, nearest.Body);
+            _memory.RecordAction(
+                bot,
+                "body_observation",
+                $"paused {observationDelay:0.0}s before reporting victim={nearest.Body.ParentId}; nearby={nearbyNames}; interrupted={interruptedAction}");
+            _log.LogInfo(
+                $"DeepBot body observation window started: bot={bot.Data?.PlayerName}, victim={nearest.Body.ParentId}, " +
+                $"delay={observationDelay:0.0}s, nearby={nearbyNames}, interrupted={interruptedAction}.");
+            return true;
         }
 
-        var activeEmergency = FindActiveSabotageTask();
-        var criticalEmergency = activeEmergency is not null && IsCriticalEmergency(activeEmergency.TaskType);
         // A failed/unsupported immediate report attempt must not make a bot
         // abandon a lethal countdown. At this point no report was sent, so the
         // policy receives false for an immediately actionable body.
@@ -734,8 +1131,14 @@ internal sealed class BotActionDirector
             nearest.Body.TruePosition,
             $"BODY_{nearest.Body.ParentId}",
             $"visible-body:{nearest.Body.ParentId}:distance={nearest.Distance:0.00}",
-            0.55f,
-            1.35f,
+            BotBehaviorPolicy.GetBodyObservationDelay(
+                BotPersonalityCatalog.ForPlayer(bot.PlayerId).EyewitnessReliance,
+                IsImpostor(bot),
+                criticalEmergency),
+            BotBehaviorPolicy.GetBodyObservationDelay(
+                BotPersonalityCatalog.ForPlayer(bot.PlayerId).EyewitnessReliance,
+                IsImpostor(bot),
+                criticalEmergency),
             BotActionKind.Report,
             null,
             nearest.Body.ParentId,
@@ -750,6 +1153,50 @@ internal sealed class BotActionDirector
             $"DeepBot visible body interrupted normal behavior: bot={bot.Data?.PlayerName}, " +
             $"victim={nearest.Body.ParentId}, distance={nearest.Distance:0.00}, reportDistance={reportDistance:0.00}.");
         return true;
+    }
+
+    private static int CountBodyWitnesses(PlayerControl observer, DeadBody body)
+    {
+        return PlayerControl.AllPlayerControls
+            .ToArray()
+            .Count(player =>
+                player &&
+                player.PlayerId != observer.PlayerId &&
+                player.Data is not null &&
+                !player.Data.IsDead &&
+                !player.Data.Disconnected &&
+                DeadBodyPerception.CanObserve(
+                    player,
+                    body,
+                    BotPerceptionPolicy.GetCurrentVisionDistance(player),
+                    out _,
+                    out _));
+    }
+
+    private static string DescribeBodyWitnesses(PlayerControl observer, DeadBody body)
+    {
+        var witnesses = PlayerControl.AllPlayerControls
+            .ToArray()
+            .Where(player =>
+                player &&
+                player.PlayerId != observer.PlayerId &&
+                player.Data is not null &&
+                !player.Data.IsDead &&
+                !player.Data.Disconnected &&
+                DeadBodyPerception.CanObserve(
+                    player,
+                    body,
+                    BotPerceptionPolicy.GetCurrentVisionDistance(player),
+                    out _,
+                    out _))
+            .Select(player => $"{player.Data!.PlayerName}({player.PlayerId})")
+            .ToArray();
+        return witnesses.Length == 0 ? "none" : string.Join(",", witnesses);
+    }
+
+    private static float StableBodyChoiceRoll(byte botId, byte victimId)
+    {
+        return ((botId * 37 + victimId * 17 + 11) % 100) / 99f;
     }
 
     private void LogBodyPerceptionRejection(
@@ -806,27 +1253,39 @@ internal sealed class BotActionDirector
             }
 
             var distance = Vector2.Distance(botPosition, player.GetTruePosition());
+            var isPersonallyWitnessedKiller =
+                _memory.TryGetLatestWitnessedKiller(bot.PlayerId, out var witnessedKillerId) &&
+                witnessedKillerId == player.PlayerId;
+            var immediateWitnessThreat = isPersonallyWitnessedKiller &&
+                distance <= ThreatApproachDistance * 1.45f;
+            var streak = 0;
             if (!state.ThreatTracks.TryGetValue(player.PlayerId, out var track))
             {
                 state.ThreatTracks[player.PlayerId] = new ThreatTrack(distance, Time.time, 0);
-                continue;
+                if (!immediateWitnessThreat)
+                {
+                    continue;
+                }
             }
-
-            var sampleAge = Time.time - track.SampleAt;
-            var closing = sampleAge is >= 0.25f and <= 1.25f &&
-                          track.Distance - distance >= 0.18f;
-            var streak = closing
-                ? track.ApproachStreak + 1
-                : Math.Max(0, track.ApproachStreak - 1);
-            state.ThreatTracks[player.PlayerId] = new ThreatTrack(distance, Time.time, streak);
-            if (!BotBehaviorPolicy.IsPersistentApproach(
-                    track.Distance,
-                    distance,
-                    sampleAge,
-                    streak,
-                    ThreatApproachDistance))
+            else
             {
-                continue;
+                var sampleAge = Time.time - track.SampleAt;
+                var closing = sampleAge is >= 0.25f and <= 1.25f &&
+                              track.Distance - distance >= 0.18f;
+                streak = closing
+                    ? track.ApproachStreak + 1
+                    : Math.Max(0, track.ApproachStreak - 1);
+                state.ThreatTracks[player.PlayerId] = new ThreatTrack(distance, Time.time, streak);
+                if (!immediateWitnessThreat &&
+                    !BotBehaviorPolicy.IsPersistentApproach(
+                        track.Distance,
+                        distance,
+                        sampleAge,
+                        streak,
+                        ThreatApproachDistance))
+                {
+                    continue;
+                }
             }
 
             var evadeNode = PickEvadeNode(botPosition, player.GetTruePosition());
@@ -840,7 +1299,8 @@ internal sealed class BotActionDirector
                 bot,
                 state,
                 evadeNode,
-                $"crew-evade:approaching={player.Data.PlayerName}({player.PlayerId}); interrupted={interruptedAction}",
+                $"crew-evade:{(immediateWitnessThreat ? "witnessed-killer" : "approaching")}=" +
+                $"{player.Data.PlayerName}({player.PlayerId}); interrupted={interruptedAction}",
                 0.8f,
                 2.2f,
                 BotActionKind.Evade,
@@ -852,9 +1312,11 @@ internal sealed class BotActionDirector
             _memory.RecordAction(
                 bot,
                 "threat_evade",
-                $"abandoned {interruptedAction}; {player.Data.PlayerName} repeatedly approached to {distance:0.0}m");
+                immediateWitnessThreat
+                    ? $"abandoned {interruptedAction}; personally witnessed {player.Data.PlayerName} kill and fled at {distance:0.0}m"
+                    : $"abandoned {interruptedAction}; {player.Data.PlayerName} repeatedly approached to {distance:0.0}m");
             _log.LogInfo(
-                $"DeepBot crew evading suspicious approach: bot={bot.Data?.PlayerName}, " +
+                $"DeepBot crew evading {(immediateWitnessThreat ? "witnessed killer" : "suspicious approach")}: bot={bot.Data?.PlayerName}, " +
                 $"approacher={player.Data.PlayerName}({player.PlayerId}), distance={distance:0.00}, " +
                 $"streak={streak}, interrupted={interruptedAction}, target={evadeNode}.");
             return;
@@ -1168,14 +1630,64 @@ internal sealed class BotActionDirector
             : SkeldPathGraph.Instance.FindTopRoutes(bot.GetTruePosition(), targetPosition, 5);
         if (routes.Count == 0)
         {
-            _log.LogWarning($"DeepBot no route: bot={bot.Data?.PlayerName}, target={targetLabel}, targetPosition={targetPosition}, reason={reason}");
+            if (Time.time >= state.NextNoRouteLogAt)
+            {
+                state.NextNoRouteLogAt = Time.time + 2f;
+                _log.LogWarning($"DeepBot no route: bot={bot.Data?.PlayerName}, target={targetLabel}, targetPosition={targetPosition}, reason={reason}");
+            }
             MarkTargetUnreachable(state, targetLabel);
             TryAssignReachableFallback(bot, state, targetLabel, reason, kind);
             return;
         }
 
-        var selected = routes[state.RouteVariant % routes.Count];
+        var selected = routes[state.RouteVariant % routes.Count].ToList();
         state.RouteVariant++;
+
+        // Runtime A* projects an interaction target onto the nearest safe grid
+        // cell. On MIRA, console transforms can sit behind a panel/wall and the
+        // projected endpoint may be ~2m away from the actual usable position.
+        // Add a short, collision-checked stand-off waypoint so dwell completion
+        // uses a physically reachable position instead of retrying forever.
+        if (selected.Count > 0 &&
+            Vector2.Distance(selected[^1].Position, targetPosition) > arrivalDistance + 0.35f)
+        {
+            var fromEndpoint = selected[^1].Position;
+            var towardTarget = (targetPosition - fromEndpoint).normalized;
+            var standOffDistance = Mathf.Clamp(arrivalDistance * 0.82f, 0.62f, 1.15f);
+            var standOff = targetPosition - towardTarget * standOffDistance;
+            if (RuntimeSkeldGrid.IsNavigationSegmentClear(fromEndpoint, standOff, 0.16f))
+            {
+                selected.Add(new NavNode(
+                    $"TARGET_STANDOFF_{targetLabel}",
+                    "Collision-checked interaction stand-off",
+                    standOff,
+                    NodeKind.Waypoint));
+            }
+        }
+
+        state.ClearPortalShortcut();
+        if (!ghostTask && TryBuildPortalShortcut(
+                bot,
+                targetPosition,
+                arrivalDistance,
+                kind,
+                selected,
+                out var portalOption,
+                out var entryRoute,
+                out var continuationRoute,
+                out var savedDistance))
+        {
+            selected = entryRoute;
+            state.PortalShortcutOption = portalOption;
+            state.PortalContinuationRoute = continuationRoute;
+            state.PortalShortcutStarted = false;
+            state.PortalWaitStartedAt = 0f;
+            _log.LogInfo(
+                $"DeepBot portal shortcut planned: bot={bot.Data?.PlayerName}, target={targetLabel}, " +
+                $"entry={portalOption.Entry}, exit={portalOption.Exit}, remote={portalOption.Remote}, " +
+                $"estimatedSavedDistance={savedDistance:0.0}.");
+        }
+
         state.Route = selected.ToList();
         state.RouteIndex = Math.Min(1, state.Route.Count - 1);
         state.CurrentTargetNode = targetLabel;
@@ -1197,6 +1709,158 @@ internal sealed class BotActionDirector
             $"nodes={state.Route.Count}, from={bot.GetTruePosition()}, first={state.Route[0].Position}, last={state.RouteEndpoint}, " +
             $"dwell={state.DwellSeconds:0.0}s, action={kind}, reason={reason}");
         _memory.RecordAction(bot, "intent", $"started {kind} toward {targetLabel}; reason={reason}");
+    }
+
+    private static bool TryBuildPortalShortcut(
+        PlayerControl bot,
+        Vector2 targetPosition,
+        float arrivalDistance,
+        BotActionKind kind,
+        IReadOnlyList<NavNode> directRoute,
+        out TorPortalTraversalOption option,
+        out List<NavNode> entryRoute,
+        out List<NavNode> continuationRoute,
+        out float savedDistance)
+    {
+        option = default;
+        entryRoute = [];
+        continuationRoute = [];
+        savedDistance = 0f;
+        var origin = bot.GetTruePosition();
+        var directCost = EstimateRouteDistance(origin, directRoute, targetPosition);
+        if (directCost < 7f)
+        {
+            return false;
+        }
+
+        var teleportSpeedEquivalent = bot.MyPhysics
+            ? Mathf.Max(1.8f, bot.MyPhysics.TrueSpeed)
+            : 2.5f;
+        var requiredSaving = kind == BotActionKind.Emergency ? 1.25f : 3f;
+        var bestCost = directCost;
+        foreach (var candidate in TorRoleAdapter.GetPortalTraversalOptions(bot))
+        {
+            List<NavNode> candidateEntry;
+            var entryCost = 0f;
+            if (candidate.Remote)
+            {
+                candidateEntry =
+                [
+                    new NavNode(
+                        $"TOR_PORTAL_REMOTE_ENTRY_{candidate.ExitMode}",
+                        "Remote portal activation point",
+                        origin,
+                        NodeKind.Waypoint)
+                ];
+            }
+            else
+            {
+                var toEntry = SkeldPathGraph.Instance.FindTopRoutes(origin, candidate.Entry, 3);
+                if (toEntry.Count == 0)
+                {
+                    continue;
+                }
+
+                candidateEntry = toEntry[0].ToList();
+                if (!TryAppendExactPortalEndpoint(candidateEntry, candidate.Entry, "ENTRY"))
+                {
+                    continue;
+                }
+                entryCost = EstimateRouteDistance(origin, candidateEntry, candidate.Entry);
+            }
+
+            var fromExit = SkeldPathGraph.Instance.FindTopRoutes(candidate.Exit, targetPosition, 3);
+            if (fromExit.Count == 0)
+            {
+                continue;
+            }
+
+            var candidateContinuation = fromExit[0].ToList();
+            if (candidateContinuation.Count == 0)
+            {
+                continue;
+            }
+            if (Vector2.Distance(candidateContinuation[0].Position, candidate.Exit) > 0.15f)
+            {
+                candidateContinuation.Insert(
+                    0,
+                    new NavNode("TOR_PORTAL_EXIT", "Portal exit", candidate.Exit, NodeKind.Waypoint));
+            }
+            AppendInteractionStandOff(candidateContinuation, targetPosition, arrivalDistance, "PORTAL_CONTINUATION");
+
+            var exitCost = EstimateRouteDistance(candidate.Exit, candidateContinuation, targetPosition);
+            var candidateCost = entryCost + exitCost + candidate.Duration * teleportSpeedEquivalent;
+            var saving = directCost - candidateCost;
+            if (saving < requiredSaving || candidateCost >= bestCost)
+            {
+                continue;
+            }
+
+            option = candidate;
+            entryRoute = candidateEntry;
+            continuationRoute = candidateContinuation;
+            savedDistance = saving;
+            bestCost = candidateCost;
+        }
+
+        return entryRoute.Count > 0 && continuationRoute.Count > 0;
+    }
+
+    private static bool TryAppendExactPortalEndpoint(List<NavNode> route, Vector2 endpoint, string suffix)
+    {
+        if (route.Count == 0)
+        {
+            return false;
+        }
+
+        var distance = Vector2.Distance(route[^1].Position, endpoint);
+        if (distance <= 0.18f)
+        {
+            route[^1] = new NavNode($"TOR_PORTAL_{suffix}", "Portal endpoint", endpoint, NodeKind.Waypoint);
+            return true;
+        }
+
+        if (distance > 1.25f || !RuntimeSkeldGrid.IsNavigationSegmentClear(route[^1].Position, endpoint, 0.14f))
+        {
+            return false;
+        }
+
+        route.Add(new NavNode($"TOR_PORTAL_{suffix}", "Portal endpoint", endpoint, NodeKind.Waypoint));
+        return true;
+    }
+
+    private static void AppendInteractionStandOff(
+        List<NavNode> route,
+        Vector2 targetPosition,
+        float arrivalDistance,
+        string label)
+    {
+        if (route.Count == 0 || Vector2.Distance(route[^1].Position, targetPosition) <= arrivalDistance + 0.35f)
+        {
+            return;
+        }
+
+        var fromEndpoint = route[^1].Position;
+        var towardTarget = (targetPosition - fromEndpoint).normalized;
+        var standOffDistance = Mathf.Clamp(arrivalDistance * 0.82f, 0.62f, 1.15f);
+        var standOff = targetPosition - towardTarget * standOffDistance;
+        if (RuntimeSkeldGrid.IsNavigationSegmentClear(fromEndpoint, standOff, 0.16f))
+        {
+            route.Add(new NavNode($"TARGET_STANDOFF_{label}", "Collision-checked interaction stand-off", standOff, NodeKind.Waypoint));
+        }
+    }
+
+    private static float EstimateRouteDistance(Vector2 origin, IReadOnlyList<NavNode> route, Vector2 target)
+    {
+        var distance = 0f;
+        var cursor = origin;
+        foreach (var node in route)
+        {
+            distance += Vector2.Distance(cursor, node.Position);
+            cursor = node.Position;
+        }
+        distance += Vector2.Distance(cursor, target);
+        return distance;
     }
 
     private void TryAssignReachableFallback(PlayerControl bot, BotRuntimeState state, string failedTarget, string failedReason, BotActionKind failedKind)
@@ -1228,6 +1892,456 @@ internal sealed class BotActionDirector
             null);
     }
 
+    private MiraDeconHandling TryOperateMiraDecontamination(
+        PlayerControl bot,
+        BotRuntimeState state,
+        Vector2 position,
+        out Vector2 movementTarget)
+    {
+        movementTarget = position;
+        if (!GameRuleSettings.IsMiraHqMap() || !ShipStatus.Instance || !state.HasActiveRoute)
+        {
+            return MiraDeconHandling.None;
+        }
+
+        RefreshMiraDeconSystems();
+        DeconSystem? selected = null;
+        var selectedDistance = float.MaxValue;
+        var selectedInside = false;
+        for (var index = 0; index < _miraDeconSystems.Length; index++)
+        {
+            var system = _miraDeconSystems[index];
+            if (!system || !system.RoomArea)
+            {
+                continue;
+            }
+
+            var inside = system.RoomArea.OverlapPoint(position);
+            var roomBoundaryDistance = inside
+                ? 0f
+                : Vector2.Distance(position, system.RoomArea.ClosestPoint(position));
+            var closestControlDistance = _miraDeconControls
+                .Where(control => control && control.System && control.System == system)
+                .Select(control => Vector2.Distance(position, control.transform.position))
+                .DefaultIfEmpty(float.MaxValue)
+                .Min();
+            var distance = SelectMiraDeconActivationDistance(
+                roomBoundaryDistance,
+                closestControlDistance);
+            if (distance > MiraDeconActivationDistance || distance >= selectedDistance)
+            {
+                continue;
+            }
+
+            selected = system;
+            selectedDistance = distance;
+            selectedInside = inside;
+        }
+
+        if (!selected)
+        {
+            ResetMiraDeconTransit(state);
+            return MiraDeconHandling.None;
+        }
+
+        var selectedSystem = selected!;
+        var roomArea = selectedSystem.RoomArea;
+        if (!roomArea)
+        {
+            return MiraDeconHandling.None;
+        }
+
+        var roomCenter = (Vector2)roomArea.bounds.center;
+        var routeTarget = state.CurrentTargetPosition ?? state.RouteEndpoint ?? state.Route[^1].Position;
+        var currentSide = position.y - roomCenter.y;
+        var targetSide = routeTarget.y - roomCenter.y;
+        const float sideTolerance = 0.4f;
+        var headingUp = targetSide > sideTolerance;
+        var wantsPassage = selectedInside ||
+            (currentSide < -sideTolerance && targetSide > sideTolerance) ||
+            (currentSide > sideTolerance && targetSide < -sideTolerance);
+        if (!wantsPassage)
+        {
+            if (state.MiraDeconCommandIssued &&
+                state.MiraDeconCycleObserved &&
+                selectedSystem.CurState == DeconSystem.States.Idle)
+            {
+                _log.LogInfo(
+                    $"DeepBot MIRA decontamination cycle completed: bot={bot.Data?.PlayerName}, " +
+                    $"headingUp={state.MiraDeconHeadingUp}, inside={selectedInside}, position={position}; navigation resumed.");
+            }
+            ResetMiraDeconTransit(state);
+            return MiraDeconHandling.None;
+        }
+
+        var selectedSystemId = (int)selectedSystem.TargetSystem;
+        if (state.MiraDeconSystemId != selectedSystemId)
+        {
+            ResetMiraDeconTransit(state);
+            state.MiraDeconSystemId = selectedSystemId;
+            state.MiraDeconHeadingUp = headingUp;
+        }
+
+        var transitActive = selectedInside || selectedSystem.CurState != DeconSystem.States.Idle || selectedDistance <= 1.25f;
+        if (!transitActive)
+        {
+            return MiraDeconHandling.None;
+        }
+
+        var nativeState = selectedSystem.CurState;
+        var nativeHandling = ClassifyMiraDeconState(nativeState);
+        var nativeHeadingUp = HasMiraDeconFlag(nativeState, DeconSystem.States.HeadingUp);
+        var effectiveHeadingUp = nativeHandling == MiraDeconHandling.None
+            ? headingUp
+            : nativeHeadingUp;
+        if (nativeHandling != MiraDeconHandling.None)
+        {
+            state.MiraDeconCycleObserved = true;
+            state.MiraDeconHeadingUp = effectiveHeadingUp;
+
+            // Enter means the entrance door is open: walk into the chamber.
+            // Closed is the actual spray/wait period. Exit means the opposite
+            // door is open: walk out. Treating every non-idle state as a stop
+            // prevented bots from ever crossing either open door.
+            if (nativeHandling == MiraDeconHandling.Hold)
+            {
+                return MiraDeconHandling.Hold;
+            }
+
+            var entrySide = effectiveHeadingUp ? -1f : 1f;
+            var isAtEntrySide = selectedInside || Mathf.Sign(currentSide) == Mathf.Sign(entrySide);
+            if (HasMiraDeconFlag(nativeState, DeconSystem.States.Enter))
+            {
+                if (!isAtEntrySide)
+                {
+                    return MiraDeconHandling.Hold;
+                }
+
+                var livingPlayersInside = PlayerControl.AllPlayerControls
+                    .ToArray()
+                    .Count(player =>
+                        player &&
+                        player.PlayerId != bot.PlayerId &&
+                        player.Data is not null &&
+                        !player.Data.IsDead &&
+                        !player.Data.Disconnected &&
+                        roomArea.OverlapPoint(player.GetTruePosition()));
+                if (BotBehaviorPolicy.ShouldWaitForMiraDeconCapacity(
+                        selectedInside,
+                        livingPlayersInside,
+                        2))
+                {
+                    if (Time.time >= state.NextMiraDeconProximityLogAt)
+                    {
+                        state.NextMiraDeconProximityLogAt = Time.time + 1.5f;
+                        _log.LogInfo(
+                            $"DeepBot waiting outside MIRA decontamination capacity: bot={bot.Data?.PlayerName}, " +
+                            $"inside={livingPlayersInside}/2, headingUp={effectiveHeadingUp}, position={position}.");
+                    }
+
+                    return MiraDeconHandling.Hold;
+                }
+
+                movementTarget = roomCenter;
+                return MiraDeconHandling.Move;
+            }
+
+            if (HasMiraDeconFlag(nativeState, DeconSystem.States.Exit))
+            {
+                if (!selectedInside)
+                {
+                    // A bot that missed the entry window must not push into the
+                    // now-closed entrance while somebody else exits.
+                    return MiraDeconHandling.Hold;
+                }
+
+                movementTarget = GetMiraDeconExitPosition(selectedSystem, effectiveHeadingUp, roomCenter);
+                return MiraDeconHandling.Move;
+            }
+
+            return MiraDeconHandling.Hold;
+        }
+
+        var buttonPosition = GetMiraDeconButtonPosition(
+            selectedSystem,
+            selectedInside,
+            headingUp,
+            position,
+            roomCenter,
+            out var buttonUseDistance,
+            out var buttonSource);
+        var buttonDistance = Vector2.Distance(position, buttonPosition);
+
+        if (state.MiraDeconCommandIssued)
+        {
+            if (state.MiraDeconCycleObserved)
+            {
+                state.MiraDeconCycleObserved = false;
+                state.MiraDeconCommandIssued = false;
+                state.MiraDeconCommandIssuedAt = 0f;
+                state.NextMiraDeconUseAt = Time.time + 0.15f;
+                _log.LogInfo(
+                    $"DeepBot MIRA decontamination cycle completed: bot={bot.Data?.PlayerName}, " +
+                    $"headingUp={state.MiraDeconHeadingUp}, inside={selectedInside}, position={position}; navigation resumed.");
+            }
+            else if (Time.time - state.MiraDeconCommandIssuedAt < 0.9f)
+            {
+                // UpdateSystem normally changes CurState immediately. Give the
+                // native RPC one short grace window; if no cycle starts, retry
+                // the same physical button.
+                return MiraDeconHandling.Hold;
+            }
+            else
+            {
+                state.MiraDeconCommandIssued = false;
+                state.MiraDeconCommandIssuedAt = 0f;
+                state.NextMiraDeconUseAt = Time.time + 0.5f;
+                _log.LogWarning(
+                    $"DeepBot MIRA decontamination button produced no native cycle: bot={bot.Data?.PlayerName}, " +
+                    $"headingUp={headingUp}, inside={selectedInside}, button={buttonPosition}, " +
+                    $"buttonSource={buttonSource}; retrying in 0.5s.");
+                return MiraDeconHandling.Hold;
+            }
+        }
+
+        if (buttonDistance > buttonUseDistance)
+        {
+            if (Time.time >= state.NextMiraDeconProximityLogAt)
+            {
+                state.NextMiraDeconProximityLogAt = Time.time + 1.5f;
+                _log.LogInfo(
+                    $"DeepBot approaching MIRA decontamination button: bot={bot.Data?.PlayerName}, " +
+                    $"headingUp={headingUp}, inside={selectedInside}, distance={buttonDistance:0.00}, " +
+                    $"required={buttonUseDistance:0.00}, button={buttonPosition}, buttonSource={buttonSource}.");
+            }
+
+            movementTarget = buttonPosition;
+            return MiraDeconHandling.Move;
+        }
+
+        if (
+            Time.time < state.NextMiraDeconUseAt ||
+            Time.time < _nextMiraDeconCommandAt)
+        {
+            return MiraDeconHandling.Hold;
+        }
+        var command = selectedInside
+            ? headingUp ? DeconSystem.HeadUpInsideCmd : DeconSystem.HeadDownInsideCmd
+            : headingUp ? DeconSystem.HeadUpCmd : DeconSystem.HeadDownCmd;
+
+        try
+        {
+            ShipStatus.Instance.UpdateSystem(selectedSystem.TargetSystem, bot, command);
+            state.MiraDeconCommandIssued = true;
+            state.MiraDeconCommandIssuedAt = Time.time;
+            state.MiraDeconCycleObserved = selectedSystem.CurState != DeconSystem.States.Idle;
+            state.MiraDeconHeadingUp = headingUp;
+            state.NextMiraDeconUseAt = float.MaxValue;
+            _nextMiraDeconCommandAt = Time.time + 0.35f;
+            _memory.RecordAction(
+                bot,
+                "decontamination",
+                $"pressed MIRA decon {(headingUp ? "up" : "down")} button; inside={selectedInside}; system={selectedSystem.TargetSystem}");
+            _log.LogInfo(
+                $"DeepBot MIRA decontamination physical button pressed: bot={bot.Data?.PlayerName}, system={selectedSystem.TargetSystem}, " +
+                $"command={command}, headingUp={headingUp}, inside={selectedInside}, distance={selectedDistance:0.00}, " +
+                $"buttonDistance={buttonDistance:0.00}, button={buttonPosition}, buttonSource={buttonSource}, " +
+                $"state={selectedSystem.CurState}, target={routeTarget}.");
+        }
+        catch (Exception ex)
+        {
+            state.NextMiraDeconUseAt = Time.time + 1.5f;
+            _log.LogWarning(
+                $"DeepBot MIRA decontamination command failed: bot={bot.Data?.PlayerName}, " +
+                $"system={selectedSystem.TargetSystem}, error={ex.Message}");
+        }
+
+        return MiraDeconHandling.Hold;
+    }
+
+    private Vector2 GetMiraDeconButtonPosition(
+        DeconSystem system,
+        bool inside,
+        bool headingUp,
+        Vector2 fallbackPosition,
+        Vector2 roomCenter,
+        out float useDistance,
+        out string source)
+    {
+        var desiredSide = inside
+            ? headingUp ? 1f : -1f
+            : headingUp ? -1f : 1f;
+        var controls = _miraDeconControls
+            .Where(control => control && control.System && control.System == system)
+            .Where(control =>
+            {
+                var side = control.transform.position.y - roomCenter.y;
+                return Mathf.Abs(side) <= 0.15f || Mathf.Sign(side) == Mathf.Sign(desiredSide);
+            })
+            .OrderBy(control => Vector2.Distance(fallbackPosition, control.transform.position))
+            .ToArray();
+        if (controls.Length > 0)
+        {
+            var control = controls[0];
+            useDistance = Mathf.Clamp(control.UsableDistance, 0.55f, 0.90f);
+            source = $"DeconControl:{control.name}";
+            return control.transform.position;
+        }
+
+        // From outside, an upward trip starts at the lower door and a downward
+        // trip at the upper door. From inside, the corresponding exit button is
+        // on the chamber side of the destination door. Both are slightly offset
+        // from the moving door leaf so the bot stands at the usable panel side.
+        var door = inside
+            ? headingUp ? system.UpperDoor : system.LowerDoor
+            : headingUp ? system.LowerDoor : system.UpperDoor;
+        if (!door)
+        {
+            useDistance = 0.72f;
+            source = "RoomArea-fallback";
+            return system.RoomArea
+                ? (Vector2)system.RoomArea.ClosestPoint(fallbackPosition)
+                : fallbackPosition;
+        }
+
+        var chamberSideOffset = headingUp ? -0.42f : 0.42f;
+        useDistance = 0.72f;
+        source = "door-offset-fallback";
+        return (Vector2)door.transform.position + Vector2.up * chamberSideOffset;
+    }
+
+    private static Vector2 GetMiraDeconExitPosition(
+        DeconSystem system,
+        bool headingUp,
+        Vector2 roomCenter)
+    {
+        var door = headingUp ? system.UpperDoor : system.LowerDoor;
+        var direction = headingUp ? Vector2.up : Vector2.down;
+        return door
+            ? (Vector2)door.transform.position + direction * 0.95f
+            : roomCenter + direction * 2.4f;
+    }
+
+    internal static void LogMiraDeconRecoverySelfTest(ManualLogSource log)
+    {
+        var idleUsesNormalNavigation = ClassifyMiraDeconState(DeconSystem.States.Idle) == MiraDeconHandling.None;
+        var enterMoves = ClassifyMiraDeconState(DeconSystem.States.Enter | DeconSystem.States.HeadingUp) == MiraDeconHandling.Move;
+        var closedWaits = ClassifyMiraDeconState(DeconSystem.States.Closed | DeconSystem.States.HeadingUp) == MiraDeconHandling.Hold;
+        var exitMoves = ClassifyMiraDeconState(DeconSystem.States.Exit | DeconSystem.States.HeadingUp) == MiraDeconHandling.Move;
+        var capacityWaits =
+            BotBehaviorPolicy.ShouldWaitForMiraDeconCapacity(false, 2, 2) &&
+            !BotBehaviorPolicy.ShouldWaitForMiraDeconCapacity(true, 2, 2);
+        var controlDistanceActivates =
+            Mathf.Approximately(SelectMiraDeconActivationDistance(2.3f, 0.4f), 0.4f) &&
+            Mathf.Approximately(SelectMiraDeconActivationDistance(0.6f, 1.5f), 0.6f);
+        var level = idleUsesNormalNavigation && enterMoves && closedWaits && exitMoves &&
+                    capacityWaits && controlDistanceActivates
+            ? "ok"
+            : "error";
+        log.LogInfo(
+            $"DeepBot MIRA decontamination recovery self-test: level={level}, " +
+            $"idleUsesNormalNavigation={idleUsesNormalNavigation}, enterMoves={enterMoves}, " +
+            $"closedWaits={closedWaits}, exitMoves={exitMoves}, capacityWaits={capacityWaits}, " +
+            $"controlDistanceActivates={controlDistanceActivates}.");
+    }
+
+    internal static void LogPostMeetingMovementRecoverySelfTest(ManualLogSource log)
+    {
+        var normalUnlock = ShouldReleaseVirtualPostMeetingLock(true, false, false, false);
+        var deadProtected = !ShouldReleaseVirtualPostMeetingLock(false, false, false, false);
+        var ventProtected = !ShouldReleaseVirtualPostMeetingLock(true, true, false, false) &&
+                            !ShouldReleaseVirtualPostMeetingLock(true, false, true, false);
+        var ruleLockProtected = !ShouldReleaseVirtualPostMeetingLock(true, false, false, true);
+        var level = normalUnlock && deadProtected && ventProtected && ruleLockProtected ? "ok" : "error";
+        log.LogInfo(
+            $"DeepBot post-meeting movement recovery self-test: level={level}, " +
+            $"normalUnlock={normalUnlock}, deadProtected={deadProtected}, " +
+            $"ventProtected={ventProtected}, ruleLockProtected={ruleLockProtected}.");
+    }
+
+    internal static void LogMurderPlanningSelfTest(ManualLogSource log)
+    {
+        var stationaryPreferred = ScoreMurderMovementOpportunity(0f, 2.5f) >
+                                  ScoreMurderMovementOpportunity(2.5f, 2.5f);
+        var hiddenMotionNeutral = Mathf.Approximately(
+            ScoreMurderMovementOpportunity(-1f, 2.5f),
+            0f);
+        var level = stationaryPreferred && hiddenMotionNeutral ? "ok" : "error";
+        log.LogInfo(
+            $"DeepBot ordinary killer planning self-test: level={level}, " +
+            $"stationaryTargetPreferred={stationaryPreferred}, hiddenMotionNeutral={hiddenMotionNeutral}.");
+    }
+
+    private static float SelectMiraDeconActivationDistance(
+        float roomBoundaryDistance,
+        float closestControlDistance)
+    {
+        return Mathf.Min(
+            Mathf.Max(0f, roomBoundaryDistance),
+            Mathf.Max(0f, closestControlDistance));
+    }
+
+    private static MiraDeconHandling ClassifyMiraDeconState(DeconSystem.States state)
+    {
+        if (state == DeconSystem.States.Idle)
+        {
+            return MiraDeconHandling.None;
+        }
+
+        if (HasMiraDeconFlag(state, DeconSystem.States.Closed))
+        {
+            return MiraDeconHandling.Hold;
+        }
+
+        return HasMiraDeconFlag(state, DeconSystem.States.Enter) ||
+               HasMiraDeconFlag(state, DeconSystem.States.Exit)
+            ? MiraDeconHandling.Move
+            : MiraDeconHandling.Hold;
+    }
+
+    private static bool HasMiraDeconFlag(DeconSystem.States state, DeconSystem.States flag)
+    {
+        return (state & flag) != 0;
+    }
+
+    private static void ResetMiraDeconTransit(BotRuntimeState state)
+    {
+        state.MiraDeconSystemId = -1;
+        state.MiraDeconCommandIssued = false;
+        state.MiraDeconCommandIssuedAt = 0f;
+        state.MiraDeconCycleObserved = false;
+        state.MiraDeconHeadingUp = false;
+        state.NextMiraDeconUseAt = 0f;
+    }
+
+    private void RefreshMiraDeconSystems()
+    {
+        if (!ShipStatus.Instance)
+        {
+            _miraDeconSystems = [];
+            _miraDeconControls = [];
+            _miraDeconShipInstanceId = 0;
+            _nextMiraDeconRefreshAt = 0f;
+            _nextMiraDeconCommandAt = 0f;
+            return;
+        }
+
+        var shipInstanceId = ShipStatus.Instance.GetInstanceID();
+        if (_miraDeconShipInstanceId == shipInstanceId &&
+            (_miraDeconSystems.Length > 0 || Time.time < _nextMiraDeconRefreshAt))
+        {
+            return;
+        }
+
+        _miraDeconShipInstanceId = shipInstanceId;
+        _miraDeconSystems = UnityEngine.Object.FindObjectsOfType<DeconSystem>();
+        _miraDeconControls = UnityEngine.Object.FindObjectsOfType<DeconControl>();
+        _nextMiraDeconRefreshAt = Time.time + (_miraDeconSystems.Length == 0 ? 2f : 30f);
+        _log.LogInfo(
+            $"DeepBot MIRA decontamination cache refreshed: systems={_miraDeconSystems.Length}, " +
+            $"controls={_miraDeconControls.Length}, ship={shipInstanceId}.");
+    }
+
     private void DriveAlongRoute(PlayerControl bot, BotRuntimeState state, float speedMultiplier, float deltaTime)
     {
         if (!bot.MyPhysics || state.Route.Count == 0)
@@ -1238,7 +2352,8 @@ internal sealed class BotActionDirector
         if (state.DwellUntil > 0f)
         {
             Stop(bot.MyPhysics);
-            if (state.ActionKind is not BotActionKind.Emergency)
+            if (state.ActionKind is not BotActionKind.Emergency &&
+                !IsDeadCrewmate(bot, state))
             {
                 if (TryAssignEmergencyRoute(bot, state, "dwell-interrupt"))
                 {
@@ -1255,6 +2370,33 @@ internal sealed class BotActionDirector
         }
 
         var position = bot.GetTruePosition();
+        var deconHandling = TryOperateMiraDecontamination(bot, state, position, out var deconMovementTarget);
+        if (deconHandling != MiraDeconHandling.None)
+        {
+            // A closed decontamination door intentionally prevents physical
+            // progress while its native cycle runs. Do not blacklist that
+            // route cell as a wall or start left/right escape oscillation.
+            state.LastProgressPosition = position;
+            state.LastProgressAt = Time.time;
+            state.LastProgressRouteIndex = state.RouteIndex;
+            state.LastProgressTargetDistance = state.RouteIndex < state.Route.Count
+                ? Vector2.Distance(position, state.Route[state.RouteIndex].Position)
+                : 0f;
+            state.StuckSamples = 0;
+            if (deconHandling == MiraDeconHandling.Hold ||
+                Vector2.Distance(position, deconMovementTarget) <= 0.08f)
+            {
+                Stop(bot.MyPhysics);
+            }
+            else
+            {
+                // Door/chamber traversal is a short, native-state-gated motion.
+                // Drive directly so generic left/right avoidance cannot create
+                // oscillation against a temporarily moving door leaf.
+                DriveDirection(bot, (deconMovementTarget - position).normalized, speedMultiplier);
+            }
+            return;
+        }
         if (state.CurrentTargetPosition.HasValue &&
             Vector2.Distance(position, state.CurrentTargetPosition.Value) <= state.ArrivalDistance)
         {
@@ -1264,6 +2406,11 @@ internal sealed class BotActionDirector
             state.LastProgressPosition = position;
             state.LastProgressAt = Time.time;
             state.StuckEscapeAttempts = 0;
+            return;
+        }
+
+        if (TryHandlePortalShortcut(bot, state, position, speedMultiplier))
+        {
             return;
         }
 
@@ -1383,15 +2530,25 @@ internal sealed class BotActionDirector
                         return;
                     }
 
-                    SkeldPathGraph.Instance.BlockRuntimeEdge(
-                        previous.Id,
-                        target.Id,
-                        _log,
-                        $"stuck displacement={progress:0.00},targetImprovement={targetImprovement:0.00}");
+                    var nearMiraDecon = IsNearMiraDecontamination(position, 2.1f);
+                    if (!nearMiraDecon)
+                    {
+                        SkeldPathGraph.Instance.BlockRuntimeEdge(
+                            previous.Id,
+                            target.Id,
+                            _log,
+                            $"stuck displacement={progress:0.00},targetImprovement={targetImprovement:0.00}");
+                    }
                     _memory.RecordAction(
                         bot,
                         "navigation_replan",
-                        $"stuck on {previous.Id}->{target.Id}; displacement={progress:0.00}; targetImprovement={targetImprovement:0.00}");
+                        $"stuck on {previous.Id}->{target.Id}; displacement={progress:0.00}; " +
+                        $"targetImprovement={targetImprovement:0.00}; nearMiraDecon={nearMiraDecon}");
+                    // Count a blocked-edge failure before replanning.  The old
+                    // ReplanCurrentRoute path cleared this counter, allowing a
+                    // bot to retry the same physically blocked destination
+                    // forever (seen at LIVE_ROOM_STORAGE_12 on The Skeld).
+                    state.StuckEscapeAttempts++;
                     if (state.StuckEscapeAttempts >= MaxStuckEscapeAttemptsPerTarget)
                     {
                         var failedTarget = state.CurrentTargetNode ?? target.Id;
@@ -1408,11 +2565,21 @@ internal sealed class BotActionDirector
                         TryAssignReachableFallback(bot, state, failedTarget, "repeated-stuck", BotActionKind.Llm);
                         return;
                     }
-                    if (TryStartStuckEscape(bot, state, offset.normalized, speedMultiplier, previous.Id, target.Id))
+                    // The blocked grid cell must not remain in the current
+                    // route. The old side-step continued following the same
+                    // compressed edge afterwards, producing a permanent
+                    // three-cell loop at MIRA entrances. Replan immediately
+                    // from the real position after blacklisting the cell.
+                    state.RouteVariant++;
+                    _log.LogWarning(
+                        $"DeepBot replanning after {(nearMiraDecon ? "transient decon obstruction" : "blocked grid cell")}: " +
+                        $"bot={bot.Data?.PlayerName}, pos={position}, edge={previous.Id}({previous.Position})->" +
+                        $"{target.Id}({target.Position}), sharedCellBlocked={!nearMiraDecon}, teleport=false.");
+                    ReplanCurrentRoute(bot, state, nearMiraDecon ? "decon-transient-obstruction" : "blocked-grid-cell");
+                    if (!state.HasActiveRoute)
                     {
-                        return;
+                        TryStartStuckEscape(bot, state, offset.normalized, speedMultiplier, previous.Id, target.Id);
                     }
-                    ReplanCurrentRoute(bot, state, "stuck");
                     return;
                 }
 
@@ -1429,6 +2596,130 @@ internal sealed class BotActionDirector
             bot,
             ComputeSteeredDirection(bot, state, offset.normalized, offset.magnitude),
             speedMultiplier);
+    }
+
+    private bool TryHandlePortalShortcut(
+        PlayerControl bot,
+        BotRuntimeState state,
+        Vector2 position,
+        float speedMultiplier)
+    {
+        if (!state.PortalShortcutOption.HasValue)
+        {
+            return false;
+        }
+
+        var option = state.PortalShortcutOption.Value;
+        if (TorRoleAdapter.IsPortalTeleportPending(bot))
+        {
+            Stop(bot.MyPhysics);
+            state.LastProgressPosition = position;
+            state.LastProgressAt = Time.time;
+            state.StuckSamples = 0;
+            state.StuckEscapeAttempts = 0;
+            return true;
+        }
+
+        if (state.PortalShortcutStarted)
+        {
+            var continuation = state.PortalContinuationRoute.ToList();
+            state.ClearPortalShortcut();
+            if (continuation.Count == 0)
+            {
+                ReplanCurrentRoute(bot, state, "portal-continuation-missing");
+                return true;
+            }
+
+            state.Route = continuation;
+            state.RouteIndex = Math.Min(1, continuation.Count - 1);
+            state.RouteEndpoint = continuation[^1].Position;
+            state.LastProgressPosition = position;
+            state.LastProgressAt = Time.time;
+            state.LastProgressRouteIndex = state.RouteIndex;
+            state.LastProgressTargetDistance = Vector2.Distance(position, continuation[state.RouteIndex].Position);
+            state.LastSafeNodeId = continuation[0].Id;
+            state.StuckSamples = 0;
+            state.StuckEscapeAttempts = 0;
+            _memory.RecordAction(bot, "portal_travel", $"emerged at {position}; resumed route to {state.CurrentTargetNode}");
+            _log.LogInfo(
+                $"DeepBot portal continuation armed: bot={bot.Data?.PlayerName}, target={state.CurrentTargetNode}, " +
+                $"nodes={continuation.Count}, exit={position}.");
+            return false;
+        }
+
+        var distanceToEntry = option.Remote ? 0f : Vector2.Distance(position, option.Entry);
+        if (distanceToEntry <= 0.32f)
+        {
+            if (TorRoleAdapter.TryBeginPortalTeleport(bot, option, out var outcome))
+            {
+                state.PortalShortcutStarted = true;
+                state.PortalWaitStartedAt = 0f;
+                Stop(bot.MyPhysics);
+                _memory.RecordAction(bot, "portal_travel", $"started portal shortcut to {option.Exit}; {outcome}");
+                return true;
+            }
+
+            state.PortalWaitStartedAt = state.PortalWaitStartedAt <= 0f ? Time.time : state.PortalWaitStartedAt;
+            if (Time.time - state.PortalWaitStartedAt >= 2.5f)
+            {
+                _log.LogInfo(
+                    $"DeepBot portal wait abandoned: bot={bot.Data?.PlayerName}, target={state.CurrentTargetNode}, " +
+                    $"reason={outcome}.");
+                state.ClearPortalShortcut();
+                ReplanCurrentRoute(bot, state, $"portal-unavailable:{outcome}");
+            }
+            else
+            {
+                Stop(bot.MyPhysics);
+            }
+            return true;
+        }
+
+        if (state.RouteIndex < state.Route.Count)
+        {
+            return false;
+        }
+
+        var directOffset = option.Entry - position;
+        if (directOffset.magnitude <= 0.85f &&
+            RuntimeSkeldGrid.IsNavigationSegmentClear(position, option.Entry, 0.14f))
+        {
+            DriveDirection(bot, directOffset.normalized, speedMultiplier);
+            return true;
+        }
+
+        _log.LogInfo(
+            $"DeepBot portal endpoint was not physically reachable: bot={bot.Data?.PlayerName}, " +
+            $"entry={option.Entry}, distance={directOffset.magnitude:0.00}; replanning without this shortcut.");
+        state.ClearPortalShortcut();
+        ReplanCurrentRoute(bot, state, "portal-entry-unreachable");
+        return true;
+    }
+
+    private bool IsNearMiraDecontamination(Vector2 position, float maximumDistance)
+    {
+        if (!GameRuleSettings.IsMiraHqMap())
+        {
+            return false;
+        }
+
+        RefreshMiraDeconSystems();
+        for (var index = 0; index < _miraDeconSystems.Length; index++)
+        {
+            var system = _miraDeconSystems[index];
+            if (!system || !system.RoomArea)
+            {
+                continue;
+            }
+
+            if (system.RoomArea.OverlapPoint(position) ||
+                Vector2.Distance(position, system.RoomArea.ClosestPoint(position)) <= maximumDistance)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void DriveDirectGhostTaskRoute(
@@ -1766,6 +3057,17 @@ internal sealed class BotActionDirector
         var furthest = Math.Min(state.Route.Count - 1, state.RouteIndex + RouteLookAheadNodes);
         for (var index = furthest; index > state.RouteIndex; index--)
         {
+            // Route look-ahead is evaluated every rendered frame. Without a
+            // physical distance cap, four clear nodes can be skipped again on
+            // the next frame and the cursor eventually advances to a remote
+            // node while the bot is still near the route start. The stuck
+            // detector then blacklists an unrelated far-away edge and runs A*
+            // repeatedly. Keep look-ahead local to the bot's actual position.
+            if (Vector2.Distance(position, state.Route[index].Position) > RouteLookAheadDistance)
+            {
+                continue;
+            }
+
             if (!RuntimeSkeldGrid.IsNavigationSegmentClear(
                     position,
                     state.Route[index].Position,
@@ -1805,10 +3107,14 @@ internal sealed class BotActionDirector
             ? EmergencyAvoidanceLookAhead
             : LocalAvoidanceLookAhead;
         var lookAhead = Mathf.Clamp(distanceToTarget, 0.38f, lookAheadLimit);
-        var separation = emergency || (bot.Data is not null && bot.Data.IsDead)
+        var separation = bot.Data is not null && bot.Data.IsDead
             ? Vector2.zero
             : ComputePlayerSeparation(bot);
-        var blended = (desired.normalized + separation * 0.22f).normalized;
+        // Emergencies keep the target direction dominant, but a small
+        // deterministic separation term prevents every responder from
+        // physically stacking at MIRA's single Launchpad exit.
+        var separationWeight = emergency ? 0.08f : 0.22f;
+        var blended = (desired.normalized + separation * separationWeight).normalized;
 
         if (Time.time < state.AvoidanceUntil &&
             state.AvoidanceDirection.sqrMagnitude > 0.001f &&
@@ -1852,11 +3158,16 @@ internal sealed class BotActionDirector
             }
         }
 
-        var fallback = Rotate(blended, 90f * side);
-        state.AvoidanceDirection = fallback;
-        state.AvoidanceUntil = Time.time +
-            (emergency ? EmergencyAvoidanceCommitSeconds : AvoidanceCommitSeconds);
-        return fallback;
+        // Every tested steering direction is physically blocked.  The old
+        // fallback returned an unvalidated 90-degree direction anyway.  Near
+        // outer hull walls and narrow room corners that command could push a
+        // living bot through the collider before the stuck sampler ran,
+        // leaving it visually outside the map.  Hold position here so the
+        // existing stuck/replan path can blacklist the bad edge and choose a
+        // genuinely clear route.
+        state.AvoidanceDirection = Vector2.zero;
+        state.AvoidanceUntil = 0f;
+        return Vector2.zero;
     }
 
     private bool TryStartStuckEscape(
@@ -1920,7 +3231,8 @@ internal sealed class BotActionDirector
                 player.PlayerId == bot.PlayerId ||
                 player.Data is null ||
                 player.Data.IsDead ||
-                player.Data.Disconnected)
+                player.Data.Disconnected ||
+                BotPerceptionPolicy.IsConcealedByVent(player))
             {
                 continue;
             }
@@ -1967,6 +3279,10 @@ internal sealed class BotActionDirector
 
     private void ReplanCurrentRoute(PlayerControl bot, BotRuntimeState state, string reason)
     {
+        var preserveBlockedAttempts =
+            string.Equals(reason, "blocked-grid-cell", StringComparison.Ordinal) ||
+            string.Equals(reason, "decon-transient-obstruction", StringComparison.Ordinal);
+        var blockedAttempts = preserveBlockedAttempts ? state.StuckEscapeAttempts : 0;
         var targetLabel = state.CurrentTargetNode;
         var targetPosition = state.CurrentTargetPosition;
         var arrivalDistance = state.ArrivalDistance;
@@ -1981,6 +3297,10 @@ internal sealed class BotActionDirector
         }
 
         AssignRoute(bot, state, targetPosition.Value, targetLabel, $"replan:{reason}", dwell, dwell, kind, taskId, targetPlayerId, arrivalDistance);
+        if (preserveBlockedAttempts && state.HasActiveRoute)
+        {
+            state.StuckEscapeAttempts = blockedAttempts;
+        }
     }
 
     private static Vector2 FindClosestPointOnRoute(Vector2 position, IReadOnlyList<NavNode> route, out int segmentIndex, out float distance)
@@ -2058,18 +3378,19 @@ internal sealed class BotActionDirector
     private string BuildVisiblePlayers(PlayerControl observer, BotRuntimeState state)
     {
         var visible = new List<string>();
-        var vision = GetVisionDistance(observer);
         var observerPosition = observer.GetTruePosition();
         foreach (var player in PlayerControl.AllPlayerControls)
         {
-            if (!player || player.PlayerId == observer.PlayerId || player.Data is null || player.Data.IsDead)
+            if (!player ||
+                player.PlayerId == observer.PlayerId ||
+                !BotPerceptionPolicy.CanBeOrdinarilyObserved(player))
             {
                 continue;
             }
 
             var targetPosition = player.GetTruePosition();
             var distance = Vector2.Distance(observerPosition, targetPosition);
-            if (distance <= vision && !PhysicsHelpers.AnythingBetween(observerPosition, targetPosition, Constants.ShipAndObjectsMask, false))
+            if (CanObservePlayer(observer, player))
             {
                 visible.Add($"{player.Data.PlayerName}({player.PlayerId}) dist={distance:0.0}");
                 state.LastSeenPlayers[player.PlayerId] = new PlayerLastSeen(player.Data.PlayerName, targetPosition, Time.time);
@@ -2123,9 +3444,7 @@ internal sealed class BotActionDirector
 
     private static float GetVisionDistance(PlayerControl observer)
     {
-        return IsImpostor(observer)
-            ? GameRuleSettings.GetImpostorVision(1.5f) * 5f
-            : GameRuleSettings.GetCrewVision(1f) * 5f;
+        return BotPerceptionPolicy.GetCurrentVisionDistance(observer);
     }
 
     private static string BuildTaskSummary(PlayerControl bot)
@@ -2286,7 +3605,7 @@ internal sealed class BotActionDirector
         for (var i = 0; i < points.Count; i++)
         {
             var candidate = points[i];
-            if (!IsPlausibleSkeldTaskPoint(candidate))
+            if (!IsPlausibleMapTaskPoint(candidate))
             {
                 continue;
             }
@@ -2361,13 +3680,11 @@ internal sealed class BotActionDirector
         }
     }
 
-    private static bool IsPlausibleSkeldTaskPoint(Vector2 point)
+    private static bool IsPlausibleMapTaskPoint(Vector2 point)
     {
         // Console locations come from the live task, which is more authoritative
-        // than the hand-authored landmark graph. Current Skeld coordinates moved
-        // far enough that valid Reactor, Navigation and Communications consoles
-        // can be several metres from their legacy landmarks. Runtime routing
-        // below still proves physical reachability.
+        // than the hand-authored semantic landmarks. Runtime routing below
+        // still proves physical reachability on the active supported map.
         return float.IsFinite(point.x) &&
                float.IsFinite(point.y) &&
                RuntimeSkeldGrid.ContainsSupportedPoint(point);
@@ -2465,9 +3782,23 @@ internal sealed class BotActionDirector
         if (!state.EmergencyResponder ||
             !state.EmergencyConsoleId.HasValue ||
             !state.EmergencyConsolePosition.HasValue ||
-            state.EmergencyInteractionActive ||
             Time.time - state.EmergencyLastPanelSwitchAt < 1.25f ||
-            task.TaskType is not (TaskTypes.ResetReactor or TaskTypes.ResetSeismic or TaskTypes.RestoreOxy))
+            task.TaskType is not (TaskTypes.ResetReactor or TaskTypes.ResetSeismic or TaskTypes.RestoreOxy or TaskTypes.FixComms))
+        {
+            return;
+        }
+
+        var selectedConsoleId = state.EmergencyConsoleId.Value;
+        var selectedComplete = IsEmergencyConsoleComplete(task.TaskType, selectedConsoleId);
+
+        // A reactor responder must keep holding its side until the other side
+        // is held as well. O2 and MIRA HQ communications are different: once
+        // this bot has completed its keypad/panel, it may physically travel to
+        // the still-unfinished side. The previous blanket interaction guard
+        // left a MIRA responder repeatedly operating an already-complete comms
+        // panel and never allowed the second panel to be selected.
+        if (state.EmergencyInteractionActive &&
+            (task.TaskType is TaskTypes.ResetReactor or TaskTypes.ResetSeismic || !selectedComplete))
         {
             return;
         }
@@ -2475,13 +3806,13 @@ internal sealed class BotActionDirector
         // The player already operating a panel must keep holding it. Only a
         // newcomer reroutes after personally seeing that its chosen side is
         // occupied, or after the shared sabotage state marks that side done.
-        if (Vector2.Distance(bot.GetTruePosition(), state.EmergencyConsolePosition.Value) <=
+        if (!selectedComplete &&
+            Vector2.Distance(bot.GetTruePosition(), state.EmergencyConsolePosition.Value) <=
             state.EmergencyUseDistance + 0.2f)
         {
             return;
         }
 
-        var selectedConsoleId = state.EmergencyConsoleId.Value;
         var selectedPosition = state.EmergencyConsolePosition.Value;
         var visibleOccupant = PlayerControl.AllPlayerControls
             .ToArray()
@@ -2493,7 +3824,6 @@ internal sealed class BotActionDirector
                 !player.Data.Disconnected &&
                 CanObservePlayer(bot, player) &&
                 Vector2.Distance(player.GetTruePosition(), selectedPosition) <= 1.35f);
-        var selectedComplete = IsEmergencyConsoleComplete(task.TaskType, selectedConsoleId);
         if (!visibleOccupant && !selectedComplete)
         {
             return;
@@ -2568,6 +3898,12 @@ internal sealed class BotActionDirector
             return oxygen is not null && oxygen.GetConsoleComplete(consoleId);
         }
 
+        if (taskType == TaskTypes.FixComms)
+        {
+            var hqComms = rawSystem.TryCast<HqHudSystemType>();
+            return hqComms is not null && hqComms.IsConsoleOkay(consoleId);
+        }
+
         return false;
     }
 
@@ -2620,10 +3956,8 @@ internal sealed class BotActionDirector
             return;
         }
 
-        var critical = task.TaskType is
-            TaskTypes.ResetReactor or
-            TaskTypes.ResetSeismic or
-            TaskTypes.RestoreOxy;
+        var requiredResponders = GetRequiredEmergencyResponders(task.TaskType);
+        var critical = IsCriticalEmergency(task.TaskType) || requiredResponders > 1;
         var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
         var visibleLikelyResponders = CountVisibleLikelyEmergencyResponders(bot, consoles);
         var unresolvedSeconds = Time.time - state.EmergencyObservedAt;
@@ -2658,6 +3992,11 @@ internal sealed class BotActionDirector
             return;
         }
 
+        var preferredConsoleIndex = BotBehaviorPolicy.SelectDistributedIndex(
+            bot.PlayerId,
+            (int)task.TaskType,
+            consoles.Count);
+        var preferredConsoleId = consoles[preferredConsoleIndex].ConsoleId;
         var routableConsoles = consoles
             .Where(console => !IsEmergencyConsoleComplete(task.TaskType, console.ConsoleId))
             .Where(console => SkeldPathGraph.Instance.FindTopRoutes(
@@ -2667,12 +4006,20 @@ internal sealed class BotActionDirector
             .Select(console => new
             {
                 Console = console,
+                VisiblePlayers = CountVisiblePlayersNearEmergencyConsole(bot, console.Position),
+                PreferenceRank = console.ConsoleId == preferredConsoleId ? 0 : 1,
                 Score =
                     Vector2.Distance(bot.GetTruePosition(), console.Position) +
                     CountVisiblePlayersNearEmergencyConsole(bot, console.Position) * 2.6f +
                     ((bot.PlayerId + console.ConsoleId + state.EmergencyDecisionEpoch) % 3) * 0.28f
             })
-            .OrderBy(item => item.Score)
+            // Bots do not read another bot's private target. Sequential player
+            // ids independently produce an even stable side preference. A
+            // personally visible occupant overrides that preference, while
+            // distance only breaks ties after those two local observations.
+            .OrderBy(item => item.VisiblePlayers > 0 ? 1 : 0)
+            .ThenBy(item => item.PreferenceRank)
+            .ThenBy(item => item.Score)
             .ThenBy(item => item.Console.ConsoleId)
             .ToArray();
         if (routableConsoles.Length == 0)
@@ -2693,12 +4040,12 @@ internal sealed class BotActionDirector
         _memory.RecordAction(
             bot,
             "emergency_inference",
-            $"independently chose {task.TaskType} console={selected.ConsoleId}; visibleLikelyResponders={visibleLikelyResponders}");
+            $"independently chose {task.TaskType} console={selected.ConsoleId}; preferredConsole={preferredConsoleId}; visibleLikelyResponders={visibleLikelyResponders}");
         _log.LogInfo(
             $"DeepBot personal emergency choice: bot={bot.Data?.PlayerName}, task={task.TaskType}, " +
             $"respond=true, impostor={IsImpostor(bot)}, visibleLikelyResponders={visibleLikelyResponders}, " +
-            $"console={selected.ConsoleId}, position={selected.Position}, useDistance={selected.UseDistance:0.00}, " +
-            $"unresolved={unresolvedSeconds:0.0}s, roll={roll:0.00}.");
+            $"console={selected.ConsoleId}, preferredConsole={preferredConsoleId}, position={selected.Position}, useDistance={selected.UseDistance:0.00}, " +
+            $"requiredResponders={requiredResponders}, unresolved={unresolvedSeconds:0.0}s, roll={roll:0.00}.");
     }
 
     private static int CountVisibleLikelyEmergencyResponders(
@@ -2746,47 +4093,68 @@ internal sealed class BotActionDirector
         return (hash & 1023) / 1023f;
     }
 
-    private static List<EmergencyConsoleTarget> FindEmergencyConsoles(PlayerTask task)
+    private List<EmergencyConsoleTarget> FindEmergencyConsoles(PlayerTask task)
     {
         var result = new List<EmergencyConsoleTarget>();
         var seenConsoleIds = new HashSet<int>();
+        var error = string.Empty;
         try
         {
             var consoles = task.FindConsoles();
-            if (consoles is null)
+            if (consoles is not null)
             {
-                return result;
-            }
-
-            for (var index = 0; index < consoles.Count; index++)
-            {
-                var console = consoles[index];
-                if (!console || !task.ValidConsole(console) || !seenConsoleIds.Add(console.ConsoleId))
+                for (var index = 0; index < consoles.Count; index++)
                 {
-                    continue;
-                }
+                    var console = consoles[index];
+                    if (!console || !task.ValidConsole(console) || !seenConsoleIds.Add(console.ConsoleId))
+                    {
+                        continue;
+                    }
 
-                result.Add(new EmergencyConsoleTarget(
-                    console.ConsoleId,
-                    console.transform.position,
-                    Mathf.Clamp(console.UsableDistance, 0.7f, 1.35f)));
+                    result.Add(new EmergencyConsoleTarget(
+                        console.ConsoleId,
+                        console.transform.position,
+                        Mathf.Clamp(console.UsableDistance, 0.7f, 1.35f)));
+                }
             }
         }
-        catch
+        catch (Exception ex)
         {
             // The caller logs a physical-panel shortage and deliberately does not
             // fall back to remotely completing the sabotage.
+            error = ex.GetBaseException().Message;
         }
 
-        return result
+        var ordered = result
             .OrderBy(console => console.ConsoleId)
             .ThenBy(console => console.Position.x)
             .ThenBy(console => console.Position.y)
             .ToList();
+        var panels = ordered.Count == 0
+            ? "none"
+            : string.Join(";", ordered.Select(console =>
+                $"id={console.ConsoleId}@{console.Position}/use={console.UseDistance:0.00}"));
+        var signature = $"{task.Id}:{task.TaskType}:{panels}:{error}";
+        if (!string.Equals(signature, _lastEmergencyConsoleInventory, StringComparison.Ordinal))
+        {
+            _lastEmergencyConsoleInventory = signature;
+            _log.LogInfo(
+                $"DeepBot emergency console inventory: map={(GameRuleSettings.IsMiraHqMap() ? "MIRA HQ" : "The Skeld")}, " +
+                $"task={task.TaskType}, taskId={task.Id}, panels={ordered.Count}, " +
+                $"requiredResponders={GetRequiredEmergencyResponders(task.TaskType)}, list={panels}, " +
+                $"error={(string.IsNullOrWhiteSpace(error) ? "none" : error)}.");
+        }
+
+        return ordered;
     }
 
     private static int GetRequiredEmergencyResponders(TaskTypes type)
     {
+        if (type == TaskTypes.FixComms && GameRuleSettings.IsMiraHqMap())
+        {
+            return 2;
+        }
+
         return type is TaskTypes.ResetReactor or TaskTypes.ResetSeismic or TaskTypes.RestoreOxy ? 2 : 1;
     }
 
@@ -3089,11 +4457,7 @@ internal sealed class BotActionDirector
 
     private static string MapSabotageToNode(TaskTypes type)
     {
-        if (type is TaskTypes.ResetReactor or TaskTypes.ResetSeismic) return "REACTOR_MID";
-        if (type == TaskTypes.RestoreOxy) return "O2_CENTER";
-        if (type == TaskTypes.FixComms) return "COMMS_CENTER";
-        if (type == TaskTypes.FixLights) return "ELEC_SWITCH";
-        return "CAF_TABLE";
+        return SkeldPathGraph.Instance.GetEmergencyNode(type);
     }
 
     private static bool IsSabotage(TaskTypes type)
@@ -3248,6 +4612,36 @@ internal sealed class BotActionDirector
             return false;
         }
 
+        var hqComms = rawSystem.TryCast<HqHudSystemType>();
+        if (hqComms is not null)
+        {
+            if (!hqComms.IsActive)
+            {
+                return true;
+            }
+
+            if (!state.EmergencyInteractionActive ||
+                Time.time - state.EmergencyLastInteractionAt >= 1.2f)
+            {
+                var consoleId = state.EmergencyConsoleId!.Value;
+                var repairAmount = (byte)((byte)HqHudSystemType.Tags.FixBit |
+                                          (consoleId & HqHudSystemType.IdMask));
+                ShipStatus.Instance.UpdateSystem(SystemTypes.Comms, bot, repairAmount);
+                state.EmergencyInteractionActive = true;
+                state.EmergencyLastInteractionAt = Time.time;
+                _memory.RecordAction(
+                    bot,
+                    "emergency_repair",
+                    $"entered MIRA comms code at console={consoleId}, position={bot.GetTruePosition()}");
+                _log.LogInfo(
+                    $"DeepBot MIRA comms panel used: bot={bot.Data?.PlayerName}, console={consoleId}, " +
+                    $"repairAmount={repairAmount}, consoleOkay={hqComms.IsConsoleOkay(consoleId)}, " +
+                    $"completed={hqComms.NumComplete}, activeAfter={hqComms.IsActive}, position={bot.GetTruePosition()}.");
+            }
+
+            return !hqComms.IsActive;
+        }
+
         var comms = rawSystem.TryCast<HudOverrideSystemType>();
         if (comms is null || !comms.IsActive)
         {
@@ -3259,7 +4653,7 @@ internal sealed class BotActionDirector
         {
             var consoleId = state.EmergencyConsoleId!.Value;
             // HudOverrideSystemType uses DamageBit to turn the outage on.
-            // Repairing the one Skeld tuning panel sends a task value with that
+            // Repairing the one tuning panel sends a task value with that
             // bit cleared; the former hard-coded 16|0 / 16|1 values never
             // cleared IsActive on the current game build.
             var repairAmount = (byte)(consoleId & HudOverrideSystemType.TaskMask);
@@ -3662,8 +5056,13 @@ internal sealed class BotActionDirector
 
     private static bool IsIntroPresentationActive()
     {
-        return IntroCutscene.Instance ||
-               (HudManager.Instance && HudManager.Instance.IsIntroDisplayed);
+        // Once the HUD exists its displayed flag is the reliable source. Some
+        // TOR transitions retain an IntroCutscene singleton after the visible
+        // card is gone; treating that stale object as active can deadlock the
+        // post-meeting action window.
+        return HudManager.Instance
+            ? HudManager.Instance.IsIntroDisplayed
+            : IntroCutscene.Instance;
     }
 
     private void ResetActivePlayGate()
@@ -3672,6 +5071,7 @@ internal sealed class BotActionDirector
         _playClockStartedAt = 0f;
         _meetingTransitionActive = false;
         _transitionReadySince = 0f;
+        _postMeetingBotUnlockAt = 0f;
     }
 
     private string ExplainSharedActionWindowBlock(PlayerControl bot)
@@ -3688,19 +5088,7 @@ internal sealed class BotActionDirector
 
     private static string? MapTaskTypeToNode(TaskTypes type)
     {
-        var text = type.ToString();
-        if (text.Contains("Reactor", StringComparison.OrdinalIgnoreCase) || text.Contains("Manifold", StringComparison.OrdinalIgnoreCase)) return "REACTOR_MID";
-        if (text.Contains("O2", StringComparison.OrdinalIgnoreCase) || text.Contains("Chute", StringComparison.OrdinalIgnoreCase)) return "O2_CENTER";
-        if (text.Contains("Navigation", StringComparison.OrdinalIgnoreCase) || text.Contains("Chart", StringComparison.OrdinalIgnoreCase)) return "NAV_CENTER";
-        if (text.Contains("Weapon", StringComparison.OrdinalIgnoreCase) || text.Contains("Asteroid", StringComparison.OrdinalIgnoreCase)) return "WEAP_CENTER";
-        if (text.Contains("Admin", StringComparison.OrdinalIgnoreCase) || text.Contains("Card", StringComparison.OrdinalIgnoreCase)) return "ADMIN_CARD";
-        if (text.Contains("Electrical", StringComparison.OrdinalIgnoreCase) || text.Contains("Wiring", StringComparison.OrdinalIgnoreCase)) return "ELEC_CENTER";
-        if (text.Contains("Med", StringComparison.OrdinalIgnoreCase) || text.Contains("Scan", StringComparison.OrdinalIgnoreCase)) return "MED_SCAN";
-        if (text.Contains("Security", StringComparison.OrdinalIgnoreCase)) return "SEC_CENTER";
-        if (text.Contains("Shield", StringComparison.OrdinalIgnoreCase)) return "SHIELD_CENTER";
-        if (text.Contains("Comms", StringComparison.OrdinalIgnoreCase) || text.Contains("Upload", StringComparison.OrdinalIgnoreCase)) return "COMMS_CENTER";
-        if (text.Contains("Engine", StringComparison.OrdinalIgnoreCase) || text.Contains("Fuel", StringComparison.OrdinalIgnoreCase)) return "LOWER_ENGINE_M";
-        return "STOR_CENTER";
+        return SkeldPathGraph.Instance.GetTaskNode(type);
     }
 
     private string? PickReachableFallbackNode(PlayerControl bot, BotRuntimeState state, BotActionDecision? decision, string? excludedTarget = null)
@@ -3733,8 +5121,6 @@ internal sealed class BotActionDirector
             {
                 return node.Id;
             }
-
-            MarkTargetUnreachable(state, node.Id);
         }
 
         return null;
@@ -3814,12 +5200,12 @@ internal sealed class BotActionDirector
 
     private static string PickFakeTaskNode()
     {
-        var candidates = PlausibleFakeTaskNodes
+        var candidates = SkeldPathGraph.Instance.FakeTaskNodeIds
             .Where(id => SkeldPathGraph.Instance.IsNodeAllowed(id))
             .ToArray();
         return candidates.Length > 0
             ? candidates[UnityEngine.Random.Range(0, candidates.Length)]
-            : "ADMIN_CARD";
+            : SkeldPathGraph.Instance.PrimarySpawnNodeId;
     }
 
     private bool TryAssignImpostorOpeningCover(PlayerControl bot, BotRuntimeState state)
@@ -3932,9 +5318,79 @@ internal sealed class BotActionDirector
         return state.HasActiveRoute;
     }
 
+    private bool TryAssignCrewAmbientBehavior(PlayerControl bot, BotRuntimeState state)
+    {
+        var epoch = state.CrewAmbientEpoch++;
+        var mode = (bot.PlayerId + epoch) % 5;
+        var target = PickReachableAmbientNode(bot, state, mode, epoch);
+        if (target is null)
+        {
+            state.NextDecisionAt = Time.time + 0.75f;
+            return false;
+        }
+
+        var kind = mode == 4 ? BotActionKind.Hide : mode == 1 ? BotActionKind.Idle : BotActionKind.Llm;
+        AssignRoute(
+            bot,
+            state,
+            target,
+            $"crew-ambient:{(mode == 4 ? "hide" : mode == 1 ? "pause" : "roam")}:epoch={epoch}",
+            mode == 1 ? 1.5f : 2.5f,
+            mode == 1 ? 3.5f : 6.5f,
+            kind,
+            null,
+            null);
+        if (state.HasActiveRoute)
+        {
+            _log.LogInfo(
+                $"DeepBot crew ambient fallback assigned: bot={bot.Data?.PlayerName}, " +
+                $"target={target}, mode={kind}, epoch={epoch}, reason=llm-unavailable-or-no-task-target.");
+        }
+
+        return state.HasActiveRoute;
+    }
+
+    private static string? PickReachableAmbientNode(
+        PlayerControl bot,
+        BotRuntimeState state,
+        int mode,
+        int epoch)
+    {
+        var allowedKinds = mode switch
+        {
+            1 => new[] { NodeKind.Landmark, NodeKind.Hall },
+            4 => new[] { NodeKind.Corner },
+            _ => new[] { NodeKind.Corner, NodeKind.Interaction, NodeKind.Landmark }
+        };
+        var candidates = SkeldPathGraph.Instance.Nodes
+            .Where(node =>
+                SkeldPathGraph.Instance.IsNodeAllowed(node.Id) &&
+                !IsTargetCoolingDown(state, node.Id) &&
+                allowedKinds.Contains(node.Kind))
+            .ToArray();
+        if (candidates.Length == 0)
+        {
+            return null;
+        }
+
+        var start = Math.Abs(bot.PlayerId * 17 + epoch * 7) % candidates.Length;
+        var from = bot.GetTruePosition();
+        for (var offset = 0; offset < candidates.Length; offset++)
+        {
+            var candidate = candidates[(start + offset) % candidates.Length];
+            if (SkeldPathGraph.Instance.FindTopRoutes(from, candidate.Position, 1).Count > 0)
+            {
+                return candidate.Id;
+            }
+        }
+
+        return null;
+    }
+
     private static string? PickReachableFakeTaskNode(PlayerControl bot, BotRuntimeState state, int epoch)
     {
-        var candidates = PlausibleFakeTaskNodes
+        var fakeTaskNodes = SkeldPathGraph.Instance.FakeTaskNodeIds;
+        var candidates = fakeTaskNodes
             .Where(id =>
                 SkeldPathGraph.Instance.IsNodeAllowed(id) &&
                 !IsTargetCoolingDown(state, id))
@@ -3950,9 +5406,22 @@ internal sealed class BotActionDirector
                 1).Count > 0)
             .OrderBy(item =>
                 Vector2.Distance(bot.GetTruePosition(), item.Node!.Value.Position) +
-                ((Array.IndexOf(PlausibleFakeTaskNodes, item.Id) + bot.PlayerId + epoch) % 4) * 0.7f)
+                ((IndexOf(fakeTaskNodes, item.Id) + bot.PlayerId + epoch) % 4) * 0.7f)
             .ToArray();
         return candidates.FirstOrDefault()?.Id;
+    }
+
+    private static int IndexOf(IReadOnlyList<string> values, string value)
+    {
+        for (var index = 0; index < values.Count; index++)
+        {
+            if (string.Equals(values[index], value, StringComparison.Ordinal))
+            {
+                return index;
+            }
+        }
+
+        return 0;
     }
 
     private bool TryAssignAutonomousMurderTarget(PlayerControl killer, BotRuntimeState state)
@@ -3975,20 +5444,44 @@ internal sealed class BotActionDirector
         }
 
         var killerPosition = killer.GetTruePosition();
-        var candidates = PlayerControl.AllPlayerControls
-            .ToArray()
-            .Where(player =>
-                player &&
-                player.PlayerId != killer.PlayerId &&
-                !TorRoleAdapter.AreLoverPartners(killer, player) &&
-                player.Data is not null &&
-                !player.Data.IsDead &&
-                !player.Data.Disconnected &&
-                !IsImpostor(player) &&
-                CanObservePlayer(killer, player))
-            .Select(player =>
+        var knownOpponents = new List<KnownCrewObservation>();
+        foreach (var player in PlayerControl.AllPlayerControls)
+        {
+            if (!player ||
+                player.PlayerId == killer.PlayerId ||
+                TorRoleAdapter.AreLoverPartners(killer, player) ||
+                player.Data is null ||
+                player.Data.IsDead ||
+                player.Data.Disconnected ||
+                IsImpostor(player))
             {
-                var position = player.GetTruePosition();
+                continue;
+            }
+
+            if (CanObservePlayer(killer, player))
+            {
+                var livePosition = player.GetTruePosition();
+                state.LastSeenPlayers[player.PlayerId] =
+                    new PlayerLastSeen(player.Data.PlayerName, livePosition, Time.time);
+                knownOpponents.Add(new KnownCrewObservation(player, livePosition, 0f));
+                continue;
+            }
+
+            if (state.LastSeenPlayers.TryGetValue(player.PlayerId, out var lastSeen))
+            {
+                var age = Time.time - lastSeen.SeenAt;
+                if (BotBehaviorPolicy.ShouldUseRecentSightForMurderPlan(false, age, RecentSightSeconds))
+                {
+                    knownOpponents.Add(new KnownCrewObservation(player, lastSeen.Position, age));
+                }
+            }
+        }
+
+        var candidates = knownOpponents
+            .Select(observation =>
+            {
+                var player = observation.Player;
+                var position = observation.Position;
                 var distance = Vector2.Distance(killerPosition, position);
                 var nearbyCrew = PlayerControl.AllPlayerControls
                     .ToArray()
@@ -4003,51 +5496,109 @@ internal sealed class BotActionDirector
                         CanObservePlayer(killer, other) &&
                         Vector2.Distance(position, other.GetTruePosition()) <= 3.8f);
                 var isBotVictim = DeepBotIdentity.IsBot(player);
+                var isRolePriority = TorRoleAdapter.IsPreferredOrdinaryMurderTarget(killer, player);
+                var observedSpeed = observation.Age <= 0.05f
+                    ? GetObservedPlayerSpeed(player)
+                    : -1f;
+                var movementOpportunity = ScoreMurderMovementOpportunity(
+                    observedSpeed,
+                    player.MyPhysics ? Mathf.Max(0.8f, player.MyPhysics.TrueSpeed) : 1f);
                 var repeatPenalty = state.LastMurderTargetId == player.PlayerId ? 4.5f : 0f;
                 var score = BotBehaviorPolicy.ScoreMurderCandidate(
                     distance,
                     nearbyCrew,
                     isBotVictim,
                     repeatPenalty > 0f,
-                    ((killer.PlayerId + player.PlayerId + state.MurderTargetEpoch) % 5) * 0.08f);
-                return new { Player = player, Distance = distance, NearbyCrew = nearbyCrew, IsBotVictim = isBotVictim, Score = score };
+                    ((killer.PlayerId + player.PlayerId + state.MurderTargetEpoch) % 5) * 0.08f) +
+                    (isRolePriority ? 8f : 0f) -
+                    observation.Age * 0.22f +
+                    movementOpportunity;
+                return new
+                {
+                    Player = player,
+                    Distance = distance,
+                    NearbyCrew = nearbyCrew,
+                    IsBotVictim = isBotVictim,
+                    IsRolePriority = isRolePriority,
+                    ObservedSpeed = observedSpeed,
+                    Score = score,
+                    LastSeenAge = observation.Age
+                };
             })
-            .Where(item => item.Distance <= 11f)
+            .Where(item => item.Distance <= (item.LastSeenAge <= 0.05f ? 11f : 15f))
             .OrderByDescending(item => item.Score)
             .ToArray();
         state.MurderTargetEpoch++;
         if (candidates.Length == 0 || candidates[0].Score < 3.2f)
         {
             state.NextMurderPlanAt = Time.time + UnityEngine.Random.Range(2.5f, 5f);
+            if (Time.time >= state.NextMurderDiagnosticAt)
+            {
+                state.NextMurderDiagnosticAt = Time.time + 3f;
+                var roleName = TorRoleAdapter.TryGetRole(killer, out var torRole)
+                    ? torRole.Name
+                    : killer.Data?.Role?.NiceName ?? "unknown";
+                _log.LogInfo(
+                    $"DeepBot autonomous murder search waiting: killer={killer.Data?.PlayerName}, " +
+                    $"role={roleName}, knownOpponents={knownOpponents.Count}, viableCandidates={candidates.Length}, " +
+                    $"bestScore={(candidates.Length == 0 ? "none" : candidates[0].Score.ToString("0.0"))}.");
+            }
             return false;
         }
 
+        var preferredRoleTarget = candidates
+            .Where(item => item.IsRolePriority && item.Score >= 3.2f)
+            .OrderByDescending(item => item.Score)
+            .FirstOrDefault();
         var preferredBotVictim = candidates
             .Where(item => item.IsBotVictim && item.Score >= 3.2f)
             .OrderByDescending(item => item.Score)
             .FirstOrDefault();
-        var selected = preferredBotVictim ?? candidates[0];
+        var selected = preferredRoleTarget ?? preferredBotVictim ?? candidates[0];
         state.LastMurderTargetId = selected.Player.PlayerId;
         state.NextMurderPlanAt = Time.time + UnityEngine.Random.Range(6f, 10f);
         var assigned = TryAssignMurderPursuitRoute(
-            killer,
-            state,
-            selected.Player,
-            $"autonomous-kill-plan:score={selected.Score:0.0}; distance={selected.Distance:0.0}; " +
-            $"nearbyCrew={selected.NearbyCrew}; botVictim={selected.IsBotVictim}");
+             killer,
+             state,
+             selected.Player,
+             $"autonomous-kill-plan:score={selected.Score:0.0}; distance={selected.Distance:0.0}; " +
+             $"nearbyCrew={selected.NearbyCrew}; botVictim={selected.IsBotVictim}; rolePriority={selected.IsRolePriority}; " +
+             $"targetSpeed={selected.ObservedSpeed:0.00}; lastSeenAge={selected.LastSeenAge:0.0}s");
         if (assigned)
         {
             _memory.RecordAction(
-                killer,
-                "murder_plan",
-                $"selected {selected.Player.Data?.PlayerName}({selected.Player.PlayerId}); score={selected.Score:0.0}; botVictim={selected.IsBotVictim}");
+                 killer,
+                 "murder_plan",
+                 $"selected {selected.Player.Data?.PlayerName}({selected.Player.PlayerId}); score={selected.Score:0.0}; " +
+                 $"botVictim={selected.IsBotVictim}; rolePriority={selected.IsRolePriority}; " +
+                 $"targetSpeed={selected.ObservedSpeed:0.00}; lastSeenAge={selected.LastSeenAge:0.0}s");
             _log.LogInfo(
                 $"DeepBot autonomous murder target selected: killer={killer.Data?.PlayerName}, " +
                 $"target={selected.Player.Data?.PlayerName}({selected.Player.PlayerId}), score={selected.Score:0.0}, " +
-                $"distance={selected.Distance:0.0}, nearbyCrew={selected.NearbyCrew}, botVictim={selected.IsBotVictim}.");
+                $"distance={selected.Distance:0.0}, nearbyCrew={selected.NearbyCrew}, botVictim={selected.IsBotVictim}, " +
+                $"rolePriority={selected.IsRolePriority}, targetSpeed={selected.ObservedSpeed:0.00}, " +
+                $"source={(selected.LastSeenAge <= 0.05f ? "visible" : "recent-sight")}, lastSeenAge={selected.LastSeenAge:0.0}s.");
         }
 
         return assigned;
+    }
+
+    private static float GetObservedPlayerSpeed(PlayerControl player)
+    {
+        return player && player.MyPhysics && player.MyPhysics.body
+            ? player.MyPhysics.body.velocity.magnitude
+            : 0f;
+    }
+
+    private static float ScoreMurderMovementOpportunity(float observedSpeed, float normalSpeed)
+    {
+        if (observedSpeed < 0f)
+        {
+            return 0f;
+        }
+
+        var movingRatio = Mathf.Clamp01(observedSpeed / Mathf.Max(0.1f, normalSpeed));
+        return Mathf.Lerp(2.6f, -2.2f, movingRatio);
     }
 
     private PlayerControl PreferVisibleBotVictim(
@@ -4089,6 +5640,21 @@ internal sealed class BotActionDirector
 
     private bool UpdateMurderPursuit(PlayerControl killer, BotRuntimeState state)
     {
+        // A sabotage isolation plan can call TryAssignMurderPursuitRoute
+        // directly.  Roles such as Vampire must never keep that ordinary-kill
+        // pursuit alive: it repeatedly reaches knife range, gets rejected by
+        // TOR, and starves the native bite decision.  Cancel the stale route
+        // immediately and let BotAbilityDirector own the role action.
+        if (!TorRoleAdapter.CanUseOrdinaryMurder(killer, out var roleBlock))
+        {
+            _log.LogInfo(
+                $"DeepBot ordinary murder pursuit cancelled for role ability: " +
+                $"killer={killer.Data?.PlayerName}, block={roleBlock}.");
+            state.ClearRoute();
+            state.NextMurderPlanAt = Time.time + 1f;
+            return true;
+        }
+
         var target = state.TargetPlayerId.HasValue
             ? FindPlayerControl(state.TargetPlayerId.Value)
             : null;
@@ -4120,8 +5686,31 @@ internal sealed class BotActionDirector
             return true;
         }
 
-        if (Time.time < state.NextMurderPursuitRefreshAt ||
-            !CanObservePlayer(killer, target))
+        var targetVisible = CanObservePlayer(killer, target);
+        if (!targetVisible)
+        {
+            var reachedLastKnownPosition = state.CurrentTargetPosition.HasValue &&
+                                           Vector2.Distance(
+                                               killer.GetTruePosition(),
+                                               state.CurrentTargetPosition.Value) <= 1.25f;
+            var lastSeenAge = state.LastSeenPlayers.TryGetValue(target.PlayerId, out var lastSeen)
+                ? Time.time - lastSeen.SeenAt
+                : float.MaxValue;
+            if (reachedLastKnownPosition && lastSeenAge >= 1.4f)
+            {
+                _log.LogInfo(
+                    $"DeepBot murder pursuit abandoned at stale last-known position: " +
+                    $"killer={killer.Data?.PlayerName}, target={target.Data.PlayerName}, " +
+                    $"lastSeenAge={lastSeenAge:0.0}s; replanning instead of waiting for full timeout.");
+                state.ClearRoute();
+                state.NextMurderPlanAt = Time.time + UnityEngine.Random.Range(0.6f, 1.4f);
+                return true;
+            }
+
+            return false;
+        }
+
+        if (Time.time < state.NextMurderPursuitRefreshAt)
         {
             return false;
         }
@@ -4152,6 +5741,13 @@ internal sealed class BotActionDirector
         PlayerControl target,
         string reason)
     {
+        // Keep every entry point (including post-sabotage isolation) under the
+        // same TOR-native kill gate as autonomous target selection.
+        if (!TorRoleAdapter.CanUseOrdinaryMurder(killer, out _))
+        {
+            return false;
+        }
+
         if (!killer ||
             !target ||
             killer.Data is null ||
@@ -4230,7 +5826,11 @@ internal sealed class BotActionDirector
 
     private static bool CanObservePlayer(PlayerControl observer, PlayerControl target)
     {
-        if (!observer || !target || observer.Data is null || target.Data is null || target.Data.IsDead)
+        if (!observer ||
+            observer.Data is null ||
+            observer.Data.IsDead ||
+            observer.Data.Disconnected ||
+            !BotPerceptionPolicy.CanBeOrdinarilyObserved(target))
         {
             return false;
         }
@@ -4238,7 +5838,7 @@ internal sealed class BotActionDirector
         var observerPosition = observer.GetTruePosition();
         var targetPosition = target.GetTruePosition();
         return Vector2.Distance(observerPosition, targetPosition) <= GetVisionDistance(observer) &&
-            !PhysicsHelpers.AnythingBetween(observerPosition, targetPosition, Constants.ShipAndObjectsMask, false);
+            !PhysicsHelpers.AnythingBetween(observerPosition, targetPosition, Constants.ShipOnlyMask, false);
     }
 
     private static bool IsDeepBotPlayer(PlayerControl player)
@@ -4268,10 +5868,10 @@ internal sealed class BotActionDirector
             return null;
         }
 
-        if (sabotage.Contains("reactor", StringComparison.OrdinalIgnoreCase)) return "REACTOR_MID";
-        if (sabotage.Contains("o2", StringComparison.OrdinalIgnoreCase) || sabotage.Contains("oxygen", StringComparison.OrdinalIgnoreCase)) return "O2_CENTER";
-        if (sabotage.Contains("light", StringComparison.OrdinalIgnoreCase) || sabotage.Contains("electrical", StringComparison.OrdinalIgnoreCase)) return "ELEC_SWITCH";
-        if (sabotage.Contains("comm", StringComparison.OrdinalIgnoreCase)) return "COMMS_CENTER";
+        if (sabotage.Contains("reactor", StringComparison.OrdinalIgnoreCase)) return SkeldPathGraph.Instance.GetEmergencyNode(TaskTypes.ResetReactor);
+        if (sabotage.Contains("o2", StringComparison.OrdinalIgnoreCase) || sabotage.Contains("oxygen", StringComparison.OrdinalIgnoreCase)) return SkeldPathGraph.Instance.GetEmergencyNode(TaskTypes.RestoreOxy);
+        if (sabotage.Contains("light", StringComparison.OrdinalIgnoreCase) || sabotage.Contains("electrical", StringComparison.OrdinalIgnoreCase)) return SkeldPathGraph.Instance.GetEmergencyNode(TaskTypes.FixLights);
+        if (sabotage.Contains("comm", StringComparison.OrdinalIgnoreCase)) return SkeldPathGraph.Instance.GetEmergencyNode(TaskTypes.FixComms);
         return null;
     }
 
@@ -4378,7 +5978,11 @@ internal sealed class BotActionDirector
                 return true;
             }
 
-            killer.killTimer = Mathf.Max(killer.killTimer, GameRuleSettings.GetKillCooldown(10f));
+            var configuredPostKillCooldown = TorRoleAdapter.GetConfiguredOrdinaryMurderCooldown(
+                killer,
+                target,
+                GameRuleSettings.GetKillCooldown(10f));
+            killer.killTimer = Mathf.Max(killer.killTimer, configuredPostKillCooldown);
             var murderState = GetState(killer);
             murderState.LastObservedKillTimer = killer.killTimer;
             murderState.LastKillTimerSampleAt = Time.time;
@@ -4386,6 +5990,10 @@ internal sealed class BotActionDirector
             _log.LogInfo(
                 $"DeepBot murder executed: killer={killer.Data?.PlayerName}, target={target.Data?.PlayerName}, " +
                 $"outcome={torOutcome}.");
+            // TOR helper paths do not all pass through PlayerControl.MurderPlayer.
+            // Feed the confirmed result through the same immediate perception
+            // pipeline; BotMatchMemory de-duplicates the native-patch path.
+            Plugin.Runtime?.RecordObservedMurder(killer, target);
             BeginPostMurderEscape(killer, murderState, target.PlayerId, murderPosition);
             return true;
         }
@@ -4445,6 +6053,11 @@ internal sealed class BotActionDirector
 
     private void ResetRoundRoutes(string reason)
     {
+        _roundResumeEpoch++;
+        _roundResumeReason = reason;
+        _roundResumeStartedAt = Time.time;
+        _roundResumeSummaryLogged = false;
+        _nextRoundResumeWarningAt = Time.time + 5f;
         foreach (var bot in EnumerateDeepBots())
         {
             var state = GetState(bot);
@@ -4454,6 +6067,19 @@ internal sealed class BotActionDirector
             state.PendingDecision = null;
             state.PostTaskPauseUntil = 0f;
             state.PostTaskWanderPending = false;
+            // A route probe may fail while MIRA's live grid is being built or
+            // while decontamination doors are changing state.  Those transient
+            // failures must not survive a match/meeting boundary and single out
+            // taskless roles for a 45 second idle period.
+            state.UnreachableTargetUntil.Clear();
+            state.RoundResumeIntentPending =
+                bot.Data is not null &&
+                !bot.Data.IsDead &&
+                !bot.Data.Disconnected;
+            state.RoundResumeReason = reason;
+            state.RoundResumeIntent = state.RoundResumeIntentPending ? "pending" : "not-living";
+            state.RoundResumeAttempts = 0;
+            state.NextRoundResumeDiagnosticAt = 0f;
             if (string.Equals(reason, "match-start", StringComparison.Ordinal))
             {
                 state.NextSabotageAt = 0f;
@@ -4773,6 +6399,11 @@ internal sealed class BotActionDirector
             return "target-dead-or-disconnected";
         }
 
+        if (BotPerceptionPolicy.IsConcealedByVent(target))
+        {
+            return "target-concealed-in-vent";
+        }
+
         if (!IsImpostor(killer))
         {
             return "killer-not-impostor";
@@ -4809,7 +6440,11 @@ internal sealed class BotActionDirector
 
     private static bool CanMurderTarget(PlayerControl killer, PlayerControl target)
     {
-        if (!killer || !target || killer.Data is null || target.Data is null || killer.Data.IsDead || target.Data.IsDead)
+        if (!killer ||
+            !target ||
+            killer.Data is null ||
+            killer.Data.IsDead ||
+            !BotPerceptionPolicy.CanBeOrdinarilyObserved(target))
         {
             return false;
         }
@@ -4842,12 +6477,15 @@ internal sealed class BotActionDirector
                 continue;
             }
 
-            var vision = GetVisionDistance(observer);
-            var seesKiller = Vector2.Distance(observer.GetTruePosition(), killer.GetTruePosition()) <= vision &&
-                !PhysicsHelpers.AnythingBetween(observer.GetTruePosition(), killer.GetTruePosition(), Constants.ShipAndObjectsMask, false);
-            var seesTarget = Vector2.Distance(observer.GetTruePosition(), target.GetTruePosition()) <= vision &&
-                !PhysicsHelpers.AnythingBetween(observer.GetTruePosition(), target.GetTruePosition(), Constants.ShipAndObjectsMask, false);
-            if (seesKiller && seesTarget)
+            var observerPosition = observer.GetTruePosition();
+            var killerPosition = killer.GetTruePosition();
+            var targetPosition = target.GetTruePosition();
+            if (BotPerceptionPolicy.CanWitnessMurderGeometry(
+                    Vector2.Distance(observerPosition, killerPosition),
+                    Vector2.Distance(observerPosition, targetPosition),
+                    GetVisionDistance(observer),
+                    PhysicsHelpers.AnythingBetween(observerPosition, killerPosition, Constants.ShipOnlyMask, false),
+                    PhysicsHelpers.AnythingBetween(observerPosition, targetPosition, Constants.ShipOnlyMask, false)))
             {
                 witnesses++;
             }
@@ -4929,7 +6567,7 @@ internal sealed class BotActionDirector
             client.ClientId == client.HostId &&
             client.GameState == InnerNetClient.GameStates.Started &&
             ShipStatus.Instance &&
-            GameRuleSettings.IsSkeldMap();
+            GameRuleSettings.IsDeepBotSupportedMap();
     }
 
     private static IEnumerable<PlayerControl> EnumerateDeepBots()
@@ -5010,7 +6648,7 @@ internal sealed class BotActionDirector
 
     private static bool IsImpostor(PlayerControl player)
     {
-        return player.Data is not null && player.Data.Role is not null && player.Data.Role.IsImpostor;
+        return TorRoleAdapter.IsImpostorTeam(player);
     }
 
     private static bool IsTaskCompletingRole(PlayerControl player)
@@ -5031,6 +6669,10 @@ internal sealed class BotActionDirector
         public int RouteIndex { get; set; }
         public string? CurrentTargetNode { get; set; }
         public Vector2? CurrentTargetPosition { get; set; }
+        public TorPortalTraversalOption? PortalShortcutOption { get; set; }
+        public List<NavNode> PortalContinuationRoute { get; set; } = [];
+        public bool PortalShortcutStarted { get; set; }
+        public float PortalWaitStartedAt { get; set; }
         public Vector2? RouteEndpoint { get; set; }
         public float ArrivalDistance { get; set; } = 1.05f;
         public float DwellSeconds { get; set; }
@@ -5051,6 +6693,7 @@ internal sealed class BotActionDirector
         public float LastProgressTargetDistance { get; set; } = float.MaxValue;
         public int LastProgressRouteIndex { get; set; } = -1;
         public float NextReturnLogAt { get; set; }
+        public float NextNoRouteLogAt { get; set; }
         public float NextEmergencyInterruptAt { get; set; }
         public uint? EmergencyTaskId { get; set; }
         public TaskTypes? EmergencyTaskType { get; set; }
@@ -5072,7 +6715,9 @@ internal sealed class BotActionDirector
         public bool ImpostorOpeningCoverCompleted { get; set; }
         public bool ImpostorOpeningCoverPending { get; set; }
         public int ImpostorAmbientEpoch { get; set; }
+        public int CrewAmbientEpoch { get; set; }
         public float NextBodyCheckAt { get; set; }
+        public float NextBodyDecisionLogAt { get; set; }
         public float NextBodyPerceptionDiagnosticAt { get; set; }
         public float NextTaskDiagnosticAt { get; set; }
         public Vector2 DesiredMoveDirection { get; set; }
@@ -5102,6 +6747,11 @@ internal sealed class BotActionDirector
         public float LastKillTimerSampleAt { get; set; }
         public float PostTaskPauseUntil { get; set; }
         public bool PostTaskWanderPending { get; set; }
+        public bool RoundResumeIntentPending { get; set; }
+        public string RoundResumeReason { get; set; } = string.Empty;
+        public string RoundResumeIntent { get; set; } = string.Empty;
+        public int RoundResumeAttempts { get; set; }
+        public float NextRoundResumeDiagnosticAt { get; set; }
         public Dictionary<byte, ThreatTrack> ThreatTracks { get; } = [];
         public float NextThreatScanAt { get; set; }
         public float ThreatEvadeUntil { get; set; }
@@ -5118,6 +6768,13 @@ internal sealed class BotActionDirector
         public float SocialFollowUntil { get; set; }
         public float NextSocialFollowRefreshAt { get; set; }
         public float NextAbilityRouteRefreshAt { get; set; }
+        public float NextMiraDeconUseAt { get; set; }
+        public float NextMiraDeconProximityLogAt { get; set; }
+        public float MiraDeconCommandIssuedAt { get; set; }
+        public int MiraDeconSystemId { get; set; } = -1;
+        public bool MiraDeconCommandIssued { get; set; }
+        public bool MiraDeconCycleObserved { get; set; }
+        public bool MiraDeconHeadingUp { get; set; }
         public bool HasActiveRoute => Route.Count > 0 || DwellUntil > 0f;
 
         public void ClearRoute()
@@ -5126,6 +6783,7 @@ internal sealed class BotActionDirector
             RouteIndex = 0;
             CurrentTargetNode = null;
             CurrentTargetPosition = null;
+            ClearPortalShortcut();
             RouteEndpoint = null;
             ArrivalDistance = 1.05f;
             DwellSeconds = 0f;
@@ -5139,6 +6797,7 @@ internal sealed class BotActionDirector
             LastProgressTargetDistance = float.MaxValue;
             LastProgressRouteIndex = -1;
             NextReturnLogAt = 0f;
+            NextNoRouteLogAt = 0f;
             DesiredMoveDirection = Vector2.zero;
             DesiredMoveSpeedMultiplier = 0f;
             DesiredMoveUntil = 0f;
@@ -5152,6 +6811,14 @@ internal sealed class BotActionDirector
             MurderPursuitUntil = 0f;
             NextMurderPursuitRefreshAt = 0f;
             NextMurderDiagnosticAt = 0f;
+        }
+
+        public void ClearPortalShortcut()
+        {
+            PortalShortcutOption = null;
+            PortalContinuationRoute.Clear();
+            PortalShortcutStarted = false;
+            PortalWaitStartedAt = 0f;
         }
 
         public void ClearEmergency()
@@ -5199,6 +6866,13 @@ internal sealed class BotActionDirector
         string Goal,
         string Reason,
         byte? TargetPlayerId);
+
+    private enum MiraDeconHandling
+    {
+        None,
+        Hold,
+        Move
+    }
 
     private enum BotActionKind
     {

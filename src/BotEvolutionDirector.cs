@@ -268,7 +268,7 @@ internal sealed class BotEvolutionDirector
 
     private static bool IsImpostor(PlayerControl player)
     {
-        return player && player.Data?.Role is not null && player.Data.Role.IsImpostor;
+        return TorRoleAdapter.IsImpostorTeam(player);
     }
 
     private sealed record MatchEndSnapshot(

@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <Version>0.10.0</Version>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(InstallerMode)' == 'Host'">
+    <AssemblyName>AmongUs-DeepBot-Host-Installer</AssemblyName>
+    <DefineConstants>$(DefineConstants);HOST_INSTALLER</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(InstallerMode)' == 'Client'">
+    <AssemblyName>AmongUs-DeepBot-Client-Installer</AssemblyName>
+    <DefineConstants>$(DefineConstants);CLIENT_INSTALLER</DefineConstants>
+  </PropertyGroup>
+
+  <Target Name="ValidateInstallerInputs" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(InstallerMode)' != 'Host' and '$(InstallerMode)' != 'Client'"
+           Text="Set InstallerMode to Host or Client." />
+    <Error Condition="'$(PayloadZip)' == '' or !Exists('$(PayloadZip)')"
+           Text="Set PayloadZip to an existing payload ZIP." />
+  </Target>
+
+  <ItemGroup>
+    <EmbeddedResource Include="$(PayloadZip)" LogicalName="DeepBot.Payload.zip" />
+  </ItemGroup>
+</Project>

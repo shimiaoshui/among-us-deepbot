@@ -1,3 +1,16 @@
+# 0.10.0-skeld-native-tor
+
+- Added separate self-contained Windows host and client installers. Both accept a Steam root or exact game directory and back up overwritten mod files before installation.
+- Fixed an unvalidated local-avoidance fallback that could push a living bot through an outer wall when every tested steering direction was blocked.
+- Fixed later meetings remaining open after every living player voted by recognizing TOR ghost roles and continuing native completion checks until the meeting ends.
+- Cancelled every ordinary-kill pursuit for Vampire and other role-gated killers, leaving Vampire elimination entirely to TOR's native bite and delayed-death sequence.
+- Added legal LLM decision checkpoints between native stages for Morphling, Trickster, Ninja, Warlock, Vampire, Bomber, and Yoyo without allowing stage skipping or target replacement.
+- Added private Security Guard camera and MIRA DoorLog observations, Detective footprints, Seer soul locations, base-game shapeshift witnessing, and host-side client vent witnessing.
+- Strengthened meeting speaker attribution and silence rules so a bot cannot invent a statement for another player or fill an evidence-free turn with generic procedural language.
+- Retains host-authoritative lobby bot count, appearance customization, room-rule synchronization, private memories, emergency response, native TOR roles, and deduplicated post-match learning.
+- The Skeld is release-qualified. MIRA HQ remains experimental.
+- Release installers, source, and documentation contain no API key.
+
 # 0.9.11-lobby-identity-meeting
 
 - Added TOR lobby controls for each bot's name, color, outfit, and nameplate.

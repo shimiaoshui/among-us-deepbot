@@ -11,12 +11,18 @@ namespace AmongUsDeepSeekBots;
 internal sealed class BotAbilityDirector
 {
     private const float TickInterval = 0.5f;
+    private static readonly HashSet<string> LlmSequenceCheckpointRoles =
+    [
+        "Morphling", "Portalmaker", "Trickster", "Ninja", "Warlock", "Yoyo"
+    ];
     private readonly ManualLogSource _log;
     private readonly BotMatchMemory _memory;
     private readonly BotActionDirector _actions;
     private readonly DeepSeekDecisionClient _deepSeek;
     private readonly Dictionary<byte, AbilityState> _states = [];
+    private int _observedMatchSerial = -1;
     private float _nextTickAt;
+    private float _nextGlobalLlmRequestAt;
 
     public BotAbilityDirector(
         ManualLogSource log,
@@ -32,6 +38,7 @@ internal sealed class BotAbilityDirector
 
     public void Update(PluginConfig config)
     {
+        SynchronizeMatchState();
         if (!config.BotUseRoleAbilities.Value ||
             Time.time < _nextTickAt ||
             !IsHostAuthority() ||
@@ -49,9 +56,18 @@ internal sealed class BotAbilityDirector
             }
 
             var state = GetState(bot);
+            if (HandlePendingVentEntry(bot, state))
+            {
+                continue;
+            }
+
             if (bot.inVent)
             {
-                if (state.ActiveVentId.HasValue && Time.time >= state.ExitVentAt)
+                ConfirmVentEntry(bot, state);
+                if (state.ActiveVentId.HasValue &&
+                    (Time.time >= state.ExitVentAt ||
+                     Time.time >= state.MinimumVentHoldUntil &&
+                     ShouldExitVentForAmbush(bot, state.ActiveVentId.Value, state.VentAmbushTargetId)))
                 {
                     ExitVent(bot, state);
                 }
@@ -80,6 +96,16 @@ internal sealed class BotAbilityDirector
                 continue;
             }
 
+            if (bot.Data.RoleType != RoleTypes.Shapeshifter)
+            {
+                ClearShapeshifterSequence(state);
+            }
+            else if (state.PendingShapeshiftTargetId.HasValue)
+            {
+                ContinueShapeshifterSequence(bot, state);
+                continue;
+            }
+
             if (state.DecisionCompleted)
             {
                 ApplyAbilityDecision(bot, state);
@@ -88,12 +114,27 @@ internal sealed class BotAbilityDirector
 
             if (!state.DecisionInFlight)
             {
-                RequestAbilityDecision(bot, state);
+                RequestAbilityDecision(bot, state, config);
             }
         }
     }
 
-    private void RequestAbilityDecision(PlayerControl bot, AbilityState state)
+    private void SynchronizeMatchState()
+    {
+        var serial = _memory.MatchSerial;
+        if (serial <= 0 || serial == _observedMatchSerial)
+        {
+            return;
+        }
+
+        _observedMatchSerial = serial;
+        _states.Clear();
+        _nextTickAt = 0f;
+        _nextGlobalLlmRequestAt = 0f;
+        _log.LogInfo($"DeepBot ability state reset for new match: match={serial}.");
+    }
+
+    private void RequestAbilityDecision(PlayerControl bot, AbilityState state, PluginConfig config)
     {
         var availableTorRoles = TorRoleAdapter.GetAbilityRoles(bot);
         var hasTorRole = TrySelectTorAbilityRole(bot, state, out var torRole);
@@ -102,6 +143,56 @@ internal sealed class BotAbilityDirector
             state.NextAbilityAt = Time.time + 1f;
             return;
         }
+        if (hasTorRole && TorRoleAdapter.TryGetAbilitySequencePlan(bot, torRole, out var sequencePlan))
+        {
+            if (!sequencePlan.ShouldUse)
+            {
+                state.NextAbilityAt = Time.time + Mathf.Max(0.35f, sequencePlan.RecheckSeconds);
+                if (Time.time >= state.NextRouteLogAt)
+                {
+                    state.NextRouteLogAt = Time.time + 2.5f;
+                    _log.LogInfo(
+                        $"DeepBot multi-stage ability waiting: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+                        $"role={torRole.Name}, reason={sequencePlan.Reason}.");
+                }
+                return;
+            }
+
+            var sequenceVentReady = string.Equals(sequencePlan.AbilityAction, "vent", StringComparison.Ordinal) &&
+                                    TorRoleAdapter.CanUseVents(bot, torRole);
+            var sequenceRouteReady = sequencePlan.AbilityAction is "cover" or "evade";
+            var sequenceRoleContinuationReady = sequencePlan.ShouldUse && sequencePlan.AbilityAction == "role";
+            if (!TorRoleAdapter.IsAbilityReady(bot, torRole) && !sequenceVentReady && !sequenceRouteReady && !sequenceRoleContinuationReady)
+            {
+                state.NextAbilityAt = Time.time + Mathf.Max(0.35f, sequencePlan.RecheckSeconds);
+                return;
+            }
+
+            if (TryQueueSequenceCheckpoint(bot, state, config, torRole, sequencePlan))
+            {
+                return;
+            }
+
+            state.RequestedRole = bot.Data.RoleType;
+            state.RequestedTorRole = torRole.Name;
+            state.AbilityRoleCursor++;
+            state.PendingDecision = new BotAbilityDecision(
+                true,
+                sequencePlan.TargetPlayerId,
+                sequencePlan.Reason,
+                sequencePlan.Confidence,
+                sequencePlan.AbilityAction);
+            state.DecisionCompleted = true;
+            state.DecisionInFlight = false;
+            _log.LogInfo(
+                $"DeepBot multi-stage ability continuation armed: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+                $"role={torRole.Name}, action={sequencePlan.AbilityAction}, " +
+                $"target={sequencePlan.TargetPlayerId?.ToString() ?? "none"}, reason={sequencePlan.Reason}.");
+            return;
+        }
+        state.SequenceCheckpointKey = null;
+        state.SequenceCheckpointConsumed = false;
+        state.PendingSequencePlan = null;
         var torVentReady = hasTorRole && TorRoleAdapter.CanUseVents(bot, torRole);
         if ((hasTorRole && !TorRoleAdapter.IsAbilityReady(bot, torRole) && !torVentReady) ||
             (!hasTorRole && IsRoleCoolingDown(bot.Data.Role)))
@@ -110,6 +201,13 @@ internal sealed class BotAbilityDirector
             return;
         }
 
+        if (Time.time < _nextGlobalLlmRequestAt)
+        {
+            state.NextAbilityAt = _nextGlobalLlmRequestAt + UnityEngine.Random.Range(0.05f, 0.35f);
+            return;
+        }
+
+        _nextGlobalLlmRequestAt = Time.time + Mathf.Clamp(config.AbilityRequestSpacingSeconds.Value, 0.35f, 5f);
         state.DecisionInFlight = true;
         state.RequestedRole = bot.Data.RoleType;
         state.RequestedTorRole = hasTorRole ? torRole.Name : null;
@@ -144,9 +242,87 @@ internal sealed class BotAbilityDirector
         });
     }
 
+    private bool TryQueueSequenceCheckpoint(
+        PlayerControl bot,
+        AbilityState state,
+        PluginConfig config,
+        TorRoleInfo role,
+        TorAbilitySequencePlan plan)
+    {
+        if (!RequiresLlmSequenceCheckpoint(role.Name, plan.AbilityAction))
+        {
+            return false;
+        }
+
+        var checkpointKey = BuildSequenceCheckpointKey(role.Name, plan);
+        if (!string.Equals(state.SequenceCheckpointKey, checkpointKey, StringComparison.Ordinal))
+        {
+            state.SequenceCheckpointKey = checkpointKey;
+            state.SequenceCheckpointConsumed = false;
+        }
+
+        if (state.SequenceCheckpointConsumed)
+        {
+            return false;
+        }
+
+        if (Time.time < _nextGlobalLlmRequestAt)
+        {
+            state.NextAbilityAt = _nextGlobalLlmRequestAt + UnityEngine.Random.Range(0.05f, 0.30f);
+            return true;
+        }
+
+        _nextGlobalLlmRequestAt = Time.time + Mathf.Clamp(config.AbilityRequestSpacingSeconds.Value, 0.35f, 5f);
+        state.DecisionInFlight = true;
+        state.RequestedRole = bot.Data.RoleType;
+        state.RequestedTorRole = role.Name;
+        state.PendingSequencePlan = plan;
+        state.AbilityRoleCursor++;
+        var prompt = BuildAbilityPrompt(bot, role, plan);
+        _log.LogInfo(
+            $"DeepBot multi-stage ability checkpoint queued: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+            $"role={role.Name}, action={plan.AbilityAction}, target={plan.TargetPlayerId?.ToString() ?? "none"}, " +
+            $"reason={plan.Reason}.");
+        _ = System.Threading.Tasks.Task.Run(async () =>
+        {
+            BotAbilityDecision? decision = null;
+            try
+            {
+                decision = await _deepSeek
+                    .GetAbilityDecisionAsync(prompt, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(
+                    $"DeepBot multi-stage ability checkpoint failed: bot={prompt.BotName}({prompt.BotId}), error={ex.Message}");
+            }
+            finally
+            {
+                state.PendingDecision = decision;
+                state.DecisionCompleted = true;
+                state.DecisionInFlight = false;
+            }
+        });
+        return true;
+    }
+
+    private static bool RequiresLlmSequenceCheckpoint(string roleName, string requiredAction)
+    {
+        return LlmSequenceCheckpointRoles.Contains(roleName) &&
+               requiredAction is "role" or "vent";
+    }
+
+    private static string BuildSequenceCheckpointKey(string roleName, TorAbilitySequencePlan plan)
+    {
+        return $"{roleName}|{plan.AbilityAction}|{plan.TargetPlayerId?.ToString() ?? "none"}|{plan.Reason}";
+    }
+
     private void ApplyAbilityDecision(PlayerControl bot, AbilityState state)
     {
         state.DecisionCompleted = false;
+        var requestedSequencePlan = state.PendingSequencePlan;
+        state.PendingSequencePlan = null;
         var torRole = default(TorRoleInfo);
         var hasTorRole = !string.IsNullOrWhiteSpace(state.RequestedTorRole) &&
                          TorRoleAdapter.TryGetAbilityRole(bot, state.RequestedTorRole!, out torRole);
@@ -154,6 +330,8 @@ internal sealed class BotAbilityDirector
         if (!string.Equals(state.RequestedTorRole, currentTorRole, StringComparison.Ordinal))
         {
             state.PendingDecision = null;
+            state.SequenceCheckpointKey = null;
+            state.SequenceCheckpointConsumed = false;
             state.RequestedTorRole = null;
             state.RequestedRole = null;
             state.NextAbilityAt = Time.time + 4f;
@@ -166,6 +344,8 @@ internal sealed class BotAbilityDirector
         if (state.RequestedRole.HasValue && state.RequestedRole.Value != bot.Data.RoleType)
         {
             state.PendingDecision = null;
+            state.SequenceCheckpointKey = null;
+            state.SequenceCheckpointConsumed = false;
             state.RequestedTorRole = null;
             state.RequestedRole = null;
             state.NextAbilityAt = Time.time + 4f;
@@ -175,12 +355,41 @@ internal sealed class BotAbilityDirector
             return;
         }
 
+        if (requestedSequencePlan.HasValue &&
+            (!hasTorRole ||
+             !TorRoleAdapter.TryGetAbilitySequencePlan(bot, torRole, out var liveSequencePlan) ||
+             !liveSequencePlan.Active ||
+             !liveSequencePlan.ShouldUse ||
+             !string.Equals(
+                 BuildSequenceCheckpointKey(torRole.Name, liveSequencePlan),
+                 state.SequenceCheckpointKey,
+                 StringComparison.Ordinal)))
+        {
+            state.PendingDecision = null;
+            state.RequestedTorRole = null;
+            state.RequestedRole = null;
+            state.SequenceCheckpointKey = null;
+            state.SequenceCheckpointConsumed = false;
+            state.NextAbilityAt = Time.time + 0.75f;
+            _log.LogInfo(
+                $"DeepBot discarded stale multi-stage checkpoint: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+                $"role={(hasTorRole ? torRole.Name : "changed")}, reason=native sequence stage changed while model was thinking.");
+            return;
+        }
+
         state.RequestedTorRole = null;
         state.RequestedRole = null;
-        var decision = state.PendingDecision ?? BuildStrategicFallback(bot, hasTorRole ? torRole : null);
+        var modelDecision = state.PendingDecision;
+        var decision = modelDecision ??
+                       (requestedSequencePlan.HasValue
+                           ? BuildSequenceCheckpointFallback(requestedSequencePlan.Value)
+                           : BuildStrategicFallback(bot, hasTorRole ? torRole : null));
         state.PendingDecision = null;
         var torVentReady = hasTorRole && TorRoleAdapter.CanUseVents(bot, torRole);
-        if ((hasTorRole && !TorRoleAdapter.IsAbilityReady(bot, torRole) && !torVentReady) ||
+        var torSequenceReady = hasTorRole &&
+                               TorRoleAdapter.TryGetAbilitySequencePlan(bot, torRole, out var currentSequence) &&
+                               currentSequence.ShouldUse;
+        if ((hasTorRole && !TorRoleAdapter.IsAbilityReady(bot, torRole) && !torVentReady && !torSequenceReady) ||
             (!hasTorRole && IsRoleCoolingDown(bot.Data.Role)))
         {
             state.NextAbilityAt = Time.time + 3f;
@@ -190,17 +399,43 @@ internal sealed class BotAbilityDirector
             return;
         }
 
-        if (!decision.Use || decision.Confidence < 0.52f)
+        if (hasTorRole)
+        {
+            if (requestedSequencePlan.HasValue)
+            {
+                decision = ConstrainSequenceCheckpointDecision(
+                    bot,
+                    torRole,
+                    requestedSequencePlan.Value,
+                    decision);
+                state.SequenceCheckpointConsumed = true;
+                _log.LogInfo(
+                    $"DeepBot multi-stage ability checkpoint applied: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+                    $"role={torRole.Name}, source={(modelDecision is null ? "safe-fallback" : "llm")}, " +
+                    $"action={NormalizeAbilityAction(decision.AbilityAction)}, " +
+                    $"target={decision.TargetPlayerId?.ToString() ?? "none"}, use={decision.Use}, " +
+                    $"reason={decision.Reason}.");
+            }
+
+            decision = ApplyObjectiveCriticalOverride(bot, torRole, decision);
+        }
+
+        var abilityAction = NormalizeAbilityAction(decision.AbilityAction);
+        if (!decision.Use || abilityAction == "hold" || decision.Confidence < 0.52f)
         {
             var urgentBodyReview = hasTorRole &&
                                    torRole.Name == "Vulture" &&
                                    TorRoleAdapter.FindVisibleUsableBody(bot);
-            state.NextAbilityAt = Time.time + (urgentBodyReview
-                ? UnityEngine.Random.Range(2.5f, 4f)
-                : UnityEngine.Random.Range(7f, 12f));
+            var plannedRecheck = Mathf.Clamp(
+                decision.RecheckSeconds ?? (urgentBodyReview ? UnityEngine.Random.Range(2.5f, 4f) : UnityEngine.Random.Range(7f, 12f)),
+                urgentBodyReview ? 1.5f : 2f,
+                urgentBodyReview ? 4f : 12f);
+            state.NextAbilityAt = Time.time + plannedRecheck;
             _log.LogInfo(
                 $"DeepBot ability held for strategy: bot={bot.Data?.PlayerName}, role={(hasTorRole ? torRole.Name : bot.Data?.RoleType.ToString())}, " +
-                $"confidence={decision.Confidence:0.00}, urgentBodyReview={urgentBodyReview}, reason={decision.Reason ?? "no useful purpose"}.");
+                $"confidence={decision.Confidence:0.00}, urgentBodyReview={urgentBodyReview}, recheck={plannedRecheck:0.0}s, " +
+                $"goal={decision.PlanGoal ?? "none"}, next={decision.NextStage ?? "none"}, " +
+                $"abort={decision.AbortCondition ?? "none"}, reason={decision.Reason ?? "no useful purpose"}.");
             if (hasTorRole && torRole.Name == "Arsonist" && !TorRoleAdapter.IsArsonistReadyToIgnite(bot))
             {
                 _actions.TryRouteToRoleSearch(bot, torRole.Name);
@@ -214,14 +449,13 @@ internal sealed class BotAbilityDirector
         _memory.RecordAction(
             bot,
             "ability_plan",
-            $"role={(hasTorRole ? torRole.Name : bot.Data?.RoleType.ToString())}, target={targetId?.ToString() ?? "none"}, reason={decision.Reason}, confidence={decision.Confidence:0.00}");
+            $"role={(hasTorRole ? torRole.Name : bot.Data?.RoleType.ToString())}, target={targetId?.ToString() ?? "none"}, " +
+            $"goal={decision.PlanGoal ?? "none"}, next={decision.NextStage ?? "none"}, abort={decision.AbortCondition ?? "none"}, " +
+            $"reason={decision.Reason}, confidence={decision.Confidence:0.00}");
         _log.LogInfo(
             $"DeepBot ability brain approved: bot={bot.Data?.PlayerName}, role={(hasTorRole ? torRole.Name : bot.Data?.RoleType.ToString())}, " +
             $"target={targetId?.ToString() ?? "none"}, confidence={decision.Confidence:0.00}, reason={decision.Reason}.");
 
-        var abilityAction = string.IsNullOrWhiteSpace(decision.AbilityAction)
-            ? "role"
-            : decision.AbilityAction.Trim().ToLowerInvariant();
         if (abilityAction == "vent")
         {
             var canVent = hasTorRole
@@ -229,7 +463,12 @@ internal sealed class BotAbilityDirector
                 : bot.Data?.Role?.CanVent == true;
             if (canVent)
             {
-                TryUseOrRouteVent(bot, state, hasTorRole ? torRole.Name : bot.Data?.RoleType.ToString() ?? "unknown");
+                var ambushTargetId = targetId ?? TryGetRecentVentAmbushTarget(bot)?.PlayerId;
+                TryUseOrRouteVent(
+                    bot,
+                    state,
+                    hasTorRole ? torRole.Name : bot.Data?.RoleType.ToString() ?? "unknown",
+                    ambushTargetId);
             }
             else
             {
@@ -239,8 +478,109 @@ internal sealed class BotAbilityDirector
             return;
         }
 
+        if (hasTorRole && abilityAction == "evade")
+        {
+            if (TorRoleAdapter.TryGetAbilityEscapeDestination(
+                    bot,
+                    torRole,
+                    out var escapePosition,
+                    out var escapeStage,
+                    out var escapeArrivalDistance))
+            {
+                var routed = _actions.TryRouteToRoleEscape(
+                    bot,
+                    escapePosition,
+                    $"ABILITY_ESCAPE_{torRole.Name.ToUpperInvariant()}_{escapeStage}",
+                    escapeArrivalDistance);
+                state.NextAbilityAt = Time.time + (routed ? 1.0f : 2.5f);
+                _memory.RecordAction(
+                    bot,
+                    "ability_escape",
+                    $"role={torRole.Name}; stage={escapeStage}; routed={routed}; reason={decision.Reason}");
+                _log.LogInfo(
+                    $"DeepBot multi-stage ability escape: bot={bot.Data?.PlayerName}, role={torRole.Name}, " +
+                    $"stage={escapeStage}, routed={routed}.");
+            }
+            else
+            {
+                state.NextAbilityAt = Time.time + 1.5f;
+            }
+            return;
+        }
+
         if (hasTorRole)
         {
+            if (abilityAction is "role" or "cover" &&
+                TorRoleAdapter.TryGetAbilityStagingDestination(
+                    bot,
+                    torRole,
+                    out var stagingPosition,
+                    out var stagingLabel,
+                    out var stagingArrivalDistance))
+            {
+                var stagingPhase = stagingLabel.Split(':')[0];
+                var stagingKey = $"{torRole.Name}:{stagingPhase}";
+                if (string.Equals(state.TorStagingKey, stagingKey, StringComparison.Ordinal) &&
+                    state.TorStagingPosition.HasValue &&
+                    SkeldPathGraph.Instance.FindTopRoutes(
+                        bot.GetTruePosition(),
+                        state.TorStagingPosition.Value,
+                        1).Count > 0)
+                {
+                    stagingPosition = state.TorStagingPosition.Value;
+                    stagingLabel = state.TorStagingLabel ?? stagingLabel;
+                    stagingArrivalDistance = state.TorStagingArrivalDistance;
+                }
+                else
+                {
+                    state.TorStagingKey = stagingKey;
+                    state.TorStagingPosition = stagingPosition;
+                    state.TorStagingLabel = stagingLabel;
+                    state.TorStagingArrivalDistance = stagingArrivalDistance;
+                    _log.LogInfo(
+                        $"DeepBot multi-stage target locked: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+                        $"role={torRole.Name}, phase={stagingPhase}, target={stagingLabel}@{stagingPosition}.");
+                }
+
+                var stagingDistance = Vector2.Distance(bot.GetTruePosition(), stagingPosition);
+                var stagingBlocked = PhysicsHelpers.AnythingBetween(
+                    bot.GetTruePosition(),
+                    stagingPosition,
+                    Constants.ShipOnlyMask,
+                    false);
+                if (stagingDistance > stagingArrivalDistance || stagingBlocked)
+                {
+                    var routed = _actions.TryRouteToRoleAbility(
+                        bot,
+                        stagingPosition,
+                        $"ABILITY_STAGE_{torRole.Name.ToUpperInvariant()}_{stagingLabel}",
+                        stagingArrivalDistance);
+                    state.NextAbilityAt = Time.time + (routed ? 0.8f : 2.5f);
+                    _memory.RecordAction(
+                        bot,
+                        "ability_stage",
+                        $"role={torRole.Name}; stage={stagingLabel}; distance={stagingDistance:0.0}; routed={routed}");
+                    _log.LogInfo(
+                        $"DeepBot multi-stage ability route: bot={bot.Data?.PlayerName}, role={torRole.Name}, " +
+                        $"stage={stagingLabel}, distance={stagingDistance:0.0}, routed={routed}.");
+                    return;
+                }
+
+                if (abilityAction == "cover")
+                {
+                    _actions.CompleteRoleAbilityRoute(bot, $"{torRole.Name}-cover-position-reached");
+                    state.NextAbilityAt = Time.time + 2.5f;
+                    _memory.RecordAction(bot, "ability_cover", $"role={torRole.Name}; stage={stagingLabel}; position reached");
+                    return;
+                }
+            }
+
+            if (abilityAction == "cover")
+            {
+                state.NextAbilityAt = Time.time + 2.5f;
+                return;
+            }
+
             if (torRole.Name is "Sheriff" or "Deputy")
             {
                 var requiredConfidence = torRole.Name == "Sheriff" ? 0.78f : 0.62f;
@@ -255,7 +595,7 @@ internal sealed class BotAbilityDirector
                 }
             }
 
-            if (torRole.Name == "Vulture" &&
+            if (torRole.Name is "Vulture" or "Cleaner" or "Janitor" &&
                 !TorRoleAdapter.HasNearbyUsableBody(bot) &&
                 TorRoleAdapter.FindVisibleUsableBody(bot) is { } visibleBody)
             {
@@ -268,9 +608,9 @@ internal sealed class BotAbilityDirector
                 _memory.RecordAction(
                     bot,
                     "ability_route",
-                    $"Vulture prioritized visible body playerId={visibleBody.ParentId} before report; llmReason={decision.Reason}");
+                    $"{torRole.Name} prioritized visible body playerId={visibleBody.ParentId}; llmReason={decision.Reason}");
                 _log.LogInfo(
-                    $"DeepBot Vulture body route approved by LLM: bot={bot.Data?.PlayerName}, victim={visibleBody.ParentId}, routed={routed}.");
+                    $"DeepBot {torRole.Name} body route approved: bot={bot.Data?.PlayerName}, victim={visibleBody.ParentId}, routed={routed}.");
                 return;
             }
 
@@ -288,15 +628,16 @@ internal sealed class BotAbilityDirector
                 return;
             }
 
-            if (targetId.HasValue && FindPlayer(targetId.Value) is { } roleTarget && roleTarget && roleTarget.Data is not null &&
-                !roleTarget.Data.IsDead && !roleTarget.Data.Disconnected)
+            if (TorRoleAdapter.CurrentAbilityStageRequiresCasterProximity(bot, torRole) &&
+                targetId.HasValue && FindPlayer(targetId.Value) is { } roleTarget && roleTarget && roleTarget.Data is not null &&
+                BotPerceptionPolicy.CanBeOrdinarilyObserved(roleTarget))
             {
                 var useRange = TorRoleAdapter.GetAbilityUseRange(torRole.Name);
                 var distance = Vector2.Distance(bot.GetTruePosition(), roleTarget.GetTruePosition());
                 var blocked = PhysicsHelpers.AnythingBetween(
                     bot.GetTruePosition(),
                     roleTarget.GetTruePosition(),
-                    Constants.ShipAndObjectsMask,
+                    Constants.ShipOnlyMask,
                     false);
                 if (distance > useRange * 0.85f || blocked)
                 {
@@ -320,7 +661,11 @@ internal sealed class BotAbilityDirector
 
             if (TorRoleAdapter.TryUseAbility(bot, torRole, targetId, out var outcome))
             {
-                TorRoleAdapter.RegisterConfiguredCooldown(bot, torRole);
+                state.ClearTorStagingTarget();
+                if (!TorRoleAdapter.IsAbilitySequencePending(bot, torRole))
+                {
+                    TorRoleAdapter.RegisterConfiguredCooldown(bot, torRole);
+                }
                 state.NextAbilityAt = Time.time + 0.75f;
                 _memory.RecordAction(bot, "ability", $"TOR {torRole.Name}: {outcome}");
                 _log.LogInfo(
@@ -354,13 +699,13 @@ internal sealed class BotAbilityDirector
                 TryUsePhantom(bot, state);
                 break;
             case RoleTypes.Shapeshifter:
-                TryUseTargetedAbility(bot, state, "shapeshift", targetId);
+                StartShapeshifterSequence(bot, state, targetId);
                 break;
             case RoleTypes.Detective:
                 TryUseTargetedAbility(bot, state, "detective-interrogate", targetId);
                 break;
             default:
-                if (bot.Data.Role.CanVent && bot.Data.Role.IsImpostor)
+                if (bot.Data.Role.CanVent && TorRoleAdapter.IsImpostorTeam(bot))
                 {
                     TryUseImpostorVent(bot, state);
                 }
@@ -370,6 +715,71 @@ internal sealed class BotAbilityDirector
                 }
                 break;
         }
+    }
+
+    private static BotAbilityDecision BuildSequenceCheckpointFallback(TorAbilitySequencePlan plan)
+    {
+        return new BotAbilityDecision(
+            plan.ShouldUse,
+            plan.TargetPlayerId,
+            $"ability API unavailable; safely continue TOR's validated sequence stage: {plan.Reason}",
+            plan.Confidence,
+            plan.AbilityAction,
+            "complete the current native multi-stage ability",
+            plan.Reason,
+            "abort if TOR no longer reports this stage as legal",
+            plan.RecheckSeconds);
+    }
+
+    private static BotAbilityDecision ConstrainSequenceCheckpointDecision(
+        PlayerControl bot,
+        TorRoleInfo role,
+        TorAbilitySequencePlan plan,
+        BotAbilityDecision decision)
+    {
+        var action = NormalizeAbilityAction(decision.AbilityAction);
+        var canVent = TorRoleAdapter.CanUseVents(bot, role);
+        if (!decision.Use || action == "hold")
+        {
+            return decision with
+            {
+                TargetPlayerId = plan.TargetPlayerId,
+                AbilityAction = "hold",
+                RecheckSeconds = Mathf.Clamp(decision.RecheckSeconds ?? plan.RecheckSeconds, 0.5f, 4f)
+            };
+        }
+
+        if (!IsAllowedSequenceCheckpointAction(plan.AbilityAction, action, canVent))
+        {
+            return decision with
+            {
+                Use = false,
+                TargetPlayerId = plan.TargetPlayerId,
+                AbilityAction = "hold",
+                Reason = $"model proposed illegal sequence action={action}; native stage requires={plan.AbilityAction}",
+                Confidence = Mathf.Min(decision.Confidence, 0.50f),
+                RecheckSeconds = 1f
+            };
+        }
+
+        // The model may choose timing, cover, evasion, or a legal vent detour,
+        // but it cannot silently replace the target fixed by TOR's current
+        // sequence stage (sampled identity, marked victim, curse target, etc.).
+        return decision with
+        {
+            TargetPlayerId = plan.TargetPlayerId,
+            AbilityAction = action
+        };
+    }
+
+    private static bool IsAllowedSequenceCheckpointAction(
+        string requiredAction,
+        string proposedAction,
+        bool canVent)
+    {
+        return proposedAction == requiredAction ||
+               proposedAction is "hold" or "cover" or "evade" ||
+               proposedAction == "vent" && canVent;
     }
 
     private void TryUseScientistVitals(PlayerControl bot, AbilityState state)
@@ -422,7 +832,9 @@ internal sealed class BotAbilityDirector
             }
             engineer.SetCooldown();
             _actions.CompleteRoleAbilityRoute(bot, $"engineer-entered-vent-{vent.Id}");
-            state.ActiveVentId = vent.Id;
+            BeginVentEntryTracking(bot, state, vent.Id, "Engineer");
+            state.VentAmbushTargetId = null;
+            state.MinimumVentHoldUntil = Time.time + 0.8f;
             state.ExitVentAt = Time.time + UnityEngine.Random.Range(2.5f, 5f);
             state.NextAbilityAt = Time.time + UnityEngine.Random.Range(22f, 38f);
             _memory.RecordAction(bot, "ability", $"engineer entered vent {vent.Id}");
@@ -450,7 +862,9 @@ internal sealed class BotAbilityDirector
         {
             bot.MyPhysics.RpcEnterVent(vent.Id);
             _actions.CompleteRoleAbilityRoute(bot, $"impostor-entered-vent-{vent.Id}");
-            state.ActiveVentId = vent.Id;
+            BeginVentEntryTracking(bot, state, vent.Id, bot.Data.RoleType.ToString());
+            state.VentAmbushTargetId = null;
+            state.MinimumVentHoldUntil = Time.time + 1.2f;
             state.ExitVentAt = Time.time + UnityEngine.Random.Range(2f, 4.5f);
             state.NextAbilityAt = Time.time + UnityEngine.Random.Range(25f, 45f);
             _memory.RecordAction(bot, "ability", $"impostor entered vent {vent.Id}");
@@ -478,8 +892,256 @@ internal sealed class BotAbilityDirector
         finally
         {
             state.ActiveVentId = null;
+            state.VentAmbushTargetId = null;
+            state.MinimumVentHoldUntil = 0f;
             state.ExitVentAt = 0f;
         }
+    }
+
+    private void StartShapeshifterSequence(PlayerControl bot, AbilityState state, byte? requestedTargetId)
+    {
+        var target = requestedTargetId.HasValue
+            ? FindPlayer(requestedTargetId.Value)
+            : FindAbilityTarget(bot, impostor: true);
+        if (!IsLegalShapeshiftIdentity(bot, target))
+        {
+            state.NextAbilityAt = Time.time + 4f;
+            _log.LogInfo(
+                $"DeepBot Shapeshifter plan held: bot={bot.Data?.PlayerName}, " +
+                $"requestedTarget={requestedTargetId?.ToString() ?? "none"}, reason=identity target unavailable or allied.");
+            return;
+        }
+
+        var staging = PickShapeshiftStagingPosition(bot, null);
+        if (!staging.HasValue)
+        {
+            state.NextAbilityAt = Time.time + 3f;
+            _log.LogInfo($"DeepBot Shapeshifter plan held: bot={bot.Data?.PlayerName}, reason=no reachable concealed staging node.");
+            return;
+        }
+
+        state.PendingShapeshiftTargetId = target!.PlayerId;
+        state.PendingShapeshiftStagePosition = staging;
+        state.ShapeshiftStageAttempts = 0;
+        state.NextAbilityAt = Time.time + 0.5f;
+        var routed = _actions.TryRouteToRoleAbility(
+            bot,
+            staging.Value,
+            $"ABILITY_STAGE_SHAPESHIFTER_{target.PlayerId}",
+            0.85f);
+        _memory.RecordAction(
+            bot,
+            "ability_stage",
+            $"Shapeshifter selected identity={target.Data?.PlayerName}({target.PlayerId}); routedToConcealment={routed}");
+        _log.LogInfo(
+            $"DeepBot Shapeshifter multi-stage plan started: bot={bot.Data?.PlayerName}, " +
+            $"identity={target.Data?.PlayerName}({target.PlayerId}), stage={staging.Value}, routed={routed}.");
+    }
+
+    private void ContinueShapeshifterSequence(PlayerControl bot, AbilityState state)
+    {
+        var shapeshifter = bot.Data?.Role?.TryCast<ShapeshifterRole>();
+        var target = state.PendingShapeshiftTargetId.HasValue
+            ? FindPlayer(state.PendingShapeshiftTargetId.Value)
+            : null;
+        if (shapeshifter is null || !IsLegalShapeshiftIdentity(bot, target))
+        {
+            ClearShapeshifterSequence(state);
+            state.NextAbilityAt = Time.time + 4f;
+            _log.LogInfo($"DeepBot Shapeshifter sequence cancelled: bot={bot.Data?.PlayerName}, reason=role or identity target changed.");
+            return;
+        }
+
+        if (shapeshifter.IsCoolingDown || shapeshifter.durationSecondsRemaining > 0.05f)
+        {
+            ClearShapeshifterSequence(state);
+            state.NextAbilityAt = Time.time + 2f;
+            return;
+        }
+
+        var staging = state.PendingShapeshiftStagePosition ?? PickShapeshiftStagingPosition(bot, null);
+        if (!staging.HasValue)
+        {
+            ClearShapeshifterSequence(state);
+            state.NextAbilityAt = Time.time + 3f;
+            return;
+        }
+
+        state.PendingShapeshiftStagePosition = staging;
+        var distance = Vector2.Distance(bot.GetTruePosition(), staging.Value);
+        var blocked = PhysicsHelpers.AnythingBetween(
+            bot.GetTruePosition(),
+            staging.Value,
+            Constants.ShipOnlyMask,
+            false);
+        if (distance > 0.95f || blocked)
+        {
+            var routed = _actions.TryRouteToRoleAbility(
+                bot,
+                staging.Value,
+                $"ABILITY_STAGE_SHAPESHIFTER_{target!.PlayerId}",
+                0.85f);
+            state.NextAbilityAt = Time.time + (routed ? 0.55f : 1.5f);
+            return;
+        }
+
+        var witnesses = CountPlayersWhoCanSee(bot);
+        if (witnesses > 0)
+        {
+            var nextStage = PickShapeshiftStagingPosition(bot, staging);
+            state.PendingShapeshiftStagePosition = nextStage;
+            state.ShapeshiftStageAttempts++;
+            state.NextAbilityAt = Time.time + (nextStage.HasValue ? 0.6f : 1.5f);
+            if (nextStage.HasValue)
+            {
+                _actions.TryRouteToRoleAbility(
+                    bot,
+                    nextStage.Value,
+                    $"ABILITY_RESTAGE_SHAPESHIFTER_{target!.PlayerId}_{state.ShapeshiftStageAttempts}",
+                    0.85f);
+            }
+            _log.LogInfo(
+                $"DeepBot Shapeshifter concealment recheck: bot={bot.Data?.PlayerName}, witnesses={witnesses}, " +
+                $"restage={nextStage?.ToString() ?? "none"}, attempts={state.ShapeshiftStageAttempts}.");
+            return;
+        }
+
+        try
+        {
+            _actions.CompleteRoleAbilityRoute(bot, "Shapeshifter-concealment-reached");
+            shapeshifter.SetPlayerTarget(target);
+            shapeshifter.UseAbility();
+            _memory.RecordAction(
+                bot,
+                "ability",
+                $"Shapeshifter transformed into {target!.Data?.PlayerName}({target.PlayerId}) after concealed staging");
+            _log.LogInfo(
+                $"DeepBot Shapeshifter sequence completed: bot={bot.Data?.PlayerName}, " +
+                $"identity={target.Data?.PlayerName}({target.PlayerId}), witnesses=0.");
+            ClearShapeshifterSequence(state);
+            state.NextAbilityAt = Time.time + 2f;
+        }
+        catch (Exception ex)
+        {
+            ClearShapeshifterSequence(state);
+            state.NextAbilityAt = Time.time + 4f;
+            _log.LogWarning($"DeepBot Shapeshifter transform failed: bot={bot.Data?.PlayerName}, error={ex.Message}");
+        }
+    }
+
+    private static bool IsLegalShapeshiftIdentity(PlayerControl bot, PlayerControl? target)
+    {
+        return target &&
+               target!.PlayerId != bot.PlayerId &&
+               target.Data is not null &&
+               !target.Data.IsDead &&
+               !target.Data.Disconnected &&
+               !TorRoleAdapter.IsImpostorTeam(target);
+    }
+
+    private static int CountPlayersWhoCanSee(PlayerControl subject)
+    {
+        var subjectPosition = subject.GetTruePosition();
+        return EnumerateLivingPlayers().Count(observer =>
+            observer.PlayerId != subject.PlayerId &&
+            !BotPerceptionPolicy.IsConcealedByVent(observer) &&
+            Vector2.Distance(observer.GetTruePosition(), subjectPosition) <= BotPerceptionPolicy.GetCurrentVisionDistance(observer) &&
+            !PhysicsHelpers.AnythingBetween(
+                observer.GetTruePosition(),
+                subjectPosition,
+                Constants.ShipOnlyMask,
+                false));
+    }
+
+    private static Vector2? PickShapeshiftStagingPosition(PlayerControl bot, Vector2? excluded)
+    {
+        var botPosition = bot.GetTruePosition();
+        var observers = EnumerateLivingPlayers()
+            .Where(player => player.PlayerId != bot.PlayerId)
+            .ToArray();
+        var candidates = SkeldPathGraph.Instance.Nodes
+            .Where(node => node.Kind is NodeKind.Corner or NodeKind.Landmark)
+            .Where(node => !excluded.HasValue || Vector2.Distance(node.Position, excluded.Value) >= 2.5f)
+            .Select(node => new
+            {
+                Node = node,
+                Travel = Vector2.Distance(botPosition, node.Position),
+                NearestObserver = observers.Length == 0
+                    ? 12f
+                    : observers.Min(observer => Vector2.Distance(observer.GetTruePosition(), node.Position)),
+                OcclusionRatio = observers.Length == 0
+                    ? 1f
+                    : observers.Count(observer => PhysicsHelpers.AnythingBetween(
+                        observer.GetTruePosition(),
+                        node.Position,
+                        Constants.ShipOnlyMask,
+                        false)) / (float)observers.Length
+            })
+            .Where(item => item.Travel is >= 1.25f and <= 14f)
+            .Where(item => SkeldPathGraph.Instance.FindTopRoutes(botPosition, item.Node.Id, 1).Count > 0)
+            .OrderByDescending(item => ScoreShapeshiftStageCandidate(item.NearestObserver, item.Travel, item.OcclusionRatio))
+            .ThenBy(item => item.Node.Id, StringComparer.Ordinal)
+            .Take(4)
+            .ToArray();
+        if (candidates.Length == 0)
+        {
+            return null;
+        }
+
+        var index = (bot.PlayerId + Mathf.FloorToInt(Time.time / 7f)) % candidates.Length;
+        return candidates[index].Node.Position;
+    }
+
+    private static float ScoreShapeshiftStageCandidate(float nearestObserverDistance, float travelDistance, float occlusionRatio)
+    {
+        return Mathf.Clamp(nearestObserverDistance, 0f, 12f) * 1.6f +
+               Mathf.Clamp01(occlusionRatio) * 5f -
+               Mathf.Max(0f, travelDistance) * 0.28f;
+    }
+
+    private static void ClearShapeshifterSequence(AbilityState state)
+    {
+        state.PendingShapeshiftTargetId = null;
+        state.PendingShapeshiftStagePosition = null;
+        state.ShapeshiftStageAttempts = 0;
+    }
+
+    internal static void LogSelfTest(ManualLogSource log)
+    {
+        var multiStageActionsPreserved =
+            NormalizeAbilityAction("role") == "role" &&
+            NormalizeAbilityAction("vent") == "vent" &&
+            NormalizeAbilityAction("hold") == "hold" &&
+            NormalizeAbilityAction("cover") == "cover" &&
+            NormalizeAbilityAction("evade") == "evade" &&
+            NormalizeAbilityAction("unexpected") == "hold";
+        var concealedStageScoresHigher =
+            ScoreShapeshiftStageCandidate(9f, 6f, 1f) >
+            ScoreShapeshiftStageCandidate(3f, 3f, 0f);
+        var llmSequenceCheckpointGuard =
+            RequiresLlmSequenceCheckpoint("Morphling", "role") &&
+            RequiresLlmSequenceCheckpoint("Trickster", "vent") &&
+            !RequiresLlmSequenceCheckpoint("Vampire", "evade") &&
+            IsAllowedSequenceCheckpointAction("role", "role", false) &&
+            IsAllowedSequenceCheckpointAction("role", "cover", false) &&
+            !IsAllowedSequenceCheckpointAction("role", "vent", false) &&
+            IsAllowedSequenceCheckpointAction("role", "vent", true) &&
+            !IsAllowedSequenceCheckpointAction("role", "unexpected", true);
+        log.LogInfo(
+            $"DeepBot ability sequence self-test: level={(concealedStageScoresHigher && multiStageActionsPreserved && llmSequenceCheckpointGuard ? "ok" : "error")}, " +
+            $"shapeshifterConcealmentScoring={concealedStageScoresHigher}, " +
+            $"multiStageActionsPreserved={multiStageActionsPreserved}, " +
+            $"llmSequenceCheckpointGuard={llmSequenceCheckpointGuard}.");
+    }
+
+    private static string NormalizeAbilityAction(string? action)
+    {
+        var normalized = string.IsNullOrWhiteSpace(action)
+            ? "role"
+            : action.Trim().ToLowerInvariant();
+        return normalized is "role" or "vent" or "hold" or "cover" or "evade"
+            ? normalized
+            : "hold";
     }
 
     private void TryUseTargetedAbility(
@@ -491,7 +1153,7 @@ internal sealed class BotAbilityDirector
         var role = bot.Data.Role;
         var target = requestedTargetId.HasValue
             ? FindPlayer(requestedTargetId.Value)
-            : FindAbilityTarget(bot, role.IsImpostor);
+            : FindAbilityTarget(bot, TorRoleAdapter.IsImpostorTeam(bot));
         if (target is null)
         {
             state.NextAbilityAt = Time.time + 6f;
@@ -503,10 +1165,8 @@ internal sealed class BotAbilityDirector
 
         var distance = Vector2.Distance(bot.GetTruePosition(), target.GetTruePosition());
         if (distance > 3.5f ||
-            target.Data is null ||
-            target.Data.IsDead ||
-            target.Data.Disconnected ||
-            (role.IsImpostor && target.Data.Role is not null && target.Data.Role.IsImpostor))
+            !BotPerceptionPolicy.CanBeOrdinarilyObserved(target) ||
+            (TorRoleAdapter.IsImpostorTeam(bot) && TorRoleAdapter.IsImpostorTeam(target)))
         {
             state.NextAbilityAt = Time.time + 6f;
             _log.LogInfo(
@@ -542,8 +1202,14 @@ internal sealed class BotAbilityDirector
         var nearbyCrew = EnumerateLivingPlayers()
             .Any(player =>
                 player.PlayerId != bot.PlayerId &&
-                !player.Data.Role.IsImpostor &&
-                Vector2.Distance(bot.GetTruePosition(), player.GetTruePosition()) <= 4.5f);
+                BotPerceptionPolicy.CanBeOrdinarilyObserved(player) &&
+                !TorRoleAdapter.IsImpostorTeam(player) &&
+                Vector2.Distance(bot.GetTruePosition(), player.GetTruePosition()) <= 4.5f &&
+                !PhysicsHelpers.AnythingBetween(
+                    bot.GetTruePosition(),
+                    player.GetTruePosition(),
+                    Constants.ShipAndObjectsMask,
+                    false));
         if (!nearbyCrew)
         {
             state.NextAbilityAt = Time.time + 2f;
@@ -564,13 +1230,17 @@ internal sealed class BotAbilityDirector
         }
     }
 
-    private BotAbilityPrompt BuildAbilityPrompt(PlayerControl bot, TorRoleInfo? selectedTorRole = null)
+    private BotAbilityPrompt BuildAbilityPrompt(
+        PlayerControl bot,
+        TorRoleInfo? selectedTorRole = null,
+        TorAbilitySequencePlan? sequenceCheckpoint = null)
     {
         var hasTorRole = selectedTorRole.HasValue;
         var torRole = selectedTorRole.GetValueOrDefault();
         var position = bot.GetTruePosition();
         var visible = EnumerateLivingPlayers()
             .Where(player => player.PlayerId != bot.PlayerId)
+            .Where(BotPerceptionPolicy.CanBeOrdinarilyObserved)
             .Select(player => new
             {
                 Player = player,
@@ -578,14 +1248,14 @@ internal sealed class BotAbilityDirector
                 Blocked = PhysicsHelpers.AnythingBetween(
                     position,
                     player.GetTruePosition(),
-                    Constants.ShipAndObjectsMask,
+                    Constants.ShipOnlyMask,
                     false)
             })
             .Where(item => item.Distance <= 6f && !item.Blocked)
             .Select(item => $"{item.Player.Data?.PlayerName}({item.Player.PlayerId}) distance={item.Distance:0.0}")
             .ToArray();
         var nearestVent = UnityEngine.Object.FindObjectsOfType<Vent>()
-            .Where(vent => vent)
+            .Where(vent => vent && IsVentEligibleForRole(vent, hasTorRole ? torRole.Name : null))
             .Select(vent => Vector2.Distance(position, vent.transform.position))
             .DefaultIfEmpty(float.MaxValue)
             .Min();
@@ -599,6 +1269,7 @@ internal sealed class BotAbilityDirector
                 Blocked = PhysicsHelpers.AnythingBetween(position, body.TruePosition, Constants.ShipAndObjectsMask, false),
                 Witnesses = livingPlayers.Count(player =>
                     player.PlayerId != bot.PlayerId &&
+                    BotPerceptionPolicy.CanBeOrdinarilyObserved(player) &&
                     Vector2.Distance(player.GetTruePosition(), body.TruePosition) <= 3.25f &&
                     !PhysicsHelpers.AnythingBetween(player.GetTruePosition(), body.TruePosition, Constants.ShipAndObjectsMask, false))
             })
@@ -611,10 +1282,23 @@ internal sealed class BotAbilityDirector
         return new BotAbilityPrompt(
             bot.PlayerId,
             bot.Data?.PlayerName ?? $"DeepBot {bot.PlayerId}",
-            hasTorRole ? torRole.Alignment : bot.Data?.Role?.IsImpostor == true ? "impostor" : "crewmate",
+            hasTorRole ? torRole.Alignment : TorRoleAdapter.IsImpostorTeam(bot) ? "impostor" : "crewmate",
             hasTorRole ? torRole.Name : bot.Data?.RoleType.ToString() ?? "unknown",
-            hasTorRole ? TorRoleAdapter.BuildStrategicRoleBrief(bot, torRole) : DescribeAbilityPurpose(bot),
-            $"position={position}; node={SkeldPathGraph.Instance.NearestNode(position).Id}; killCooldown={bot.killTimer:0.0}; ventAccess={ventAccess}; nearestVent={nearestVent:0.0}; emergency={HasActiveEmergency(bot)}",
+            hasTorRole
+                ? TorRoleAdapter.BuildStrategicRoleBrief(bot, torRole) +
+                  (torRole.ActiveAbility
+                      ? string.Empty
+                      : " This role has no separate active role button in the ability controller; choose only vent or hold here. Ordinary kills, tasks, meetings, and cover movement are handled by their dedicated controllers.") +
+                  (sequenceCheckpoint.HasValue
+                      ? $" CURRENT NATIVE SEQUENCE CHECKPOINT: action={sequenceCheckpoint.Value.AbilityAction}; " +
+                        $"fixedTarget={sequenceCheckpoint.Value.TargetPlayerId?.ToString() ?? "none"}; " +
+                        $"stage={sequenceCheckpoint.Value.Reason}. Decide whether to continue now, briefly hold, " +
+                        "take cover, evade, or use a legal vent detour. Never restart stage one or replace the fixed target."
+                      : string.Empty)
+                : DescribeAbilityPurpose(bot),
+            $"position={position}; node={SkeldPathGraph.Instance.NearestNode(position).Id}; " +
+            $"killCooldown={bot.killTimer:0.0}; ventAccess={ventAccess}; nearestVent={nearestVent:0.0}; " +
+            $"emergency={HasActiveEmergency(bot)}; roomRules=[{GameRuleSettings.CaptureSnapshot().Describe()}]",
             visible.Length == 0 ? "none" : string.Join("; ", visible),
             visibleBodies.Length == 0 ? "no visible usable body" : string.Join("; ", visibleBodies),
             _memory.BuildTimeline(bot.PlayerId, 20));
@@ -631,7 +1315,7 @@ internal sealed class BotAbilityDirector
             RoleTypes.Phantom => "Phantom: become invisible to escape witnesses, conceal a rotation, or approach an isolated target.",
             RoleTypes.Shapeshifter => "Shapeshifter: copy a crew appearance before a planned deception or kill, preferably while unobserved.",
             RoleTypes.Detective => "Detective: investigate a player whose recent behavior or meeting claims create a useful suspicion.",
-            _ when bot.Data?.Role?.CanVent == true && bot.Data.Role.IsImpostor =>
+            _ when bot.Data?.Role?.CanVent == true && TorRoleAdapter.IsImpostorTeam(bot) =>
                 "Impostor vent: covertly escape a dangerous scene or reposition for a planned kill; never vent with witnesses.",
             _ => "No strategically useful active ability."
         };
@@ -641,19 +1325,53 @@ internal sealed class BotAbilityDirector
     {
         var hasTorRole = selectedTorRole.HasValue;
         var torRole = selectedTorRole.GetValueOrDefault();
-        var target = FindAbilityTarget(bot, hasTorRole ? torRole.IsImpostorTeam : bot.Data.Role.IsImpostor);
+        var botIsImpostor = hasTorRole ? torRole.IsImpostorTeam : TorRoleAdapter.IsImpostorTeam(bot);
+        var target = FindAbilityTarget(bot, botIsImpostor);
         var visibleCrew = EnumerateLivingPlayers()
             .Where(player =>
                 player.PlayerId != bot.PlayerId &&
-                (player.Data?.Role?.IsImpostor != true || !(hasTorRole ? torRole.IsImpostorTeam : bot.Data.Role.IsImpostor)) &&
-                Vector2.Distance(bot.GetTruePosition(), player.GetTruePosition()) <= 5f)
+                BotPerceptionPolicy.CanBeOrdinarilyObserved(player) &&
+                (!TorRoleAdapter.IsImpostorTeam(player) || !botIsImpostor) &&
+                Vector2.Distance(bot.GetTruePosition(), player.GetTruePosition()) <= 5f &&
+                !PhysicsHelpers.AnythingBetween(
+                    bot.GetTruePosition(),
+                    player.GetTruePosition(),
+                    Constants.ShipOnlyMask,
+                    false))
             .ToArray();
         if (hasTorRole)
         {
-            var torTarget = TorRoleAdapter.FindPreferredAbilityTarget(bot, torRole) ?? target;
+            var recentVentTarget = TryGetRecentVentAmbushTarget(bot);
+            if (TorRoleAdapter.CanUseVents(bot, torRole) &&
+                recentVentTarget is not null &&
+                visibleCrew.Length == 0 &&
+                FindClosestVent(bot, 1.35f, torRole.Name) is not null &&
+                (torRole.IsImpostorTeam || torRole.Name is "Jackal" or "Sidekick" or "Thief"))
+            {
+                return new BotAbilityDecision(
+                    true,
+                    recentVentTarget.PlayerId,
+                    $"hide in a nearby vent and ambush recently seen opponent {recentVentTarget.Data?.PlayerName} without entering in view",
+                    0.69f,
+                    "vent");
+            }
+
+            var torTarget = torRole.Name == "Arsonist"
+                ? TorRoleAdapter.FindArsonistPursuitTarget(bot) ?? TorRoleAdapter.FindPreferredAbilityTarget(bot, torRole) ?? target
+                : TorRoleAdapter.FindPreferredAbilityTarget(bot, torRole) ?? target;
             var sheriffTarget = FindEvidenceBackedSuspect(bot, 0.78f);
             var deputyTarget = FindEvidenceBackedSuspect(bot, 0.62f);
             var mayorTarget = FindEvidenceBackedSuspect(bot, 0.86f);
+            var thiefTarget = FindObservedRoleTarget(
+                bot,
+                (roleName, alignment) =>
+                    string.Equals(alignment, "impostor", StringComparison.Ordinal) ||
+                    roleName is "Jackal" or "Sidekick",
+                0.88f);
+            var observedCrewSpecialist = FindObservedRoleTarget(
+                bot,
+                (_, alignment) => string.Equals(alignment, "crewmate", StringComparison.Ordinal),
+                0.90f);
             return torRole.Name switch
             {
                 "Medic" when torTarget is not null =>
@@ -694,14 +1412,32 @@ internal sealed class BotAbilityDirector
                     new BotAbilityDecision(true, torTarget.PlayerId, "channel the next required douse on an undoused nearby player", 0.72f),
                 "Pursuer" when torTarget is not null && visibleCrew.Length <= 2 =>
                     new BotAbilityDecision(true, torTarget.PlayerId, "blank a nearby danger to improve survival odds", 0.60f),
+                "Thief" when thiefTarget is not null =>
+                    new BotAbilityDecision(
+                        true,
+                        thiefTarget.PlayerId,
+                        $"attempt theft only because a personally witnessed role action strongly identifies {thiefTarget.Data?.PlayerName} as an eligible hostile",
+                        0.92f),
                 "Thief" =>
-                    new BotAbilityDecision(false, null, "do not risk a blind theft without role evidence because an illegal target causes suicide", 0.74f),
-                "Eraser" when torTarget is not null =>
-                    new BotAbilityDecision(true, torTarget.PlayerId, "erase a nearby opposing role after the meeting", 0.59f),
+                    new BotAbilityDecision(false, null, "do not risk a blind theft without personally witnessed role evidence because an illegal target causes suicide", 0.84f),
+                "Eraser" when observedCrewSpecialist is not null =>
+                    new BotAbilityDecision(
+                        true,
+                        observedCrewSpecialist.PlayerId,
+                        $"erase personally identified crew specialist {observedCrewSpecialist.Data?.PlayerName} at the next resolution",
+                        0.86f),
+                "Eraser" =>
+                    new BotAbilityDecision(false, null, "hold erasure until a high-value opposing role is personally evidenced", 0.72f),
                 "Witch" when torTarget is not null && visibleCrew.Length <= 2 =>
                     new BotAbilityDecision(true, torTarget.PlayerId, "spell an isolated high-value opponent without exposing the caster", 0.62f),
-                "Shifter" when torTarget is not null =>
-                    new BotAbilityDecision(true, torTarget.PlayerId, "shift with a nearby player whose role may improve the objective", 0.58f),
+                "Shifter" when observedCrewSpecialist is not null =>
+                    new BotAbilityDecision(
+                        true,
+                        observedCrewSpecialist.PlayerId,
+                        $"shift with personally identified crew specialist {observedCrewSpecialist.Data?.PlayerName} instead of choosing blindly",
+                        0.84f),
+                "Shifter" =>
+                    new BotAbilityDecision(false, null, "hold the one-shot role exchange until a useful target role is personally evidenced", 0.76f),
                 "TimeMaster" when visibleCrew.Length is >= 1 and <= 3 =>
                     new BotAbilityDecision(true, null, "raise a time shield while nearby players create credible danger", 0.60f),
                 "Camouflager" when visibleCrew.Length is >= 1 and <= 3 =>
@@ -745,7 +1481,14 @@ internal sealed class BotAbilityDirector
             RoleTypes.Detective when target is not null =>
                 new BotAbilityDecision(true, target.PlayerId, "investigate the nearest useful encounter", 0.58f),
             _ when bot.Data.Role.CanVent &&
-                   bot.Data.Role.IsImpostor &&
+                   TorRoleAdapter.IsImpostorTeam(bot) &&
+                   TryGetRecentVentAmbushTarget(bot) is { } recentTarget &&
+                   FindClosestVent(bot, 1.35f) is not null &&
+                   visibleCrew.Length == 0 &&
+                   bot.killTimer <= 0.05f =>
+                new BotAbilityDecision(true, recentTarget.PlayerId, "hide in a nearby vent and wait for a recently seen target to return", 0.67f, "vent"),
+            _ when bot.Data.Role.CanVent &&
+                   TorRoleAdapter.IsImpostorTeam(bot) &&
                    FindClosestVent(bot, 1.35f) is not null &&
                    bot.killTimer > 0f &&
                    visibleCrew.Length <= 1 =>
@@ -754,8 +1497,169 @@ internal sealed class BotAbilityDirector
         };
     }
 
+    private PlayerControl? TryGetRecentVentAmbushTarget(PlayerControl bot)
+    {
+        if (!_memory.TryGetRecentPersonallySeenLivingPlayer(bot.PlayerId, 8f, out var targetId))
+        {
+            return null;
+        }
+
+        var target = FindPlayer(targetId);
+        if (!target ||
+            target!.PlayerId == bot.PlayerId ||
+            TorRoleAdapter.IsImpostorTeam(target) ||
+            TorRoleAdapter.AreLoverPartners(bot, target))
+        {
+            return null;
+        }
+
+        return target;
+    }
+
+    private static bool ShouldExitVentForAmbush(PlayerControl bot, int ventId, byte? plannedTargetId)
+    {
+        if (!bot ||
+            bot.Data is null ||
+            bot.Data.RoleType == RoleTypes.Engineer)
+        {
+            return false;
+        }
+
+        var hasTorRole = TorRoleAdapter.TryGetRole(bot, out var torRole);
+        var isHostileAmbusher = hasTorRole
+            ? torRole.IsImpostorTeam || torRole.Name is "Jackal" or "Sidekick" or "Thief"
+            : TorRoleAdapter.IsImpostorTeam(bot);
+        if (!isHostileAmbusher || bot.killTimer > 0.05f)
+        {
+            return false;
+        }
+
+        var vent = UnityEngine.Object.FindObjectsOfType<Vent>().FirstOrDefault(item => item && item.Id == ventId);
+        if (!vent)
+        {
+            return false;
+        }
+
+        var ventPosition = (Vector2)vent!.transform.position;
+        var nearbyOpponents = EnumerateLivingPlayers()
+            .Where(player =>
+                player.PlayerId != bot.PlayerId &&
+                !TorRoleAdapter.AreKnownAllies(bot, player) &&
+                !TorRoleAdapter.AreLoverPartners(bot, player) &&
+                BotPerceptionPolicy.CanBeOrdinarilyObserved(player) &&
+                Vector2.Distance(ventPosition, player.GetTruePosition()) <= 2.35f &&
+                !PhysicsHelpers.AnythingBetween(ventPosition, player.GetTruePosition(), Constants.ShipOnlyMask, false))
+            .ToArray();
+        if (nearbyOpponents.Length == 0 || nearbyOpponents.Length > 2)
+        {
+            return false;
+        }
+
+        return !plannedTargetId.HasValue || nearbyOpponents.Any(player => player.PlayerId == plannedTargetId.Value);
+    }
+
+    private BotAbilityDecision ApplyObjectiveCriticalOverride(
+        PlayerControl bot,
+        TorRoleInfo role,
+        BotAbilityDecision decision)
+    {
+        if (role.Name is "Trickster" or "Portalmaker" &&
+            TorRoleAdapter.TryGetAbilityStagingDestination(
+                bot,
+                role,
+                out _,
+                out var setupStage,
+                out _))
+        {
+            // Setup stages are prerequisites for the role to become useful.
+            // An API outage or cautious model response may delay them briefly,
+            // but must not leave the role permanently without boxes/portals.
+            return new BotAbilityDecision(
+                true,
+                null,
+                $"native setup progression override: continue {setupStage}",
+                0.88f,
+                "role",
+                $"complete {role.Name} setup",
+                setupStage,
+                "abort if TOR reports the setup stage is no longer legal",
+                1.0f);
+        }
+
+        if (role.Name == "Engineer" && HasActiveEmergency(bot) &&
+            BotBehaviorPolicy.ShouldOverrideForRoleObjective(role.Name, true))
+        {
+            return new BotAbilityDecision(
+                true,
+                null,
+                "hard-rule override: spend the limited repair because an unresolved sabotage is active",
+                0.94f);
+        }
+
+        if (role.Name == "Arsonist")
+        {
+            if (TorRoleAdapter.IsArsonistReadyToIgnite(bot) &&
+                BotBehaviorPolicy.ShouldOverrideForRoleObjective(role.Name, true))
+            {
+                return new BotAbilityDecision(
+                    true,
+                    null,
+                    "hard-rule override: every other living player is doused, so ignite now",
+                    0.99f);
+            }
+
+            var target = TorRoleAdapter.FindArsonistPursuitTarget(bot);
+            if (target is not null &&
+                BotBehaviorPolicy.ShouldOverrideForRoleObjective(role.Name, true))
+            {
+                return new BotAbilityDecision(
+                    true,
+                    target.PlayerId,
+                    $"hard-rule override: approach undoused visible target {target.Data?.PlayerName} and channel douse",
+                    0.90f);
+            }
+        }
+
+        if (role.Name is "Vulture" or "Cleaner" or "Janitor" &&
+            TorRoleAdapter.FindVisibleUsableBody(bot) is { } body)
+        {
+            var personallyVisibleWitnesses = EnumerateLivingPlayers()
+                .Count(player =>
+                    player.PlayerId != bot.PlayerId &&
+                    BotPerceptionPolicy.CanBeOrdinarilyObserved(player) &&
+                    Vector2.Distance(bot.GetTruePosition(), player.GetTruePosition()) <= 6f &&
+                    Vector2.Distance(player.GetTruePosition(), body.TruePosition) <= 3.25f &&
+                    !PhysicsHelpers.AnythingBetween(
+                        bot.GetTruePosition(),
+                        player.GetTruePosition(),
+                        Constants.ShipOnlyMask,
+                        false));
+            var objectiveOpportunity = role.Name == "Vulture" || personallyVisibleWitnesses == 0;
+            if (BotBehaviorPolicy.ShouldOverrideForRoleObjective(role.Name, objectiveOpportunity))
+            {
+                return new BotAbilityDecision(
+                    true,
+                    null,
+                    $"hard-rule override: visible body advances {role.Name} objective; personallyVisibleWitnesses={personallyVisibleWitnesses}",
+                    role.Name == "Vulture" ? 0.96f : 0.88f);
+            }
+        }
+
+        return decision;
+    }
+
     private PlayerControl? FindEvidenceBackedSuspect(PlayerControl bot, float minimumConfidence)
     {
+        if (_memory.TryGetLatestWitnessedKiller(bot.PlayerId, out var witnessedKillerId))
+        {
+            var witnessedKiller = FindPlayer(witnessedKillerId);
+            if (IsPersonallyReachableTarget(bot, witnessedKiller) &&
+                !TorRoleAdapter.AreKnownAllies(bot, witnessedKiller))
+            {
+                return witnessedKiller;
+            }
+        }
+
         if (!_memory.TryGetPostMeetingIntent(bot.PlayerId, out var intent) ||
             intent.FollowIntent != "suspect" ||
             !intent.FollowPlayerId.HasValue ||
@@ -765,7 +1669,7 @@ internal sealed class BotAbilityDirector
         }
 
         var target = FindPlayer(intent.FollowPlayerId.Value);
-        if (!target || target!.Data is null || target.Data.IsDead || target.Data.Disconnected || target.PlayerId == bot.PlayerId)
+        if (!BotPerceptionPolicy.CanBeOrdinarilyObserved(target) || target!.PlayerId == bot.PlayerId)
         {
             return null;
         }
@@ -774,13 +1678,54 @@ internal sealed class BotAbilityDirector
         if (distance > 6f || PhysicsHelpers.AnythingBetween(
                 bot.GetTruePosition(),
                 target.GetTruePosition(),
-                Constants.ShipAndObjectsMask,
+                Constants.ShipOnlyMask,
                 false))
         {
             return null;
         }
 
         return target;
+    }
+
+    private PlayerControl? FindObservedRoleTarget(
+        PlayerControl bot,
+        Func<string, string, bool> acceptsPublicRole,
+        float minimumInferenceConfidence)
+    {
+        return EnumerateLivingPlayers()
+            .Where(player => player.PlayerId != bot.PlayerId)
+            .Where(player => !TorRoleAdapter.AreKnownAllies(bot, player))
+            .Where(player => IsPersonallyReachableTarget(bot, player))
+            .Select(player => new
+            {
+                Player = player,
+                Evidence = _memory.GetPersonalRoleEvidence(bot.PlayerId, player.PlayerId)
+            })
+            .Where(item =>
+                item.Evidence.HasObservation &&
+                item.Evidence.InferenceConfidence >= minimumInferenceConfidence &&
+                !string.IsNullOrWhiteSpace(item.Evidence.InferredRoleName) &&
+                TorRoleAdapter.TryGetPublicRoleAlignment(item.Evidence.InferredRoleName!, out var alignment) &&
+                acceptsPublicRole(item.Evidence.InferredRoleName!, alignment))
+            .OrderByDescending(item => item.Evidence.InferenceConfidence)
+            .ThenBy(item => Vector2.Distance(bot.GetTruePosition(), item.Player.GetTruePosition()))
+            .Select(item => item.Player)
+            .FirstOrDefault();
+    }
+
+    private static bool IsPersonallyReachableTarget(PlayerControl bot, PlayerControl? target)
+    {
+        return target &&
+               target!.Data is not null &&
+               !target.Data.IsDead &&
+               !target.Data.Disconnected &&
+               BotPerceptionPolicy.CanBeOrdinarilyObserved(target) &&
+               Vector2.Distance(bot.GetTruePosition(), target.GetTruePosition()) <= 6f &&
+               !PhysicsHelpers.AnythingBetween(
+                   bot.GetTruePosition(),
+                   target.GetTruePosition(),
+                   Constants.ShipOnlyMask,
+                   false);
     }
 
     private static bool TrySelectTorAbilityRole(PlayerControl bot, AbilityState state, out TorRoleInfo role)
@@ -795,7 +1740,10 @@ internal sealed class BotAbilityDirector
         for (var offset = 0; offset < roles.Count; offset++)
         {
             var candidate = roles[(state.AbilityRoleCursor + offset) % roles.Count];
-            if (TorRoleAdapter.IsAbilityReady(bot, candidate) || TorRoleAdapter.CanUseVents(bot, candidate))
+            if (BotBehaviorPolicy.ShouldSelectStrategicAbilityRole(
+                    TorRoleAdapter.IsAbilityReady(bot, candidate),
+                    TorRoleAdapter.CanUseVents(bot, candidate),
+                    TorRoleAdapter.IsAbilitySequencePending(bot, candidate)))
             {
                 role = candidate;
                 return true;
@@ -818,10 +1766,10 @@ internal sealed class BotAbilityDirector
                    RoleTypes.Phantom or
                    RoleTypes.Shapeshifter or
                    RoleTypes.Detective ||
-               (bot.Data?.Role?.CanVent == true && bot.Data.Role.IsImpostor);
+               (bot.Data?.Role?.CanVent == true && TorRoleAdapter.IsImpostorTeam(bot));
     }
 
-    private void TryUseOrRouteVent(PlayerControl bot, AbilityState state, string role)
+    private void TryUseOrRouteVent(PlayerControl bot, AbilityState state, string role, byte? ambushTargetId = null)
     {
         if (bot.Data?.RoleType == RoleTypes.Engineer)
         {
@@ -831,7 +1779,7 @@ internal sealed class BotAbilityDirector
         }
 
         var hasTorRole = TorRoleAdapter.TryGetRole(bot, out var torRole);
-        var vent = FindClosestVent(bot, 1.35f);
+        var vent = FindClosestVent(bot, 1.35f, hasTorRole ? torRole.Name : role);
         if (vent is null)
         {
             TryRouteToVent(bot, state, role);
@@ -840,10 +1788,35 @@ internal sealed class BotAbilityDirector
 
         try
         {
-            bot.MyPhysics.RpcEnterVent(vent.Id);
+            if (hasTorRole && string.Equals(torRole.Name, "Engineer", StringComparison.Ordinal))
+            {
+                if (!TorRoleAdapter.TryEnterTorEngineerVent(bot, vent.Id, out var nativeOutcome))
+                {
+                    state.NextAbilityAt = Time.time + 2f;
+                    _log.LogInfo(
+                        $"DeepBot TOR Engineer vent held by native room rules: bot={bot.Data?.PlayerName}, " +
+                        $"vent={vent.Id}, reason={nativeOutcome}.");
+                    return;
+                }
+
+                _log.LogInfo(
+                    $"DeepBot TOR Engineer vent accepted by native rules: bot={bot.Data?.PlayerName}, " +
+                    $"vent={vent.Id}, outcome={nativeOutcome}.");
+            }
+            else
+            {
+                bot.MyPhysics.RpcEnterVent(vent.Id);
+            }
             _actions.CompleteRoleAbilityRoute(bot, $"{role}-entered-vent-{vent.Id}");
-            state.ActiveVentId = vent.Id;
-            state.ExitVentAt = Time.time + UnityEngine.Random.Range(2.2f, 4.8f);
+            BeginVentEntryTracking(bot, state, vent.Id, role);
+            state.VentAmbushTargetId = ambushTargetId;
+            state.MinimumVentHoldUntil = Time.time + (ambushTargetId.HasValue ? 1.8f : 1.0f);
+            var plannedVentSeconds = ambushTargetId.HasValue
+                ? UnityEngine.Random.Range(
+                    string.Equals(role, "Trickster", StringComparison.Ordinal) ? 8f : 5f,
+                    string.Equals(role, "Trickster", StringComparison.Ordinal) ? 13f : 9f)
+                : UnityEngine.Random.Range(2.2f, 4.8f);
+            state.ExitVentAt = Time.time + plannedVentSeconds;
             state.NextAbilityAt = Time.time + UnityEngine.Random.Range(18f, 34f);
             _memory.RecordAction(bot, "ability", $"{role} entered vent {vent.Id} after LLM approval");
             _log.LogInfo($"DeepBot role vent used after LLM approval: bot={bot.Data?.PlayerName}, role={(hasTorRole ? torRole.Name : role)}, vent={vent.Id}.");
@@ -853,6 +1826,92 @@ internal sealed class BotAbilityDirector
             state.NextAbilityAt = Time.time + 5f;
             _log.LogWarning($"DeepBot role vent failed: bot={bot.Data?.PlayerName}, role={role}, vent={vent.Id}, error={ex.Message}");
         }
+    }
+
+    private void BeginVentEntryTracking(PlayerControl bot, AbilityState state, int ventId, string role)
+    {
+        state.PendingVentId = ventId;
+        state.PendingVentRole = role;
+        state.VentEntryRequestedAt = Time.time;
+        state.ActiveVentId = bot.inVent ? ventId : null;
+        if (bot.inVent)
+        {
+            ConfirmVentEntry(bot, state);
+        }
+    }
+
+    private void ConfirmVentEntry(PlayerControl bot, AbilityState state)
+    {
+        if (!bot.inVent || !state.PendingVentId.HasValue)
+        {
+            return;
+        }
+
+        state.ActiveVentId = state.PendingVentId;
+        state.PendingVentId = null;
+        state.PendingVentRole = null;
+        state.VentEntryRequestedAt = 0f;
+    }
+
+    private bool HandlePendingVentEntry(PlayerControl bot, AbilityState state)
+    {
+        if (!state.PendingVentId.HasValue || state.VentEntryRequestedAt <= 0f)
+        {
+            return false;
+        }
+
+        if (bot.inVent)
+        {
+            ConfirmVentEntry(bot, state);
+            return false;
+        }
+
+        var elapsed = Time.time - state.VentEntryRequestedAt;
+        if (elapsed < 2.25f)
+        {
+            // Let TOR/Among Us finish the native enter animation.  Blocking
+            // movement during this short window is expected.
+            return bot.walkingToVent;
+        }
+
+        var failedVentId = state.PendingVentId.Value;
+        var failedRole = state.PendingVentRole ?? "vent-capable role";
+        bot.walkingToVent = false;
+        if (!TorRoleAdapter.IsRuleImmobilized(bot) && !MeetingHud.Instance && !ExileController.Instance)
+        {
+            bot.moveable = true;
+        }
+        if (bot.NetTransform)
+        {
+            bot.NetTransform.Halt();
+        }
+        if (bot.MyPhysics)
+        {
+            bot.MyPhysics.SetNormalizedVelocity(Vector2.zero);
+            if (bot.MyPhysics.body)
+            {
+                bot.MyPhysics.body.velocity = Vector2.zero;
+            }
+        }
+
+        state.PendingVentId = null;
+        state.PendingVentRole = null;
+        state.VentEntryRequestedAt = 0f;
+        state.ActiveVentId = null;
+        state.VentAmbushTargetId = null;
+        state.MinimumVentHoldUntil = 0f;
+        state.ExitVentAt = 0f;
+        state.NextAbilityAt = Time.time + 12f;
+        _actions.CompleteRoleAbilityRoute(bot, $"{failedRole}-native-vent-entry-timeout-{failedVentId}");
+        _memory.RecordAction(
+            bot,
+            "ability",
+            $"{failedRole} native vent entry {failedVentId} timed out; movement released and vent plan abandoned");
+        _log.LogWarning(
+            $"DeepBot native vent entry timeout repaired: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
+            $"role={failedRole}, vent={failedVentId}, elapsed={elapsed:0.00}s, " +
+            "walkingToVent cleared, movement restored, retry delayed.");
+        return false;
     }
 
     private static bool IsRoleCoolingDown(RoleBehaviour role)
@@ -904,7 +1963,9 @@ internal sealed class BotAbilityDirector
                     TaskTypes.FixLights or
                     TaskTypes.FixComms or
                     TaskTypes.ResetReactor or
-                    TaskTypes.RestoreOxy)
+                    TaskTypes.RestoreOxy or
+                    TaskTypes.ResetSeismic or
+                    TaskTypes.StopCharles)
             {
                 return true;
             }
@@ -913,11 +1974,11 @@ internal sealed class BotAbilityDirector
         return false;
     }
 
-    private static Vent? FindClosestVent(PlayerControl bot, float maximumDistance)
+    private static Vent? FindClosestVent(PlayerControl bot, float maximumDistance, string? roleName = null)
     {
         var position = bot.GetTruePosition();
         return UnityEngine.Object.FindObjectsOfType<Vent>()
-            .Where(vent => vent)
+            .Where(vent => vent && IsVentEligibleForRole(vent, roleName))
             .Select(vent => new { Vent = vent, Distance = Vector2.Distance(position, vent.transform.position) })
             .Where(item => item.Distance <= maximumDistance)
             .OrderBy(item => item.Distance)
@@ -925,11 +1986,25 @@ internal sealed class BotAbilityDirector
             .FirstOrDefault();
     }
 
+    private static bool IsVentEligibleForRole(Vent vent, string? roleName)
+    {
+        if (!vent)
+        {
+            return false;
+        }
+
+        var isTricksterBox = (vent!.name ?? string.Empty)
+            .StartsWith("JackInTheBoxVent_", StringComparison.OrdinalIgnoreCase);
+        return string.Equals(roleName, "Trickster", StringComparison.Ordinal)
+            ? isTricksterBox
+            : !isTricksterBox;
+    }
+
     private void TryRouteToVent(PlayerControl bot, AbilityState state, string role)
     {
         var position = bot.GetTruePosition();
         var vent = UnityEngine.Object.FindObjectsOfType<Vent>()
-            .Where(candidate => candidate)
+            .Where(candidate => candidate && IsVentEligibleForRole(candidate, role))
             .OrderBy(candidate => Vector2.Distance(position, candidate.transform.position))
             .FirstOrDefault();
         if (vent is null)
@@ -958,7 +2033,8 @@ internal sealed class BotAbilityDirector
         var position = bot.GetTruePosition();
         return EnumerateLivingPlayers()
             .Where(player => player.PlayerId != bot.PlayerId)
-            .Where(player => !impostor || !player.Data.Role.IsImpostor)
+            .Where(BotPerceptionPolicy.CanBeOrdinarilyObserved)
+            .Where(player => !impostor || !TorRoleAdapter.IsImpostorTeam(player))
             .Select(player => new { Player = player, Distance = Vector2.Distance(position, player.GetTruePosition()) })
             .Where(item => item.Distance <= 3.5f)
             .OrderBy(item => item.Distance)
@@ -1027,13 +2103,36 @@ internal sealed class BotAbilityDirector
     {
         public float NextAbilityAt { get; set; }
         public int? ActiveVentId { get; set; }
+        public int? PendingVentId { get; set; }
+        public string? PendingVentRole { get; set; }
+        public float VentEntryRequestedAt { get; set; }
         public float ExitVentAt { get; set; }
+        public float MinimumVentHoldUntil { get; set; }
+        public byte? VentAmbushTargetId { get; set; }
         public float NextRouteLogAt { get; set; }
         public bool DecisionInFlight { get; set; }
         public bool DecisionCompleted { get; set; }
         public BotAbilityDecision? PendingDecision { get; set; }
         public RoleTypes? RequestedRole { get; set; }
         public string? RequestedTorRole { get; set; }
+        public TorAbilitySequencePlan? PendingSequencePlan { get; set; }
+        public string? SequenceCheckpointKey { get; set; }
+        public bool SequenceCheckpointConsumed { get; set; }
         public int AbilityRoleCursor { get; set; }
+        public byte? PendingShapeshiftTargetId { get; set; }
+        public Vector2? PendingShapeshiftStagePosition { get; set; }
+        public int ShapeshiftStageAttempts { get; set; }
+        public string? TorStagingKey { get; set; }
+        public Vector2? TorStagingPosition { get; set; }
+        public string? TorStagingLabel { get; set; }
+        public float TorStagingArrivalDistance { get; set; }
+
+        public void ClearTorStagingTarget()
+        {
+            TorStagingKey = null;
+            TorStagingPosition = null;
+            TorStagingLabel = null;
+            TorStagingArrivalDistance = 0f;
+        }
     }
 }

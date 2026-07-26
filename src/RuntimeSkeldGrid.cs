@@ -8,24 +8,16 @@ namespace AmongUsDeepSeekBots;
 
 internal sealed class RuntimeSkeldGrid
 {
-    // Current Skeld reactor consoles are at approximately x=-21.3. The old
-    // -17.2 bound cut the whole reactor room out of the runtime graph, so every
-    // physical reactor route was rejected even though the console was valid.
-    private const float MinX = -23.8f;
-    // Current Skeld's Navigation/Shields side reaches roughly x=17, while
-    // Communications and its physical sabotage panel reach below y=-17.
-    // The previous x=13.2/y=-12.2 limits silently clipped those rooms: normal
-    // routes could stop at the old boundary and FixComms had no target cell at
-    // all. Keep a modest margin around every walkable room so physical task and
-    // sabotage console positions can project onto the runtime grid.
-    private const float MaxX = 18.8f;
-    private const float MinY = -18.8f;
-    private const float MaxY = 7.2f;
-    // A finer grid provides more center-line choices in Skeld's narrow doors
+    // Runtime steering probes this method several times per moving bot and per
+    // rendered frame. LinecastAll allocates a new managed array for every
+    // probe, which creates periodic GC stalls once a lobby contains several
+    // bots. Navigation runs on Unity's main thread, so one reusable buffer is
+    // sufficient and preserves the same collider filtering semantics.
+    private static readonly RaycastHit2D[] SegmentHitBuffer = new RaycastHit2D[64];
+    // A finer grid provides more center-line choices in narrow doors
     // and around table corners.  The previous 0.42 spacing repeatedly chose
     // the same wall-adjacent cell when a route was recalculated.
     private const float Step = 0.35f;
-    private const float MinimumNamedNodeCoverage = 0.82f;
     private const float NamedNodeProjectionDistance = 1.65f;
     // A player-sized clearance that still fits through Skeld doorways. Dynamic
     // player/dead-body colliders are filtered below so the grid does not change
@@ -33,6 +25,14 @@ internal sealed class RuntimeSkeldGrid
     // Match the real crewmate collider more closely.  A cell accepted with the
     // old 0.19 probe could still be physically unreachable by a 0.223 player.
     private const float ProbeRadius = 0.225f;
+    // MIRA's room-area triggers stop short of several visual door/corridor
+    // seams. A player-sized 0.24 expansion left Launchpad, Reactor/Lab and the
+    // Greenhouse/O2 branch in separate flood-fill components. Static wall
+    // overlap and segment tests still remain authoritative, so this tolerance
+    // only fills clear trigger seams; it does not make walls traversable.
+    private const float MiraRoomBoundaryTolerance = 0.70f;
+    private const float MiraMinimumReachableCellCoverage = 0.80f;
+    private const float MiraMinimumLiveLandmarkCoverage = 0.80f;
     private const float MaximumStartProjectionDistance = 0.9f;
     private const float MaximumTargetProjectionDistance = 1.5f;
 
@@ -46,16 +46,28 @@ internal sealed class RuntimeSkeldGrid
     private readonly Dictionary<int, List<int>> _neighbors;
     private readonly Dictionary<int, float> _temporarilyBlockedCells = [];
     private readonly int _width;
+    private readonly string _mapName;
     private int _routeVariant;
 
-    private RuntimeSkeldGrid(Dictionary<int, Vector2> positions, Dictionary<int, List<int>> neighbors, int width)
+    // Build is deliberately conservative on live colliders. A null result can
+    // mean either "the map objects are still being created" or "the completed
+    // map failed the safety coverage gate"; callers use this flag to retry only
+    // the former and avoid rebuilding thousands of physics probes every second.
+    public static bool LastBuildWasDeferred { get; private set; }
+
+    private RuntimeSkeldGrid(
+        Dictionary<int, Vector2> positions,
+        Dictionary<int, List<int>> neighbors,
+        int width,
+        string mapName)
     {
         _positions = positions;
         _neighbors = neighbors;
         _width = width;
+        _mapName = mapName;
     }
 
-    public string Summary => $"runtimeGrid={_positions.Count}cells,step={Step:0.00},dynamicBlocks={_temporarilyBlockedCells.Count(pair => pair.Value > Time.time)}";
+    public string Summary => $"runtimeGrid={_mapName}:{_positions.Count}cells,step={Step:0.00},dynamicBlocks={_temporarilyBlockedCells.Count(pair => pair.Value > Time.time)}";
 
     public bool TryBlockRouteTarget(string fromId, string toId, ManualLogSource log, string reason)
     {
@@ -72,39 +84,51 @@ internal sealed class RuntimeSkeldGrid
         // A* to choose a different side of the obstacle without invalidating
         // the bot's current start cell.
         var wasBlocked = IsCellTemporarilyBlocked(to);
-        _temporarilyBlockedCells[to] = Time.time + 18f;
+        _temporarilyBlockedCells[to] = Time.time + 120f;
         if (!wasBlocked)
         {
             log.LogWarning(
-                $"DeepBot runtime grid cell temporarily blocked: {fromId}->{toId}, seconds=18, reason={reason}");
+                $"DeepBot runtime grid cell temporarily blocked: {fromId}->{toId}, seconds=120, reason={reason}");
         }
         return true;
     }
 
     internal static bool ContainsSupportedPoint(Vector2 point)
     {
-        return point.x >= MinX &&
-               point.x <= MaxX &&
-               point.y >= MinY &&
-               point.y <= MaxY;
+        return SkeldPathGraph.Instance.ContainsSupportedPoint(point);
     }
 
     public static RuntimeSkeldGrid? Build(ManualLogSource log)
     {
+        LastBuildWasDeferred = false;
         if (!ShipStatus.Instance)
         {
+            LastBuildWasDeferred = true;
             return null;
         }
 
-        var width = Mathf.FloorToInt((MaxX - MinX) / Step) + 1;
-        var height = Mathf.FloorToInt((MaxY - MinY) / Step) + 1;
+        var graph = SkeldPathGraph.Instance;
+        var bounds = graph.NavigationBounds;
+        var width = Mathf.FloorToInt((bounds.MaxX - bounds.MinX) / Step) + 1;
+        var height = Mathf.FloorToInt((bounds.MaxY - bounds.MinY) / Step) + 1;
+        var miraRoomAreas = GameRuleSettings.IsMiraHqMap()
+            ? CollectLiveRoomAreas()
+            : Array.Empty<Collider2D>();
+        if (GameRuleSettings.IsMiraHqMap() && miraRoomAreas.Length == 0)
+        {
+            LastBuildWasDeferred = true;
+            log.LogWarning("DeepBot runtime MIRA HQ grid rejected: no live room/ corridor areas were available; refusing rectangular off-map navigation.");
+            return null;
+        }
+
         var allPositions = new Dictionary<int, Vector2>();
         for (var y = 0; y < height; y++)
         {
             for (var x = 0; x < width; x++)
             {
-                var point = new Vector2(MinX + x * Step, MinY + y * Step);
-                if (!IsBlockedByStaticObstacle(point))
+                var point = new Vector2(bounds.MinX + x * Step, bounds.MinY + y * Step);
+                if ((miraRoomAreas.Length == 0 || IsInsideLiveRoomCoverage(point, miraRoomAreas)) &&
+                    !IsBlockedByStaticObstacle(point))
                 {
                     allPositions[ToIndex(x, y, width)] = point;
                 }
@@ -113,12 +137,18 @@ internal sealed class RuntimeSkeldGrid
 
         if (allPositions.Count == 0)
         {
-            log.LogWarning("DeepBot runtime Skeld grid build found no candidate cells.");
+            log.LogWarning($"DeepBot runtime {graph.CurrentMapName} grid build found no candidate cells.");
             return null;
         }
 
         var allNeighbors = BuildNeighbors(allPositions, width);
-        var seed = FindNearest(allPositions, SkeldPathGraph.Instance.FindNode("CAF_SPAWN")?.Position ?? new Vector2(-0.8f, 3.2f));
+        var configuredSeed = graph.FindNode(graph.PrimarySpawnNodeId)?.Position ?? Vector2.zero;
+        var seedPosition = ShipStatus.Instance.InitialSpawnCenter;
+        if (!bounds.Contains(seedPosition))
+        {
+            seedPosition = configuredSeed;
+        }
+        var seed = FindNearest(allPositions, seedPosition);
         var reachable = FloodFill(seed, allNeighbors);
         var positions = allPositions
             .Where(pair => reachable.Contains(pair.Key))
@@ -128,7 +158,7 @@ internal sealed class RuntimeSkeldGrid
             index => allNeighbors.GetValueOrDefault(index)?.Where(reachable.Contains).ToList() ?? []);
 
         var reachableCoverage = positions.Count / (float)allPositions.Count;
-        var namedNodes = SkeldPathGraph.Instance.Nodes
+        var namedNodes = graph.Nodes
             .Where(node => node.Kind != NodeKind.Waypoint)
             .ToArray();
         var reachableNamedNodes = namedNodes.Count(
@@ -136,21 +166,132 @@ internal sealed class RuntimeSkeldGrid
         var namedNodeCoverage = namedNodes.Length == 0
             ? 0f
             : reachableNamedNodes / (float)namedNodes.Length;
-        if (positions.Count < 250 || namedNodeCoverage < MinimumNamedNodeCoverage)
+        var liveLandmarkPositions = GameRuleSettings.IsMiraHqMap()
+            ? CollectLiveLandmarkPositions()
+            : Array.Empty<Vector2>();
+        var reachableLiveLandmarks = liveLandmarkPositions.Count(
+            position => DistanceToNearest(positions, position) <= NamedNodeProjectionDistance);
+        var liveLandmarkCoverage = liveLandmarkPositions.Length == 0
+            ? 0f
+            : reachableLiveLandmarks / (float)liveLandmarkPositions.Length;
+        var authoritativeCoverage = liveLandmarkPositions.Length > 0
+            ? liveLandmarkCoverage
+            : namedNodeCoverage;
+        var miraCoverageInsufficient = GameRuleSettings.IsMiraHqMap() &&
+            (reachableCoverage < MiraMinimumReachableCellCoverage ||
+             liveLandmarkCoverage < MiraMinimumLiveLandmarkCoverage);
+        if (positions.Count < 250 ||
+            authoritativeCoverage < graph.MinimumNamedNodeCoverage ||
+            miraCoverageInsufficient)
         {
             log.LogWarning(
-                $"DeepBot runtime Skeld grid rejected: reachableCells={positions.Count}, candidates={allPositions.Count}, " +
+                $"DeepBot runtime {graph.CurrentMapName} grid rejected: reachableCells={positions.Count}, candidates={allPositions.Count}, " +
                 $"cellCoverage={reachableCoverage:P1}, namedCoverage={reachableNamedNodes}/{namedNodes.Length}={namedNodeCoverage:P1}, " +
-                $"requiredNamed={MinimumNamedNodeCoverage:P0}; using collision-filtered static graph.");
+                $"liveCoverage={reachableLiveLandmarks}/{liveLandmarkPositions.Length}={liveLandmarkCoverage:P1}, " +
+                $"roomAreas={miraRoomAreas.Length}, requiredCoverage={graph.MinimumNamedNodeCoverage:P0}, " +
+                $"miraCellRequired={MiraMinimumReachableCellCoverage:P0}, miraLiveRequired={MiraMinimumLiveLandmarkCoverage:P0}; " +
+                "using collision-filtered static graph.");
             return null;
         }
 
-        var grid = new RuntimeSkeldGrid(positions, neighbors, width);
+        var grid = new RuntimeSkeldGrid(positions, neighbors, width, graph.CurrentMapName);
         log.LogInfo(
-            $"DeepBot runtime Skeld grid ready: {grid.Summary}, candidates={allPositions.Count}, cellCoverage={reachableCoverage:P1}, " +
+            $"DeepBot runtime {graph.CurrentMapName} grid ready: {grid.Summary}, candidates={allPositions.Count}, cellCoverage={reachableCoverage:P1}, " +
             $"namedCoverage={reachableNamedNodes}/{namedNodes.Length}={namedNodeCoverage:P1}, " +
-            $"bounds=({MinX:0.0},{MinY:0.0})..({MaxX:0.0},{MaxY:0.0}).");
+            $"liveCoverage={reachableLiveLandmarks}/{liveLandmarkPositions.Length}={liveLandmarkCoverage:P1}, roomAreas={miraRoomAreas.Length}, " +
+            $"bounds=({bounds.MinX:0.0},{bounds.MinY:0.0})..({bounds.MaxX:0.0},{bounds.MaxY:0.0}), seed={seedPosition}.");
         return grid;
+    }
+
+    private static Collider2D[] CollectLiveRoomAreas()
+    {
+        if (!ShipStatus.Instance || ShipStatus.Instance.AllRooms is null)
+        {
+            return Array.Empty<Collider2D>();
+        }
+
+        var areas = new List<Collider2D>();
+        var rooms = ShipStatus.Instance.AllRooms;
+        for (var index = 0; index < rooms.Length; index++)
+        {
+            var room = rooms[index];
+            if (room && room.roomArea)
+            {
+                areas.Add(room.roomArea);
+            }
+        }
+
+        return areas.ToArray();
+    }
+
+    private static Vector2[] CollectLiveLandmarkPositions()
+    {
+        if (!ShipStatus.Instance)
+        {
+            return Array.Empty<Vector2>();
+        }
+
+        var positions = new List<Vector2>();
+        var rooms = ShipStatus.Instance.AllRooms;
+        if (rooms is not null)
+        {
+            for (var index = 0; index < rooms.Length; index++)
+            {
+                var room = rooms[index];
+                if (room && room.roomArea)
+                {
+                    positions.Add(room.roomArea.bounds.center);
+                }
+            }
+        }
+
+        var consoles = ShipStatus.Instance.AllConsoles;
+        if (consoles is not null)
+        {
+            for (var index = 0; index < consoles.Length; index++)
+            {
+                var console = consoles[index];
+                if (console)
+                {
+                    positions.Add(console.transform.position);
+                }
+            }
+        }
+
+        var vents = ShipStatus.Instance.AllVents;
+        if (vents is not null)
+        {
+            for (var index = 0; index < vents.Length; index++)
+            {
+                var vent = vents[index];
+                if (vent)
+                {
+                    positions.Add(vent.transform.position);
+                }
+            }
+        }
+
+        return positions.ToArray();
+    }
+
+    private static bool IsInsideLiveRoomCoverage(Vector2 point, IReadOnlyList<Collider2D> roomAreas)
+    {
+        for (var index = 0; index < roomAreas.Count; index++)
+        {
+            var area = roomAreas[index];
+            if (!area)
+            {
+                continue;
+            }
+
+            if (area.OverlapPoint(point) ||
+                Vector2.Distance(point, area.ClosestPoint(point)) <= MiraRoomBoundaryTolerance)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public IReadOnlyList<IReadOnlyList<NavNode>> FindTopRoutes(Vector2 from, Vector2 target, int count)
@@ -171,10 +312,11 @@ internal sealed class RuntimeSkeldGrid
         var requested = Math.Max(1, count);
         var routes = new List<IReadOnlyList<NavNode>>();
         var signatures = new HashSet<string>(StringComparer.Ordinal);
-        for (var i = 0; i < requested * 3 && routes.Count < requested; i++)
+        var acceptedCellUseCounts = new Dictionary<int, int>();
+        for (var i = 0; i < requested * 8 && routes.Count < requested; i++)
         {
             var variant = _routeVariant++;
-            var path = FindPath(start, goal, variant);
+            var path = FindPath(start, goal, variant, acceptedCellUseCounts);
             if (path.Count == 0)
             {
                 continue;
@@ -185,6 +327,16 @@ internal sealed class RuntimeSkeldGrid
             if (!signatures.Add(signature))
             {
                 continue;
+            }
+
+            // Penalize only the interior cells of accepted candidates. Start
+            // and goal are necessarily shared, while interior reuse is what
+            // makes several nominal "top routes" collapse into one visible
+            // corridor. Collision and room coverage remain hard constraints.
+            for (var index = 1; index < path.Count - 1; index++)
+            {
+                acceptedCellUseCounts[path[index]] =
+                    acceptedCellUseCounts.GetValueOrDefault(path[index]) + 1;
             }
 
             routes.Add(compressed
@@ -213,7 +365,16 @@ internal sealed class RuntimeSkeldGrid
             !IsSegmentBlockedByStaticObstacle(from - normal, to - normal);
     }
 
-    private List<int> FindPath(int start, int goal, int variant)
+    internal static float RouteDiversityPenaltyForUseCount(int useCount)
+    {
+        return Mathf.Clamp(Math.Max(0, useCount) * 0.16f, 0f, 0.48f);
+    }
+
+    private List<int> FindPath(
+        int start,
+        int goal,
+        int variant,
+        IReadOnlyDictionary<int, int>? acceptedCellUseCounts = null)
     {
         var open = new PriorityQueue<int, float>();
         var cameFrom = new Dictionary<int, int>();
@@ -235,8 +396,12 @@ internal sealed class RuntimeSkeldGrid
                 }
 
                 var distance = Vector2.Distance(_positions[current], _positions[next]);
-                var variation = 1f + 0.12f * Hash01(current, next, variant);
-                var tentative = gScore[current] + distance * variation;
+                var variation = 1f + 0.18f * Hash01(current, next, variant);
+                var reusePenalty = acceptedCellUseCounts is null
+                    ? 0f
+                    : RouteDiversityPenaltyForUseCount(
+                        acceptedCellUseCounts.TryGetValue(next, out var useCount) ? useCount : 0);
+                var tentative = gScore[current] + distance * (variation + reusePenalty);
                 if (gScore.TryGetValue(next, out var existing) && tentative >= existing)
                 {
                     continue;
@@ -310,10 +475,18 @@ internal sealed class RuntimeSkeldGrid
 
     private static bool IsSegmentBlockedByStaticObstacle(Vector2 from, Vector2 to)
     {
-        var hits = Physics2D.LinecastAll(from, to);
-        for (var i = 0; i < hits.Length; i++)
+        var hitCount = Physics2D.LinecastNonAlloc(from, to, SegmentHitBuffer);
+        // A saturated buffer means there may be an uninspected wall behind the
+        // returned hits. Fail closed instead of allowing a possible shortcut
+        // through geometry.
+        if (hitCount >= SegmentHitBuffer.Length)
         {
-            if (IsStaticNavigationCollider(hits[i].collider))
+            return true;
+        }
+
+        for (var i = 0; i < hitCount; i++)
+        {
+            if (IsStaticNavigationCollider(SegmentHitBuffer[i].collider))
             {
                 return true;
             }
@@ -335,10 +508,31 @@ internal sealed class RuntimeSkeldGrid
             return false;
         }
 
-        var layer = collider.gameObject.layer;
-        if (layer is not (9 or 11 or 12))
+        // Only the two moving door leaves are transient. The old broad
+        // DeconSystem/name filter also discarded the chamber's structural side
+        // walls, so A* selected wall-adjacent cells and drove every bot into the
+        // same frame. Keep real walls authoritative while allowing the native
+        // door state machine to open the actual doorway colliders at runtime.
+        if (GameRuleSettings.IsMiraHqMap() && IsMiraDeconDoorCollider(collider))
         {
             return false;
+        }
+
+        var layer = collider.gameObject.layer;
+        var knownNavigationLayer = layer is 9 or 11 or 12;
+        if (!knownNavigationLayer && !GameRuleSettings.IsMiraHqMap())
+        {
+            return false;
+        }
+
+        if (!knownNavigationLayer && GameRuleSettings.IsMiraHqMap())
+        {
+            var playerCollider = PlayerControl.LocalPlayer?.Collider;
+            if (playerCollider is null || !playerCollider ||
+                Physics2D.GetIgnoreLayerCollision(playerCollider.gameObject.layer, layer))
+            {
+                return false;
+            }
         }
 
         var name = collider.name.ToLowerInvariant();
@@ -359,6 +553,22 @@ internal sealed class RuntimeSkeldGrid
         }
 
         return true;
+    }
+
+    private static bool IsMiraDeconDoorCollider(Collider2D collider)
+    {
+        var decon = collider.GetComponentInParent<DeconSystem>();
+        var door = collider.GetComponentInParent<SomeKindaDoor>();
+        if (decon && door &&
+            ((decon.UpperDoor && door == decon.UpperDoor) ||
+             (decon.LowerDoor && door == decon.LowerDoor)))
+        {
+            return true;
+        }
+
+        var name = collider.name;
+        return name.Contains("decon", StringComparison.OrdinalIgnoreCase) &&
+               name.Contains("door", StringComparison.OrdinalIgnoreCase);
     }
 
     private static HashSet<int> FloodFill(int seed, Dictionary<int, List<int>> neighbors)

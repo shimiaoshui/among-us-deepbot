@@ -2,7 +2,7 @@
 
 > Turn empty local-lobby slots into independent players that move, observe, deceive, discuss, vote, and learn from failed rounds.
 
-[![Release](https://img.shields.io/badge/release-0.9.11-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
+[![Release](https://img.shields.io/badge/release-0.10.0-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4)](#requirements)
 [![Game](https://img.shields.io/badge/game-Among%20Us-e83b3b)](#)
 [![TOR](https://img.shields.io/badge/The%20Other%20Roles-4.6.0-8a5cff)](#the-other-roles-460-integration)
@@ -10,7 +10,7 @@
 
 **Among Us DeepBot** is a host-authoritative AI player plugin for Among Us local and LAN lobbies. The host can configure between `1` and `8` bots in the lobby. Each bot joins as a real network player, while movement, decisions, and synchronization remain under host control. Human players, bots, and compatible clients can therefore play in the same match.
 
-Current release: `0.9.11-lobby-identity-meeting`. It includes a standalone build for the base game and a localized The Other Roles v4.6.0 integration build.
+Current release: `0.10.0-skeld-native-tor`. It ships separate one-click host and client installers for the TOR 4.6.0 compatibility build.
 
 ## More than an auto-walking bot
 
@@ -44,7 +44,17 @@ flowchart LR
 
 DeepBot does not force every bot to play an identical optimal strategy. Personality affects work rate, risk tolerance, trust in testimony, speaking style, and vote thresholds. One bot may rush tasks, another may wander or follow a trusted player, one may trust only eyewitness evidence, and another may be persuaded by a credible account.
 
-## Highlights in 0.9.11
+## Highlights in 0.10.0
+
+- Separate self-contained Windows installers configure the host and passive LAN clients from a selected Steam folder. Existing mod files are backed up before replacement.
+- Living bots no longer receive an unvalidated side-step when every avoidance direction is blocked, preventing corner escape from pushing a bot outside the hull.
+- Meetings continuously re-check native vote completion and detect TOR ghost roles, preventing a completed vote from freezing the round after a later meeting.
+- Vampire is excluded from every ordinary-kill pursuit entry point and uses the native TOR bite sequence: the victim dies at the original position after the configured delay.
+- Multi-stage role decisions keep TOR's native sequence authoritative while allowing a new tactical decision at legal checkpoints for Morphling, Trickster, Ninja, Warlock, Vampire, Bomber, and Yoyo.
+- Security Guard camera or DoorLog information, Detective footprints, Seer souls, base-game shapeshifts, and client vent entries enter the correct bot's private memory.
+- Speaker-attribution guards prevent bots from inventing lines that the addressed player never said. Unsupported meeting filler is suppressed instead of being presented as evidence.
+
+The release retains the lobby identity and evidence-isolation work introduced in 0.9.11:
 
 - The TOR lobby settings now configure each of up to eight bots independently: display name, color, outfit, and nameplate.
 - Bot identity is tied to reserved virtual-client ownership instead of the visible `DeepBot N` prefix. Renaming a bot no longer disables movement, tasks, meetings, abilities, camera isolation, or TOR interactions.
@@ -74,24 +84,24 @@ The compatibility layer recognizes all `44` custom primary roles, `2` base-game 
 - Lovers, Bait, Bloody, reversed controls, and other modifiers constrain movement, murder, voting, and target selection.
 - TOR remains authoritative for final win resolution and low-level ability legality. DeepBot chooses among legal actions; it does not replace or bypass TOR's rule engine.
 
-See the [complete TOR 4.6.0 role coverage matrix](docs/TOR-4.6.0-全职业覆盖.md) for the current automation depth of each role.
+See the [complete TOR 4.6.0 role coverage matrix](docs/TOR_ROLE_COVERAGE.md) for the current automation depth of each role.
 
 ## Downloads and quick start
 
-Open [GitHub Releases](https://github.com/shimiaoshui/among-us-deepbot/releases/latest) and choose one package:
+Open [GitHub Releases](https://github.com/shimiaoshui/among-us-deepbot/releases/latest) and choose one installer:
 
-- `AmongUs-DeepBot-0.9.11-Standalone.zip`: base Among Us with BepInEx 6.
-- `AmongUs-DeepBot-0.9.11-TOR46-Lobby-Identity-Meeting.zip`: strict TOR 4.6.0 integration with per-bot appearance settings and meeting evidence isolation. Every human player in the same lobby must install the identical compatibility package.
+- `AmongUs-DeepBot-Host-Installer.exe`: for the player who creates the Local/LAN lobby and controls the bots.
+- `AmongUs-DeepBot-Client-Installer.exe`: for every other human player; it installs the matching passive client configuration and never creates bots.
 
 Basic installation:
 
-1. Back up the current Among Us directory.
-2. Extract the selected package into the game root.
-3. Run `Install-DeepBot.cmd`. For model-backed meetings, run `Configure-DeepBot-Key.cmd` once and enter your own API key.
-4. Let the host create a local or LAN lobby, select the bot count in TOR settings, and start the game.
-5. Clients must use the same game, BepInEx, TOR, and DeepBot versions as the host.
+1. Close Among Us and run the correct installer.
+2. Select the Steam root, for example `D:\steam\`, or the exact folder containing `Among Us.exe`.
+3. The host runs `Configure-DeepBot-Key.cmd` once if model-backed meetings are wanted.
+4. The host creates a Local/LAN lobby, selects the bot count in TOR settings, and starts the game.
+5. Clients use the client installer from the same Release version.
 
-The [complete Chinese user guide](docs/完整使用教程.md) covers host/client installation, version checks, upgrades, rollback, and troubleshooting. Verify downloaded files against `SHA256SUMS.txt` from the Release page.
+The [complete English user guide](docs/USER_GUIDE.md) covers host/client installation, version checks, upgrades, rollback, and troubleshooting. Verify downloaded files against `SHA256SUMS.txt` from the Release page.
 
 ## Requirements
 
@@ -116,6 +126,6 @@ dotnet build .\src\AmongUsDeepSeekBots.csproj -c Release /p:AmongUsDir="D:\steam
 
 ## Project status
 
-DeepBot is an actively developed experimental game-AI project. The current focus is The Skeld and TOR 4.6.0. Complex mod combinations, different game builds, and extreme network conditions may still expose edge cases. Useful bug reports include `BepInEx\LogOutput.log`, lobby settings, role assignments, and exact reproduction steps.
+DeepBot is an actively developed experimental game-AI project. The Skeld and TOR 4.6.0 are the release-qualified target. MIRA HQ remains experimental and is not claimed as complete in this release. Complex mod combinations, different game builds, and extreme network conditions may still expose edge cases. Useful bug reports include `BepInEx\LogOutput.log`, lobby settings, role assignments, and exact reproduction steps.
 
 Project website: [shimiaoshui.xyz/deepbot](https://shimiaoshui.xyz/deepbot)

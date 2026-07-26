@@ -14,7 +14,9 @@
 
   <ItemGroup>
     <Compile Remove="decompiled_old_1_0\**\*.cs" />
+    <Compile Remove="_tor_native_audit\**\*.cs" />
     <None Remove="decompiled_old_1_0\**\*" />
+    <None Remove="_tor_native_audit\**\*" />
   </ItemGroup>
 
   <ItemGroup>
