@@ -24,6 +24,8 @@ foreach ($required in @(
     (Join-Path $GameDirectory 'Among Us.exe'),
     (Join-Path $GameDirectory 'winhttp.dll'),
     (Join-Path $GameDirectory 'doorstop_config.ini'),
+    (Join-Path $GameDirectory 'dotnet\coreclr.dll'),
+    (Join-Path $GameDirectory 'BepInEx\core\BepInEx.Unity.IL2CPP.dll'),
     $DeepBotDll,
     $TheOtherRolesDll,
     $installerProject,
@@ -55,6 +57,13 @@ function Copy-Runtime([string]$Stage) {
             Copy-Item -LiteralPath $source -Destination (Join-Path $Stage $rootFile) -Force
         }
     }
+
+    # Doorstop's IL2CPP configuration loads CoreCLR from
+    # dotnet\coreclr.dll.  Omitting this private runtime makes a clean
+    # machine launch the vanilla game even though BepInEx and the plugins
+    # were copied successfully.
+    Copy-Item -LiteralPath (Join-Path $GameDirectory 'dotnet') `
+        -Destination (Join-Path $Stage 'dotnet') -Recurse -Force
 
     foreach ($directory in @('core', 'interop', 'patchers', 'unity-libs')) {
         $source = Join-Path $GameDirectory "BepInEx\$directory"

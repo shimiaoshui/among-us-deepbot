@@ -60,6 +60,20 @@ internal static class Program
 
 internal sealed class InstallerForm : Form
 {
+    private static readonly string[] RequiredBootChain =
+    {
+        "winhttp.dll",
+        "doorstop_config.ini",
+        Path.Combine("dotnet", "coreclr.dll"),
+        Path.Combine("BepInEx", "core", "BepInEx.Unity.IL2CPP.dll"),
+        Path.Combine("BepInEx", "plugins", "Reactor.dll"),
+        Path.Combine("BepInEx", "plugins", "TheOtherRoles.dll"),
+        Path.Combine("BepInEx", "plugins", "AmongUsDeepSeekBots.dll"),
+        Path.Combine("BepInEx", "config", "local.amongus.deepseekbots.cfg"),
+        "Start-DeepBot.cmd",
+        "Start-DeepBot.ps1"
+    };
+
     private readonly TextBox _path = new() { Dock = DockStyle.Fill };
     private readonly Label _target = new() { AutoSize = true, ForeColor = Color.DimGray };
     private readonly Label _status = new() { AutoSize = true, ForeColor = Color.DimGray };
@@ -205,8 +219,8 @@ internal sealed class InstallerForm : Form
             MessageBox.Show(
                 this,
                 Program.Mode == "Host"
-                    ? "Installation completed. Start the game, open Local mode, and set the AI count in the lobby options. Configure your API key locally before using LLM meetings."
-                    : "Installation completed. Join the host through Local mode. Bot creation and AI decisions remain host-authoritative.",
+                    ? $"Installation and boot-chain verification completed.\n\nTarget: {gameDirectory}\n\nUse the DeepBot desktop shortcut, open Local mode, and set the AI count in the lobby options. Configure your API key locally before using LLM meetings."
+                    : $"Installation and boot-chain verification completed.\n\nTarget: {gameDirectory}\n\nUse the DeepBot desktop shortcut and join the host through Local mode. Bot creation and AI decisions remain host-authoritative.",
                 Text,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -214,7 +228,7 @@ internal sealed class InstallerForm : Form
             {
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
                 {
-                    FileName = Path.Combine(gameDirectory, "Among Us.exe"),
+                    FileName = Path.Combine(gameDirectory, "Start-DeepBot.cmd"),
                     WorkingDirectory = gameDirectory,
                     UseShellExecute = true
                 });
@@ -246,6 +260,7 @@ internal sealed class InstallerForm : Form
         using var payload = Assembly.GetExecutingAssembly().GetManifestResourceStream("DeepBot.Payload.zip")
                             ?? throw new InvalidOperationException("The embedded payload is missing.");
         using var archive = new ZipArchive(payload, ZipArchiveMode.Read, leaveOpen: false);
+        ValidatePayloadBootChain(archive);
         var root = Path.GetFullPath(gameDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var receiptDirectory = Path.Combine(gameDirectory, "DeepBot Installer Records");
         var receiptPath = Path.Combine(receiptDirectory, $"DeepBot-{Program.Mode}-Install.json");
@@ -315,6 +330,8 @@ internal sealed class InstallerForm : Form
                 originalBackupSha256));
         }
 
+        ValidateInstalledBootChain(gameDirectory);
+
         Directory.CreateDirectory(receiptDirectory);
         var receipt = new InstallReceipt(
             Program.Mode,
@@ -338,8 +355,43 @@ internal sealed class InstallerForm : Form
             {
                 $"{DateTime.Now:O} mode={Program.Mode} files={installed.Count} receipt={receiptPath}",
                 $"target={gameDirectory}",
-                $"backup={backupDirectory}"
+                $"backup={backupDirectory}",
+                "bootChain=ok"
             });
+    }
+
+    private static void ValidatePayloadBootChain(ZipArchive archive)
+    {
+        var entries = archive.Entries
+            .Where(entry => !string.IsNullOrEmpty(entry.Name))
+            .Select(entry => entry.FullName.Replace('/', Path.DirectorySeparatorChar).TrimStart(Path.DirectorySeparatorChar))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var missing = RequiredBootChain.Where(required => !entries.Contains(required)).ToArray();
+        if (missing.Length > 0)
+        {
+            throw new InvalidDataException(
+                "The installer payload is incomplete and cannot start BepInEx. Missing: " + string.Join(", ", missing));
+        }
+    }
+
+    private static void ValidateInstalledBootChain(string gameDirectory)
+    {
+        var missing = RequiredBootChain
+            .Where(relative => !File.Exists(Path.Combine(gameDirectory, relative)))
+            .ToArray();
+        if (missing.Length > 0)
+        {
+            throw new InvalidDataException(
+                "Installation finished with an incomplete BepInEx boot chain. Missing: " + string.Join(", ", missing));
+        }
+
+        var doorstop = File.ReadAllText(Path.Combine(gameDirectory, "doorstop_config.ini"));
+        if (!doorstop.Contains("enabled = true", StringComparison.OrdinalIgnoreCase) ||
+            !doorstop.Contains("target_assembly = BepInEx\\core\\BepInEx.Unity.IL2CPP.dll", StringComparison.OrdinalIgnoreCase) ||
+            !doorstop.Contains("coreclr_path = dotnet\\coreclr.dll", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("doorstop_config.ini does not point to the installed BepInEx/CoreCLR runtime.");
+        }
     }
 
     private static InstallReceipt? LoadReceipt(string receiptPath)
@@ -380,8 +432,9 @@ internal sealed class InstallerForm : Form
             shell = Activator.CreateInstance(shellType);
             shortcut = shellType.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { shortcutPath });
             var type = shortcut!.GetType();
-            type.InvokeMember("TargetPath", BindingFlags.SetProperty, null, shortcut, new object[] { Path.Combine(gameDirectory, "Among Us.exe") });
+            type.InvokeMember("TargetPath", BindingFlags.SetProperty, null, shortcut, new object[] { Path.Combine(gameDirectory, "Start-DeepBot.cmd") });
             type.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, shortcut, new object[] { gameDirectory });
+            type.InvokeMember("IconLocation", BindingFlags.SetProperty, null, shortcut, new object[] { Path.Combine(gameDirectory, "Among Us.exe") });
             type.InvokeMember("Description", BindingFlags.SetProperty, null, shortcut, new object[] { $"Launch Among Us DeepBot {Program.Mode}" });
             type.InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
         }
