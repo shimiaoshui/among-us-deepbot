@@ -21,6 +21,8 @@ Every participant must use the same Among Us, BepInEx, TOR, and DeepBot versions
 
 The installer searches only a small bounded area under `steamapps\common`. It does not install or redistribute the Among Us game itself. Before overwriting an existing mod file, it creates a timestamped copy under `DeepBot Installer Backups` inside the selected game folder. It also writes a local install receipt containing relative paths and SHA-256 hashes; the receipt never contains an API key.
 
+Version 0.10.1 and newer also installs the private `dotnet\coreclr.dll` runtime required by BepInEx IL2CPP and verifies the complete boot chain before reporting success. Use the generated DeepBot desktop shortcut: it checks the runtime and plugins first, so a removed or incomplete mod installation produces a clear error instead of silently launching the vanilla game.
+
 ## 3. Host setup
 
 The host should run `Configure-DeepBot-Key.cmd` once from the game folder and enter an OpenAI-compatible API key. The key is stored only at:

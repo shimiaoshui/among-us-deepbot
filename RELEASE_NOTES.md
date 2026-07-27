@@ -1,4 +1,13 @@
-# 0.10.0-skeld-native-tor
+# 0.10.1-installer-runtime-fix
+
+- Fixed clean-computer installations opening vanilla Among Us because the installer omitted the private `dotnet\coreclr.dll` runtime required by Doorstop/BepInEx IL2CPP.
+- Host and Client payloads now include the complete private CoreCLR runtime from the validated TOR build.
+- Added embedded-payload and post-install boot-chain validation. An incomplete package can no longer report a successful installation.
+- Desktop shortcuts now use the guarded DeepBot launcher, which identifies missing runtime or plugin files before starting the game.
+- Matching uninstallers track and reverse the newly installed runtime files through the existing receipt and backup system.
+- No API key is included.
+
+## Previous release: 0.10.0-skeld-native-tor
 
 - Added separate self-contained Windows host and client installers. Both accept a Steam root or exact game directory and back up overwritten mod files before installation.
 - Added matching self-contained host and client uninstallers. New installs record file hashes and original backups so removal can restore pre-install files while preserving user-modified files.

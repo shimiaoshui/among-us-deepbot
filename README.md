@@ -2,7 +2,7 @@
 
 > Turn empty local-lobby slots into independent players that move, observe, deceive, discuss, vote, and learn from failed rounds.
 
-[![Release](https://img.shields.io/badge/release-0.10.0-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
+[![Release](https://img.shields.io/badge/release-0.10.1-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4)](#requirements)
 [![Game](https://img.shields.io/badge/game-Among%20Us-e83b3b)](#)
 [![TOR](https://img.shields.io/badge/The%20Other%20Roles-4.6.0-8a5cff)](#the-other-roles-460-integration)
@@ -10,7 +10,7 @@
 
 **Among Us DeepBot** is a host-authoritative AI player plugin for Among Us local and LAN lobbies. The host can configure between `1` and `8` bots in the lobby. Each bot joins as a real network player, while movement, decisions, and synchronization remain under host control. Human players, bots, and compatible clients can therefore play in the same match.
 
-Current release: `0.10.0-skeld-native-tor`. It ships separate one-click host and client installers for the TOR 4.6.0 compatibility build.
+Current release: `0.10.1-installer-runtime-fix`. It ships separate one-click host and client installers for the TOR 4.6.0 compatibility build.
 
 ## More than an auto-walking bot
 
@@ -44,7 +44,13 @@ flowchart LR
 
 DeepBot does not force every bot to play an identical optimal strategy. Personality affects work rate, risk tolerance, trust in testimony, speaking style, and vote thresholds. One bot may rush tasks, another may wander or follow a trusted player, one may trust only eyewitness evidence, and another may be persuaded by a credible account.
 
-## Highlights in 0.10.0
+## Highlights in 0.10.1
+
+- Host and Client installers now include the private CoreCLR runtime required by BepInEx IL2CPP on a clean computer.
+- The installer verifies the complete Doorstop, CoreCLR, BepInEx, Reactor, TOR, DeepBot, configuration, and launcher chain before reporting success.
+- The desktop shortcut now runs a guarded launcher. If Steam validation or another tool removes a required mod file, it reports the missing component instead of silently opening vanilla Among Us.
+
+The release retains all gameplay changes from 0.10.0:
 
 - Separate self-contained Windows installers configure the host and passive LAN clients from a selected Steam folder. Existing mod files are backed up before replacement.
 - Living bots no longer receive an unvalidated side-step when every avoidance direction is blocked, preventing corner escape from pushing a bot outside the hull.
