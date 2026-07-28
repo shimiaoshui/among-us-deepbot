@@ -2,7 +2,7 @@
 
 > Turn empty local-lobby slots into independent players that move, observe, deceive, discuss, vote, and learn from failed rounds.
 
-[![Release](https://img.shields.io/badge/release-0.10.1-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
+[![Release](https://img.shields.io/badge/release-0.10.2-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4)](#requirements)
 [![Game](https://img.shields.io/badge/game-Among%20Us-e83b3b)](#)
 [![TOR](https://img.shields.io/badge/The%20Other%20Roles-4.6.0-8a5cff)](#the-other-roles-460-integration)
@@ -10,7 +10,7 @@
 
 **Among Us DeepBot** is a host-authoritative AI player plugin for Among Us local and LAN lobbies. The host can configure between `1` and `8` bots in the lobby. Each bot joins as a real network player, while movement, decisions, and synchronization remain under host control. Human players, bots, and compatible clients can therefore play in the same match.
 
-Current release: `0.10.1-installer-runtime-fix`. It ships separate one-click host and client installers for the TOR 4.6.0 compatibility build.
+Current release: `0.10.2-lan-handshake-api-setup`. It ships separate one-click host and client installers for one fingerprinted TOR 4.6.0 compatibility build.
 
 ## More than an auto-walking bot
 
@@ -44,8 +44,12 @@ flowchart LR
 
 DeepBot does not force every bot to play an identical optimal strategy. Personality affects work rate, risk tolerance, trust in testimony, speaking style, and vote thresholds. One bot may rush tasks, another may wander or follow a trusted player, one may trust only eyewitness evidence, and another may be persuaded by a credible account.
 
-## Highlights in 0.10.1
+## Highlights in 0.10.2
 
+- Local/LAN clients retry TOR's native version handshake while they are in the lobby. This fixes the race that could show “The host has no or a different version of The Other Roles” and remove a matching client.
+- TOR's native version and module checks remain authoritative; the fix does not disable incompatible-version protection.
+- Every Host and Client payload carries a compatibility manifest. The installer and launcher verify the exact TOR, Reactor, and DeepBot SHA-256 fingerprints before the game starts.
+- The Host installer includes masked fields for the OpenAI-compatible API base URL and API key. The key is written only to the current Windows user's local application-data folder and never to the game directory, installer receipt, log, source, or release archive.
 - Host and Client installers now include the private CoreCLR runtime required by BepInEx IL2CPP on a clean computer.
 - The installer verifies the complete Doorstop, CoreCLR, BepInEx, Reactor, TOR, DeepBot, configuration, and launcher chain before reporting success.
 - The desktop shortcut now runs a guarded launcher. If Steam validation or another tool removes a required mod file, it reports the missing component instead of silently opening vanilla Among Us.
@@ -107,7 +111,7 @@ Basic installation:
 
 1. Close Among Us and run the correct installer.
 2. Select the Steam root, for example `D:\steam\`, or the exact folder containing `Among Us.exe`.
-3. The host runs `Configure-DeepBot-Key.cmd` once if model-backed meetings are wanted.
+3. The host enters the API base URL and API key directly in the Host installer. `Configure-DeepBot-Key.cmd` remains available for later key changes.
 4. The host creates a Local/LAN lobby, selects the bot count in TOR settings, and starts the game.
 5. Clients use the client installer from the same Release version.
 
@@ -124,7 +128,7 @@ The [complete English user guide](docs/USER_GUIDE.md) covers host/client install
 
 ## Privacy and API keys
 
-The repository and release archives contain **no API key**. The configuration script stores a user's own key under that Windows user's local application-data directory; it is never written into the plugin DLL, Git repository, or redistribution archives. Without a key, bots continue to use local fallback behavior, although meeting language and high-level situational decisions become more conservative.
+The repository and release archives contain **no API key**. The Host installer and configuration script store a user's own key under that Windows user's local application-data directory; it is never written into the game directory, installer receipt, installer log, plugin DLL, Git repository, or redistribution archives. Without a key, bots continue to use local fallback behavior, although meeting language and high-level situational decisions become more conservative.
 
 ## Building from source
 

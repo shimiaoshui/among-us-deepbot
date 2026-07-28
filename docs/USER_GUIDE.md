@@ -21,17 +21,17 @@ Every participant must use the same Among Us, BepInEx, TOR, and DeepBot versions
 
 The installer searches only a small bounded area under `steamapps\common`. It does not install or redistribute the Among Us game itself. Before overwriting an existing mod file, it creates a timestamped copy under `DeepBot Installer Backups` inside the selected game folder. It also writes a local install receipt containing relative paths and SHA-256 hashes; the receipt never contains an API key.
 
-Version 0.10.1 and newer also installs the private `dotnet\coreclr.dll` runtime required by BepInEx IL2CPP and verifies the complete boot chain before reporting success. Use the generated DeepBot desktop shortcut: it checks the runtime and plugins first, so a removed or incomplete mod installation produces a clear error instead of silently launching the vanilla game.
+Version 0.10.1 and newer also installs the private `dotnet\coreclr.dll` runtime required by BepInEx IL2CPP and verifies the complete boot chain before reporting success. Version 0.10.2 additionally verifies an exact TOR/Reactor/DeepBot compatibility fingerprint. Use the generated DeepBot desktop shortcut: it checks the runtime and fingerprints first, so an incomplete or mixed release produces a clear error instead of silently launching vanilla Among Us or entering an incompatible lobby.
 
 ## 3. Host setup
 
-The host should run `Configure-DeepBot-Key.cmd` once from the game folder and enter an OpenAI-compatible API key. The key is stored only at:
+The Host installer shows an API base URL field and a masked API-key field. Enter the OpenAI-compatible endpoint (for example, the Agnes `/v1` endpoint) and the host's own key during installation. `Configure-DeepBot-Key.cmd` remains available in the game folder when the key needs to be changed later. The key is stored only at:
 
 ```text
 %LOCALAPPDATA%\AmongUsDeepSeekBots\api-key.txt
 ```
 
-It is not stored in the game folder, plugin configuration, installer, repository, or release archive. Clients do not need an API key. DeepBot can run without a key, but meetings and high-level strategy use conservative local fallback behavior.
+It is not stored in the game folder, plugin configuration, installer receipt, installer log, repository, or release archive. Clients do not need an API key. DeepBot can run without a key, but meetings and high-level strategy use conservative local fallback behavior.
 
 Start the game, create a Local lobby, and open the TOR lobby options. Set **AI Bot Count** from 1 to 8. Optional per-bot settings allow the host to change each bot's name, color, outfit, and nameplate.
 
@@ -46,7 +46,7 @@ Only one primary role is valid for a player. Stackable modifiers such as Lover, 
 1. The host creates the Local lobby.
 2. Client players install the matching client package and join through the game's Local mode.
 3. Only the host creates and drives bots. Clients receive the synchronized players and world state.
-4. Start only when every human player reports the same mod versions.
+4. Start only when every human player reports the same mod versions. Install every Host and Client from the same GitHub Release.
 
 The current release-qualified map is The Skeld. MIRA HQ remains experimental.
 
@@ -74,7 +74,8 @@ Never add an API key to this configuration file.
 
 After launching once, open `BepInEx\LogOutput.log`. A correct host installation should show:
 
-- `Among Us DeepSeek Bots 0.10.0-skeld-native-tor loaded`
+- `Among Us DeepSeek Bots 0.10.2-lan-handshake loaded`
+- `DeepBot LAN TOR handshake retry active`
 - `customRoles=44, modifiers=11`
 - startup self-tests with `level=ok`
 - one primary role and a separate modifier list for each bot
@@ -84,6 +85,8 @@ The log must never contain the API-key value.
 ## 8. Troubleshooting
 
 **The game does not start:** remove duplicate or old plugin DLLs from `BepInEx\plugins`, then verify that all players use the same versions.
+
+**The client says the host has no or a different TOR version:** confirm both computers used the Host and Client installers from the same Release, then launch both through their generated DeepBot shortcuts. The shortcut validates `DeepBot-Compatibility.json` against the installed TOR, Reactor, and DeepBot files before starting the game. Version 0.10.2 retries TOR's native LAN handshake but intentionally does not permit genuinely different TOR builds.
 
 **Bots do not move:** preserve the complete `BepInEx\LogOutput.log` and note the map, lobby settings, roles, and location. Look for `no route`, `stuck`, `replanning`, or an exception.
 

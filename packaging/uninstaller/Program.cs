@@ -333,6 +333,7 @@ internal sealed class UninstallerForm : Form
         yield return Path.Combine("BepInEx", "plugins", "AmongUsDeepSeekBots.dll");
         yield return Path.Combine("BepInEx", "config", "local.amongus.deepseekbots.cfg");
         yield return "README-DeepBot.txt";
+        yield return "DeepBot-Compatibility.json";
         yield return "Start-DeepBot.ps1";
         yield return "Start-DeepBot.cmd";
 #if HOST_UNINSTALLER
