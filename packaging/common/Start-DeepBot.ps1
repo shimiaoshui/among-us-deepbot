@@ -27,6 +27,15 @@ if ($doorstop -notmatch '(?im)^\s*enabled\s*=\s*true\s*$' -or
     throw 'DeepBot cannot start because doorstop_config.ini is disabled or does not reference dotnet\coreclr.dll. Re-run the matching installer.'
 }
 $manifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'DeepBot-Compatibility.json') -Raw | ConvertFrom-Json
+$configPath = Join-Path $PSScriptRoot 'BepInEx\config\local.amongus.deepseekbots.cfg'
+$configText = Get-Content -LiteralPath $configPath -Raw
+$botCountMatch = [regex]::Match($configText, '(?im)^\s*BotCount\s*=\s*(\d+)\s*$')
+if (-not $botCountMatch.Success) {
+    throw 'DeepBot cannot start because the installed configuration has no valid BotCount setting. Re-run the matching installer.'
+}
+if ([string]$manifest.Mode -eq 'Client' -and $botCountMatch.Groups[1].Value -ne '0') {
+    throw 'DeepBot Client cannot start because BotCount is not 0. Re-run the Client installer; only the Host may create bots.'
+}
 $compatibilityFiles = @(
     @{ Path = 'BepInEx\plugins\TheOtherRoles.dll'; Expected = $manifest.TorSha256 },
     @{ Path = 'BepInEx\plugins\Reactor.dll'; Expected = $manifest.ReactorSha256 },
@@ -39,13 +48,17 @@ foreach ($item in $compatibilityFiles) {
     }
 }
 $keyPath = Join-Path $env:LOCALAPPDATA 'AmongUsDeepSeekBots\api-key.txt'
-if (-not (Test-Path -LiteralPath $keyPath)) {
+if ([string]$manifest.Mode -eq 'Host' -and -not (Test-Path -LiteralPath $keyPath)) {
     Write-Host 'API key is not configured; local fallback logic will be used. Run Configure-DeepBot-Key.cmd to configure it.' -ForegroundColor Yellow
 }
 if ($ValidateOnly) {
-    Write-Output "DeepBot boot chain and compatibility fingerprint are valid for release $($manifest.ReleaseVersion) ($($manifest.CompatibilityId))."
+    Write-Output "DeepBot $($manifest.Mode) boot chain is valid for release $($manifest.ReleaseVersion) ($($manifest.CompatibilityId)); gameRoot=$PSScriptRoot; BotCount=$($botCountMatch.Groups[1].Value)."
     exit 0
 }
+$caption = "DeepBot $($manifest.Mode) $($manifest.ReleaseVersion)"
+$message = "Starting the verified $($manifest.Mode) build from:`n$PSScriptRoot`n`nDo not launch another Among Us copy through Steam."
+Add-Type -AssemblyName PresentationFramework
+[System.Windows.MessageBox]::Show($message, $caption, 'OK', 'Information') | Out-Null
 $oldDoorstopDisable = $env:DOORSTOP_DISABLE
 try {
     Remove-Item Env:DOORSTOP_DISABLE -ErrorAction SilentlyContinue

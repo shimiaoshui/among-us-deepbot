@@ -14,7 +14,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "local.amongus.deepseekbots";
     public const string PluginName = "Among Us DeepSeek Bots";
-    public const string PluginVersion = "0.10.4-client-visibility";
+    public const string PluginVersion = "0.10.5-client-sync";
 
     private readonly Harmony _harmony = new(PluginGuid);
 
@@ -45,7 +45,9 @@ public sealed class Plugin : BasePlugin
         host.hideFlags = HideFlags.HideAndDontSave;
         host.AddComponent<DeepBotRuntime>();
 
-        Log.LogInfo($"{PluginName} {PluginVersion} loaded. Enabled={Settings.Enabled.Value}, LocalBots={Settings.LocalBotCount.Value}, mode=rebuild-clean");
+        Log.LogInfo(
+            $"{PluginName} {PluginVersion} loaded. Enabled={Settings.Enabled.Value}, " +
+            $"LocalBots={Settings.LocalBotCount.Value}, mode=rebuild-clean, gameRoot={Paths.GameRootPath}, config={Config.ConfigFilePath}");
     }
 
     public override bool Unload()

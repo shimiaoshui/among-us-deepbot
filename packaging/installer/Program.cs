@@ -86,7 +86,13 @@ internal sealed class InstallerForm : Form
     private readonly Label _target = new() { AutoSize = true, ForeColor = Color.DimGray };
     private readonly Label _status = new() { AutoSize = true, ForeColor = Color.DimGray };
     private readonly Button _install = new() { Text = "Install", AutoSize = true };
-    private readonly CheckBox _shortcut = new() { Text = "Create a desktop shortcut", Checked = true, AutoSize = true };
+    private readonly CheckBox _shortcut = new()
+    {
+        Text = "Create the dedicated DeepBot desktop shortcut (required to avoid launching another Among Us copy)",
+        Checked = true,
+        Enabled = false,
+        AutoSize = true
+    };
     private readonly CheckBox _launch = new() { Text = "Launch Among Us after installation", Checked = false, AutoSize = true };
     private readonly TextBox _apiBaseUrl = new()
     {
@@ -250,7 +256,10 @@ internal sealed class InstallerForm : Form
         UseWaitCursor = true;
         try
         {
-            var shortcut = _shortcut.Checked;
+            // Interactive installs always create a guarded, mode-specific
+            // shortcut. Launching through Steam can open another Among Us
+            // library copy and silently load an older DLL/configuration.
+            const bool shortcut = true;
             var apiBaseUrl = Program.Mode == "Host" ? NormalizeApiBaseUrl(_apiBaseUrl.Text) : null;
             var apiKey = Program.Mode == "Host" ? _apiKey.Text : null;
             await Task.Run(() => InstallPayload(gameDirectory, shortcut, apiBaseUrl, apiKey));
@@ -259,8 +268,8 @@ internal sealed class InstallerForm : Form
             MessageBox.Show(
                 this,
                 Program.Mode == "Host"
-                    ? $"Installation, TOR compatibility verification, and API configuration completed.\n\nTarget: {gameDirectory}\n\nUse the DeepBot desktop shortcut, open Local mode, and set the AI count in the lobby options. All players must install the Host/Client packages from this same release."
-                    : $"Installation and boot-chain verification completed.\n\nTarget: {gameDirectory}\n\nUse the DeepBot desktop shortcut and join the host through Local mode. Bot creation and AI decisions remain host-authoritative.",
+                    ? $"Installation, TOR compatibility verification, and API configuration completed.\n\nExact target: {gameDirectory}\nShortcut: Among Us DeepBot Host\n\nAlways use this shortcut (not Steam's generic Play button), open Local mode, and set the AI count in the lobby options. All players must install Host/Client packages from this same release."
+                    : $"Installation and boot-chain verification completed.\n\nExact target: {gameDirectory}\nShortcut: Among Us DeepBot Client\n\nAlways use this shortcut (not Steam's generic Play button) and join the host through Local mode. Bot creation and AI decisions remain host-authoritative.",
                 Text,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
@@ -532,6 +541,23 @@ internal sealed class InstallerForm : Form
         var manifestPath = Path.Combine(gameDirectory, "DeepBot-Compatibility.json");
         var manifest = JsonSerializer.Deserialize<CompatibilityManifest>(File.ReadAllText(manifestPath))
                        ?? throw new InvalidDataException("DeepBot-Compatibility.json is invalid.");
+        if (!string.Equals(manifest.Mode, Program.Mode, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                $"The embedded package is {manifest.Mode}, but this installer is {Program.Mode}. Download the matching installer again.");
+        }
+
+        var configPath = Path.Combine(gameDirectory, "BepInEx", "config", "local.amongus.deepseekbots.cfg");
+        var config = File.ReadAllText(configPath);
+        var countMatch = Regex.Match(config, @"(?im)^\s*BotCount\s*=\s*(\d+)\s*$");
+        if (!countMatch.Success)
+        {
+            throw new InvalidDataException("The installed DeepBot configuration has no valid BotCount setting.");
+        }
+        if (Program.Mode == "Client" && countMatch.Groups[1].Value != "0")
+        {
+            throw new InvalidDataException("The passive Client package must install BotCount = 0. Reinstall the Client package.");
+        }
         var torPath = Path.Combine(gameDirectory, "BepInEx", "plugins", "TheOtherRoles.dll");
         var reactorPath = Path.Combine(gameDirectory, "BepInEx", "plugins", "Reactor.dll");
         var deepBotPath = Path.Combine(gameDirectory, "BepInEx", "plugins", "AmongUsDeepSeekBots.dll");

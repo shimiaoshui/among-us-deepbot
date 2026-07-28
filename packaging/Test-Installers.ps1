@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $testBase = [IO.Path]::GetFullPath((Join-Path $repositoryRoot '.installer-tests'))
-$testRoot = [IO.Path]::GetFullPath((Join-Path $testBase 'v0.10.4-client-visibility'))
+$testRoot = [IO.Path]::GetFullPath((Join-Path $testBase 'v0.10.5-client-sync'))
 $allowedPrefix = $testBase.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
 if (-not $testRoot.StartsWith($allowedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to clear a test path outside $testBase"
@@ -57,6 +57,13 @@ try {
 
     $hostManifest = Get-Content -LiteralPath (Join-Path $hostDirectory 'DeepBot-Compatibility.json') -Raw | ConvertFrom-Json
     $clientManifest = Get-Content -LiteralPath (Join-Path $clientDirectory 'DeepBot-Compatibility.json') -Raw | ConvertFrom-Json
+    if ($hostManifest.Mode -ne 'Host' -or $clientManifest.Mode -ne 'Client') {
+        throw "Installer mode mismatch: host=$($hostManifest.Mode), client=$($clientManifest.Mode)"
+    }
+    $clientConfig = Get-Content -LiteralPath (Join-Path $clientDirectory 'BepInEx\config\local.amongus.deepseekbots.cfg') -Raw
+    if ($clientConfig -notmatch '(?m)^BotCount\s*=\s*0\s*$') {
+        throw 'Client package did not force BotCount = 0.'
+    }
     if ($hostManifest.CompatibilityId -ne $clientManifest.CompatibilityId) {
         throw 'Host/client compatibility IDs differ.'
     }

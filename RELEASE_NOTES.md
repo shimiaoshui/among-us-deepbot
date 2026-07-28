@@ -1,4 +1,12 @@
-# 0.10.4-client-visibility (release candidate)
+# 0.10.5-client-sync
+
+- Published through GitHub's normal Latest channel so users downloading from the repository front page receive the current Client package instead of 0.10.3.
+- Interactive Host and Client installs always create a guarded, mode-specific desktop shortcut. The launcher shows the exact release, mode, and game directory before starting.
+- Client installation and launch both enforce `BotCount = 0`, preventing a passive peer from creating local bots while it briefly owns the loopback lobby before joining the real host.
+- Plugin startup diagnostics now include the actual game root and configuration path, making wrong-directory and stale-DLL reports immediately identifiable.
+- Rebuilt and clean-install tested all four Windows installers/uninstallers as release 0.10.5 with matching TOR, Reactor, and DeepBot fingerprints, clean uninstall, and no embedded API key.
+
+## Previous release candidate: 0.10.4-client-visibility
 
 - Fixed host-created bots existing only in the host's local `ClientData` roster after a LAN peer joined. Passive clients now bind reserved bot player records to the authoritative host-spawned `PlayerControl` objects and create local presentation-only client proxies.
 - Fixed the passive-client runtime boundary returning before presentation maintenance could execute. Clients still cannot run bot movement, decisions, abilities, meetings, role state, or camera control.
