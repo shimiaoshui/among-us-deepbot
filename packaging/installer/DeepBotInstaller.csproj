@@ -9,7 +9,7 @@
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
-    <Version>0.10.3</Version>
+    <Version>0.10.4</Version>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(InstallerMode)' == 'Host'">

@@ -1,4 +1,13 @@
-# 0.10.3-authority-handshake
+# 0.10.4-client-visibility (release candidate)
+
+- Fixed host-created bots existing only in the host's local `ClientData` roster after a LAN peer joined. Passive clients now bind reserved bot player records to the authoritative host-spawned `PlayerControl` objects and create local presentation-only client proxies.
+- Fixed the passive-client runtime boundary returning before presentation maintenance could execute. Clients still cannot run bot movement, decisions, abilities, meetings, role state, or camera control.
+- Added throttled client diagnostics reporting reserved bot records, matched network controls, presentation proxies, and total client entries.
+- Fixed unstable lobby-name collision detection that repeatedly changed every bot between its configured name and a suffixed name, producing an RPC flood and eventual heartbeat timeout.
+- Bot identity now survives host-owned network/physics synchronization without falling through to the human input path.
+- Rebuilt and clean-install tested all four Windows installers/uninstallers with matching TOR, Reactor, and DeepBot fingerprints. No API key is included.
+
+## Previous release: 0.10.3-authority-handshake
 
 - Fixed passive clients participating in DeepBot's runtime control loop. A strict host-authority boundary now blocks every bot movement, physics, role-state, meeting, camera, memory, and world-control callback on clients.
 - Fixed bots appearing to mirror a human client's movement after installing the client package. Clients now render host-synchronized state only and log `DeepBot passive client mode active` when world control is disabled.

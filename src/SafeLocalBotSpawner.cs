@@ -13,6 +13,7 @@ namespace AmongUsDeepSeekBots;
 internal sealed class SafeLocalBotSpawner
 {
     private const float LobbyBotCountStableSeconds = 2f;
+    private const float PassiveRosterSyncSeconds = 0.35f;
     private static readonly MethodInfo? CreatePlayerMethod =
         AccessTools.Method(typeof(AmongUsClient), "CreatePlayer");
 
@@ -21,11 +22,13 @@ internal sealed class SafeLocalBotSpawner
     private readonly HashSet<byte> _visibilityRestored = [];
     private readonly HashSet<byte> _renderDiagnosticsLogged = [];
     private readonly HashSet<byte> _disabledBotLightIds = [];
+    private readonly HashSet<int> _passiveProxyClientIds = [];
     private readonly Dictionary<int, string> _appliedLobbyAppearances = [];
     private readonly LobbyBotCountStabilizer _botCountStabilizer = new(LobbyBotCountStableSeconds);
     private float _nextSpawnAt;
     private float _nextStatusAt;
     private float _nextGuestStatusAt;
+    private float _nextPassiveRosterSyncAt;
     private bool _spawnBlocked;
     private bool _startedSpawnBlockLogged;
     private bool _hostLightRepairLogged;
@@ -41,13 +44,7 @@ internal sealed class SafeLocalBotSpawner
         var client = AmongUsClient.Instance;
         if (IsPassiveLanGuest(client))
         {
-            if (Time.time >= _nextGuestStatusAt)
-            {
-                _nextGuestStatusAt = Time.time + 15f;
-                _log.LogInfo($"DeepBot LAN guest passive mode: clientId={client.ClientId}, hostId={client.HostId}, clients={client.allClients.Count}. Host controls AI bots.");
-            }
-
-            ResetTransientState();
+            MaintainPassiveClientView();
             return;
         }
 
@@ -312,6 +309,165 @@ internal sealed class SafeLocalBotSpawner
         EnsureHostVisionLight(client, "runtime frame");
     }
 
+    public void MaintainPassiveClientView()
+    {
+        var client = AmongUsClient.Instance;
+        if (!IsPassiveLanGuest(client))
+        {
+            ClearPassiveGuestProxies(client);
+            return;
+        }
+
+        var now = Time.realtimeSinceStartup;
+        if (now < _nextPassiveRosterSyncAt)
+        {
+            return;
+        }
+        _nextPassiveRosterSyncAt = now + PassiveRosterSyncSeconds;
+
+        var reservedInfos = 0;
+        var matchedControls = 0;
+        var createdProxies = 0;
+        if (GameData.Instance)
+        {
+            foreach (var info in GameData.Instance.AllPlayers)
+            {
+                if (info is null || !DeepBotIdentity.IsReservedClientId(info.ClientId))
+                {
+                    continue;
+                }
+
+                reservedInfos++;
+                var character = FindPlayerControl(info.PlayerId);
+                if (character)
+                {
+                    matchedControls++;
+                }
+
+                var proxy = FindClientData(client!, info.ClientId);
+                if (proxy is null)
+                {
+                    var platform = new PlatformSpecificData
+                    {
+                        Platform = Platforms.StandaloneSteamPC,
+                        PlatformName = "DeepBot Host Proxy"
+                    };
+                    proxy = new ClientData(info.ClientId, info.PlayerName, platform, 5u, string.Empty, string.Empty)
+                    {
+                        InScene = true,
+                        IsReady = true,
+                        IsBeingCreated = false,
+                        Character = character,
+                        ColorId = info.DefaultOutfit.ColorId
+                    };
+                    client!.allClients.Add(proxy);
+                    _passiveProxyClientIds.Add(info.ClientId);
+                    createdProxies++;
+                }
+                else
+                {
+                    proxy.InScene = true;
+                    proxy.IsReady = true;
+                    proxy.IsBeingCreated = false;
+                    proxy.PlayerName = info.PlayerName;
+                    proxy.ColorId = info.DefaultOutfit.ColorId;
+                    if (character && proxy.Character != character)
+                    {
+                        proxy.Character = character;
+                    }
+                }
+            }
+        }
+
+        PruneMissingPassiveGuestProxies(client!);
+        EnsureLivePlayersVisible(client!, botsOnly: true, allowLobby: true);
+
+        if (Time.time >= _nextGuestStatusAt)
+        {
+            _nextGuestStatusAt = Time.time + 5f;
+            _log.LogInfo(
+                $"DeepBot LAN guest presentation sync: clientId={client!.ClientId}, hostId={client.HostId}, " +
+                $"reservedInfos={reservedInfos}, matchedControls={matchedControls}, proxyClients={_passiveProxyClientIds.Count}, " +
+                $"createdNow={createdProxies}, clients={client.allClients.Count}. Host remains sole AI authority.");
+        }
+    }
+
+    private void PruneMissingPassiveGuestProxies(AmongUsClient client)
+    {
+        foreach (var clientId in _passiveProxyClientIds.ToArray())
+        {
+            var stillPresent = false;
+            if (GameData.Instance)
+            {
+                foreach (var info in GameData.Instance.AllPlayers)
+                {
+                    if (info is not null && info.ClientId == clientId)
+                    {
+                        stillPresent = true;
+                        break;
+                    }
+                }
+            }
+
+            if (stillPresent)
+            {
+                continue;
+            }
+
+            RemoveClientDataLocally(client, clientId);
+            _passiveProxyClientIds.Remove(clientId);
+        }
+    }
+
+    private void ClearPassiveGuestProxies(AmongUsClient? client)
+    {
+        if (client is not null && client)
+        {
+            foreach (var clientId in _passiveProxyClientIds)
+            {
+                RemoveClientDataLocally(client, clientId);
+            }
+        }
+        _passiveProxyClientIds.Clear();
+        _nextPassiveRosterSyncAt = 0f;
+    }
+
+    private static void RemoveClientDataLocally(AmongUsClient client, int clientId)
+    {
+        for (var index = client.allClients.Count - 1; index >= 0; index--)
+        {
+            if (client.allClients[index]?.Id == clientId)
+            {
+                client.allClients.RemoveAt(index);
+            }
+        }
+    }
+
+    private static ClientData? FindClientData(AmongUsClient client, int clientId)
+    {
+        for (var index = 0; index < client.allClients.Count; index++)
+        {
+            var candidate = client.allClients[index];
+            if (candidate?.Id == clientId)
+            {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private static PlayerControl? FindPlayerControl(byte playerId)
+    {
+        foreach (var player in PlayerControl.AllPlayerControls)
+        {
+            if (player && player.PlayerId == playerId)
+            {
+                return player;
+            }
+        }
+        return null;
+    }
+
     private void TryCreateOne(AmongUsClient client, int botIndex)
     {
         if (CreatePlayerMethod is null)
@@ -435,51 +591,80 @@ internal sealed class SafeLocalBotSpawner
                 continue;
             }
 
-            candidate.PlayerName = name;
-            character.Data.PlayerName = name;
-            character.SetName(name);
-            character.RpcSetName(name);
-            character.SetColor(color);
-            character.RpcSetColor((byte)color);
+            var nameChanged = !string.Equals(candidate.PlayerName, name, StringComparison.Ordinal) ||
+                              !string.Equals(character.Data.PlayerName, name, StringComparison.Ordinal);
+            if (nameChanged)
+            {
+                candidate.PlayerName = name;
+                character.Data.PlayerName = name;
+                character.SetName(name);
+                character.RpcSetName(name);
+            }
+
+            var colorChanged = character.Data.DefaultOutfit.ColorId != color;
+            if (colorChanged)
+            {
+                character.SetColor(color);
+                character.RpcSetColor((byte)color);
+            }
             DeepBotAppearance.ApplyOutfit(character, _hostPlayer, botIndex, appearance.OutfitSelection, _log);
             DeepBotAppearance.ApplyNamePlate(character, _hostPlayer, botIndex, appearance.NamePlateSelection, _log);
             _appliedLobbyAppearances[candidate.Id] = signature;
             _log.LogInfo(
                 $"DeepBot lobby appearance applied: bot={botIndex + 1}, client={candidate.Id}, " +
-                $"name={name}, color={color}, outfit={appearance.OutfitSelection}, nameplate={appearance.NamePlateSelection}.");
+                $"name={name}, color={color}, nameChanged={nameChanged}, colorChanged={colorChanged}, " +
+                $"outfit={appearance.OutfitSelection}, nameplate={appearance.NamePlateSelection}.");
         }
     }
 
     private static string ResolveUniqueLobbyName(int botIndex, int nameSelection)
     {
-        var configuredName = DeepBotAppearance.ResolveName(botIndex, nameSelection);
-        var collidesWithEarlierBot = false;
-        for (var earlierIndex = 0; earlierIndex < botIndex; earlierIndex++)
+        var occupied = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var player in PlayerControl.AllPlayerControls)
         {
-            var earlierAppearance = TorRoleAdapter.GetLobbyAppearance(earlierIndex);
-            var earlierName = DeepBotAppearance.ResolveName(earlierIndex, earlierAppearance.NameSelection);
-            if (string.Equals(earlierName, configuredName, StringComparison.OrdinalIgnoreCase))
+            // Never use a bot's current display name to decide its next display
+            // name. Doing that made Iris -> Iris 1 -> Iris on alternating frames
+            // after runtime ownership moved to the host, creating an RPC storm.
+            if (player && player.Data is not null && !DeepBotIdentity.IsBot(player))
             {
-                collidesWithEarlierBot = true;
-                break;
+                occupied.Add(player.Data.PlayerName);
             }
         }
 
-        var collidesWithHuman = false;
-        foreach (var player in PlayerControl.AllPlayerControls)
+        for (var index = 0; index <= botIndex; index++)
         {
-            if (player &&
-                player.Data is not null &&
-                !DeepBotIdentity.IsBot(player) &&
-                string.Equals(player.Data.PlayerName, configuredName, StringComparison.OrdinalIgnoreCase))
+            var appearance = index == botIndex
+                ? TorRoleAdapter.GetLobbyAppearance(botIndex) with { NameSelection = nameSelection }
+                : TorRoleAdapter.GetLobbyAppearance(index);
+            var configuredName = DeepBotAppearance.ResolveName(index, appearance.NameSelection);
+            var resolvedName = ResolveStableUniqueName(configuredName, index, occupied);
+            if (index == botIndex)
             {
-                collidesWithHuman = true;
-                break;
+                return resolvedName;
             }
+
+            occupied.Add(resolvedName);
         }
-        return collidesWithEarlierBot || collidesWithHuman
-            ? $"{configuredName} {botIndex + 1}"
-            : configuredName;
+
+        return DeepBotAppearance.ResolveName(botIndex, nameSelection);
+    }
+
+    private static string ResolveStableUniqueName(string configuredName, int botIndex, ISet<string> occupied)
+    {
+        if (!occupied.Contains(configuredName))
+        {
+            return configuredName;
+        }
+
+        var suffix = botIndex + 1;
+        string candidate;
+        do
+        {
+            candidate = $"{configuredName} {suffix++}";
+        }
+        while (occupied.Contains(candidate));
+
+        return candidate;
     }
 
     private static void StartCreatePlayerCoroutine(AmongUsClient client, object? created, ClientData botClient)
@@ -792,9 +977,10 @@ internal sealed class SafeLocalBotSpawner
         }
     }
 
-    private void EnsureLivePlayersVisible(AmongUsClient client)
+    private void EnsureLivePlayersVisible(AmongUsClient client, bool botsOnly = false, bool allowLobby = false)
     {
-        if (client.GameState != InnerNetClient.GameStates.Started || !ShipStatus.Instance)
+        var matchStarted = client.GameState == InnerNetClient.GameStates.Started;
+        if ((!matchStarted && !allowLobby) || (matchStarted && !ShipStatus.Instance))
         {
             _visibilityRestored.Clear();
             return;
@@ -807,15 +993,18 @@ internal sealed class SafeLocalBotSpawner
                 !character ||
                 character.Data is null ||
                 character.Data.IsDead ||
-                character.Data.Disconnected)
+                character.Data.Disconnected ||
+                (botsOnly && !DeepBotIdentity.IsBot(character)))
             {
                 continue;
             }
 
             var legitimatePhantomInvisibility =
+                matchStarted &&
                 character.Data.RoleType == RoleTypes.Phantom &&
                 character.shouldAppearInvisible;
-            var legitimateTorConcealment = TorRoleAdapter.IsTorVisualConcealmentEffectActive(character);
+            var legitimateTorConcealment = matchStarted &&
+                TorRoleAdapter.IsTorVisualConcealmentEffectActive(character);
             if (legitimatePhantomInvisibility || legitimateTorConcealment)
             {
                 continue;
@@ -1104,14 +1293,26 @@ internal sealed class SafeLocalBotSpawner
         var exactRosterRequired = IsExactLobbyRosterReady(5, 5, 5) &&
                                   !IsExactLobbyRosterReady(8, 8, 5) &&
                                   !IsExactLobbyRosterReady(5, 7, 5);
+        var occupied = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Human" };
+        var firstName = ResolveStableUniqueName("Iris", 0, occupied);
+        occupied.Add(firstName);
+        var duplicateName = ResolveStableUniqueName("Iris", 1, occupied);
+        var repeatOccupied = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Human" };
+        var repeatedFirstName = ResolveStableUniqueName("Iris", 0, repeatOccupied);
+        repeatOccupied.Add(repeatedFirstName);
+        var repeatedDuplicateName = ResolveStableUniqueName("Iris", 1, repeatOccupied);
+        var stableAppearanceNames = firstName == "Iris" && duplicateName == "Iris 2" &&
+                                    repeatedFirstName == firstName && repeatedDuplicateName == duplicateName;
         var level = initialEight && transientOneHeld && restoredEightHeld && deliberateOnePending &&
-                    deliberateOneAccepted && startedMatchFrozen && resetAcceptsFreshValue && exactRosterRequired
+                    deliberateOneAccepted && startedMatchFrozen && resetAcceptsFreshValue && exactRosterRequired &&
+                    stableAppearanceNames
             ? "ok"
             : "error";
         log.LogInfo(
             $"DeepBot lobby spawn self-test: level={level}, transientCountHeld={transientOneHeld && restoredEightHeld}, " +
             $"deliberateCountAccepted={deliberateOneAccepted}, startedMatchFrozen={startedMatchFrozen}, " +
-            $"resetAcceptsFreshValue={resetAcceptsFreshValue}, exactRosterRequired={exactRosterRequired}, nativeLobbySpawnRequired=true.");
+            $"resetAcceptsFreshValue={resetAcceptsFreshValue}, exactRosterRequired={exactRosterRequired}, " +
+            $"stableAppearanceNames={stableAppearanceNames}, nativeLobbySpawnRequired=true.");
     }
 
     private void ResetTransientState()
@@ -1124,6 +1325,7 @@ internal sealed class SafeLocalBotSpawner
         _visibilityRestored.Clear();
         _renderDiagnosticsLogged.Clear();
         _disabledBotLightIds.Clear();
+        _passiveProxyClientIds.Clear();
         _appliedLobbyAppearances.Clear();
         _hostLightRepairLogged = false;
         _botCountStabilizer.Reset();
