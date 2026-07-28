@@ -826,6 +826,12 @@ internal sealed class BotActionDirector
             return true;
         }
 
+        if (IsTargetCoolingDown(state, targetLabel))
+        {
+            state.NextDecisionAt = Mathf.Min(state.NextDecisionAt, Time.time + 0.5f);
+            return false;
+        }
+
         AssignRoute(
             bot,
             state,

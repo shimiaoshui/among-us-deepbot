@@ -2,7 +2,7 @@
 
 > Turn empty local-lobby slots into independent players that move, observe, deceive, discuss, vote, and learn from failed rounds.
 
-[![Release](https://img.shields.io/badge/release-0.10.2-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
+[![Release](https://img.shields.io/badge/release-0.10.3-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4)](#requirements)
 [![Game](https://img.shields.io/badge/game-Among%20Us-e83b3b)](#)
 [![TOR](https://img.shields.io/badge/The%20Other%20Roles-4.6.0-8a5cff)](#the-other-roles-460-integration)
@@ -10,7 +10,7 @@
 
 **Among Us DeepBot** is a host-authoritative AI player plugin for Among Us local and LAN lobbies. The host can configure between `1` and `8` bots in the lobby. Each bot joins as a real network player, while movement, decisions, and synchronization remain under host control. Human players, bots, and compatible clients can therefore play in the same match.
 
-Current release: `0.10.2-lan-handshake-api-setup`. It ships separate one-click host and client installers for one fingerprinted TOR 4.6.0 compatibility build.
+Current release: `0.10.3-authority-handshake`. It ships separate one-click host and client installers for one fingerprinted TOR 4.6.0 compatibility build.
 
 ## More than an auto-walking bot
 
@@ -44,7 +44,16 @@ flowchart LR
 
 DeepBot does not force every bot to play an identical optimal strategy. Personality affects work rate, risk tolerance, trust in testimony, speaking style, and vote thresholds. One bot may rush tasks, another may wander or follow a trusted player, one may trust only eyewitness evidence, and another may be persuaded by a credible account.
 
-## Highlights in 0.10.2
+## Highlights in 0.10.3
+
+- Passive LAN clients are stopped at the runtime authority boundary before any movement, role, camera, meeting, memory, or world-control subsystem can run. Only the host may drive bots, preventing bots from mirroring a client's local player input.
+- Selecting a Steam library now prefers the actively used TOR + DeepBot installation and its recent runtime log over an unrelated vanilla folder merely named `Among Us`.
+- The installer and uninstaller share the same target-selection rules. Automated packaging tests cover a Steam library containing both a vanilla installation and a separate active TOR installation.
+- TOR's native Local/LAN version handshake is retried once per second as soon as a local player exists. The retry still uses TOR's own version and module GUID checks and does not accept incompatible builds.
+- Host and Client packages carry the same TOR, Reactor, and DeepBot fingerprints; the guarded launcher rejects a mixed installation before starting the game.
+- TOR placement abilities now use the runtime grid's reachable projected endpoint instead of an obstructed room-center transform. This removes the repeated Storage fuel/crate-corner loop seen with Trickster box placement.
+
+The release retains all installation and LAN work from 0.10.2:
 
 - Local/LAN clients retry TOR's native version handshake while they are in the lobby. This fixes the race that could show “The host has no or a different version of The Other Roles” and remove a matching client.
 - TOR's native version and module checks remain authoritative; the fix does not disable incompatible-version protection.

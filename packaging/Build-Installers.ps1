@@ -8,7 +8,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TheOtherRolesDll,
 
-    [string]$ReleaseVersion = '0.10.2',
+    [string]$ReleaseVersion = '0.10.3',
 
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\release-assets')
 )

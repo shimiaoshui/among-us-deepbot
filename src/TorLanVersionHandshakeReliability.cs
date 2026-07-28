@@ -19,7 +19,7 @@ namespace AmongUsDeepSeekBots;
 [HarmonyPatch(typeof(GameStartManager), nameof(GameStartManager.Update))]
 internal static class TorLanVersionHandshakeReliabilityPatch
 {
-    private const float RetrySeconds = 2.0f;
+    private const float RetrySeconds = 1.0f;
     private static MethodInfo? _shareGameVersion;
     private static float _nextRetryAt;
     private static int _lastClientId = int.MinValue;
@@ -34,8 +34,7 @@ internal static class TorLanVersionHandshakeReliabilityPatch
         var client = AmongUsClient.Instance;
         if (client is null ||
             client.NetworkMode != NetworkModes.LocalGame ||
-            PlayerControl.LocalPlayer is null ||
-            GameData.Instance is null)
+            PlayerControl.LocalPlayer is null)
         {
             ResetSessionIfNeeded(client);
             return;

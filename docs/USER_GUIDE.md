@@ -21,7 +21,7 @@ Every participant must use the same Among Us, BepInEx, TOR, and DeepBot versions
 
 The installer searches only a small bounded area under `steamapps\common`. It does not install or redistribute the Among Us game itself. Before overwriting an existing mod file, it creates a timestamped copy under `DeepBot Installer Backups` inside the selected game folder. It also writes a local install receipt containing relative paths and SHA-256 hashes; the receipt never contains an API key.
 
-Version 0.10.1 and newer also installs the private `dotnet\coreclr.dll` runtime required by BepInEx IL2CPP and verifies the complete boot chain before reporting success. Version 0.10.2 additionally verifies an exact TOR/Reactor/DeepBot compatibility fingerprint. Use the generated DeepBot desktop shortcut: it checks the runtime and fingerprints first, so an incomplete or mixed release produces a clear error instead of silently launching vanilla Among Us or entering an incompatible lobby.
+Version 0.10.1 and newer also installs the private `dotnet\coreclr.dll` runtime required by BepInEx IL2CPP and verifies the complete boot chain before reporting success. Version 0.10.2 additionally verifies an exact TOR/Reactor/DeepBot compatibility fingerprint. Version 0.10.3 also prefers the actively used TOR installation when one Steam library contains several Among Us copies. Use the generated DeepBot desktop shortcut: it checks the runtime and fingerprints first, so an incomplete or mixed release produces a clear error instead of silently launching vanilla Among Us or entering an incompatible lobby.
 
 ## 3. Host setup
 
@@ -74,8 +74,9 @@ Never add an API key to this configuration file.
 
 After launching once, open `BepInEx\LogOutput.log`. A correct host installation should show:
 
-- `Among Us DeepSeek Bots 0.10.2-lan-handshake loaded`
+- `Among Us DeepSeek Bots 0.10.3-authority-handshake loaded`
 - `DeepBot LAN TOR handshake retry active`
+- on a client, `DeepBot passive client mode active`
 - `customRoles=44, modifiers=11`
 - startup self-tests with `level=ok`
 - one primary role and a separate modifier list for each bot
@@ -86,9 +87,13 @@ The log must never contain the API-key value.
 
 **The game does not start:** remove duplicate or old plugin DLLs from `BepInEx\plugins`, then verify that all players use the same versions.
 
-**The client says the host has no or a different TOR version:** confirm both computers used the Host and Client installers from the same Release, then launch both through their generated DeepBot shortcuts. The shortcut validates `DeepBot-Compatibility.json` against the installed TOR, Reactor, and DeepBot files before starting the game. Version 0.10.2 retries TOR's native LAN handshake but intentionally does not permit genuinely different TOR builds.
+**The client says the host has no or a different TOR version:** uninstall older packages on both computers, install the Host and Client installers from the same Release, and launch both through their generated DeepBot shortcuts. When selecting a Steam root, confirm that the installer shows the TOR game directory you actually use. The shortcut validates `DeepBot-Compatibility.json` against the installed TOR, Reactor, and DeepBot files before starting the game. Version 0.10.3 retries TOR's native LAN handshake but intentionally does not permit genuinely different TOR builds.
+
+**Bots copy a client's movement:** the client loaded an older or mixed DeepBot build. The `0.10.3` client must log `DeepBot passive client mode active`; reinstall the matching Client package if that line is absent.
 
 **Bots do not move:** preserve the complete `BepInEx\LogOutput.log` and note the map, lobby settings, roles, and location. Look for `no route`, `stuck`, `replanning`, or an exception.
+
+**A bot repeatedly approaches the Storage fuel/crate corner:** confirm the log reports `0.10.3-authority-handshake`. Older builds could select an obstructed room-center transform for TOR placement abilities; `0.10.3` projects that stage onto a player-sized reachable grid endpoint.
 
 **Meeting replies are limited:** check the host endpoint quota and HTTP status in the log. An HTTP 429 means the configured account is rate-limited; local safeguards continue, but model-backed discussion is unavailable until the quota recovers.
 

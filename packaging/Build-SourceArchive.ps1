@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TheOtherRolesSource,
 
-    [string]$ReleaseVersion = '0.10.2',
+    [string]$ReleaseVersion = '0.10.3',
 
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\release-assets')
 )
@@ -61,4 +61,21 @@ if (Test-Path -LiteralPath $archive) {
 }
 Compress-Archive -Path (Join-Path $stageRoot '*') -DestinationPath $archive -CompressionLevel Optimal
 Remove-Item -LiteralPath $stageRoot -Recurse -Force
+
+$releaseNames = @(
+    'AmongUs-DeepBot-Host-Installer.exe',
+    'AmongUs-DeepBot-Client-Installer.exe',
+    'AmongUs-DeepBot-Host-Uninstaller.exe',
+    'AmongUs-DeepBot-Client-Uninstaller.exe',
+    [IO.Path]::GetFileName($archive)
+)
+$checksums = foreach ($name in $releaseNames) {
+    $asset = Join-Path $outputRoot $name
+    if (-not (Test-Path -LiteralPath $asset)) {
+        throw "Release checksum input is missing: $asset"
+    }
+    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
+    "$hash  $name"
+}
+Set-Content -LiteralPath (Join-Path $outputRoot 'SHA256SUMS.txt') -Value $checksums -Encoding ASCII
 Get-Item -LiteralPath $archive
