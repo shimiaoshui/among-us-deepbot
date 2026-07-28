@@ -82,6 +82,10 @@ public sealed class DeepBotRuntime : MonoBehaviour
         // host guard.
         if (!HasHostAuthority())
         {
+            // Passive LAN peers must never run bot decisions or physics, but
+            // they still need a local ClientData/PlayerControl presentation for
+            // host-created virtual clients that are not real transport peers.
+            _spawner.MaintainPassiveClientView();
             if (!_passiveClientLogged && AmongUsClient.Instance)
             {
                 _passiveClientLogged = true;

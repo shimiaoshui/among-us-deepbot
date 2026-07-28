@@ -2,7 +2,7 @@
 
 > Turn empty local-lobby slots into independent players that move, observe, deceive, discuss, vote, and learn from failed rounds.
 
-[![Release](https://img.shields.io/badge/release-0.10.3-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
+[![Release](https://img.shields.io/badge/release-0.10.5-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4)](#requirements)
 [![Game](https://img.shields.io/badge/game-Among%20Us-e83b3b)](#)
 [![TOR](https://img.shields.io/badge/The%20Other%20Roles-4.6.0-8a5cff)](#the-other-roles-460-integration)
@@ -10,7 +10,7 @@
 
 **Among Us DeepBot** is a host-authoritative AI player plugin for Among Us local and LAN lobbies. The host can configure between `1` and `8` bots in the lobby. Each bot joins as a real network player, while movement, decisions, and synchronization remain under host control. Human players, bots, and compatible clients can therefore play in the same match.
 
-Current release: `0.10.3-authority-handshake`. It ships separate one-click host and client installers for one fingerprinted TOR 4.6.0 compatibility build.
+Current release: `0.10.5-client-sync`. It ships separate one-click host and client installers for one fingerprinted TOR 4.6.0 compatibility build.
 
 ## More than an auto-walking bot
 
@@ -44,7 +44,19 @@ flowchart LR
 
 DeepBot does not force every bot to play an identical optimal strategy. Personality affects work rate, risk tolerance, trust in testimony, speaking style, and vote thresholds. One bot may rush tasks, another may wander or follow a trusted player, one may trust only eyewitness evidence, and another may be persuaded by a credible account.
 
-## Highlights in 0.10.3
+## Highlights in 0.10.5
+
+- The GitHub release is now published through the normal Latest channel, so the main download page no longer serves the obsolete 0.10.3 client.
+- Interactive installs always create a mode-specific guarded shortcut. Before launch it shows the exact Host/Client mode, release, and game directory, preventing Steam from silently opening another Among Us copy.
+- Client installation and launch both enforce `BotCount = 0`; a client can never create local bots before joining the real host.
+- Startup logs include the loaded plugin version, game root, and active configuration path. A remote log can now prove immediately whether the correct installation is running.
+
+- Passive LAN clients reconstruct presentation-only entries for the host's reserved virtual bot clients and bind them to the host-spawned network players, so bots appear and move from authoritative host state.
+- The client presentation path executes before the strict authority return; every decision, movement, ability, role-state, meeting, and camera subsystem remains host-only.
+- Stable bot identity and idempotent lobby appearance updates prevent both human-input mirroring and the name-change RPC flood that caused heartbeat disconnects.
+- New client diagnostics expose the exact reserved-record/control/proxy counts needed to validate a LAN join without leaking private bot information.
+
+The release retains all authority and installer work from 0.10.3:
 
 - Passive LAN clients are stopped at the runtime authority boundary before any movement, role, camera, meeting, memory, or world-control subsystem can run. Only the host may drive bots, preventing bots from mirroring a client's local player input.
 - Selecting a Steam library now prefers the actively used TOR + DeepBot installation and its recent runtime log over an unrelated vanilla folder merely named `Among Us`.

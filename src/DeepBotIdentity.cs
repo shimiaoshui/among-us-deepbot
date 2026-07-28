@@ -14,11 +14,46 @@ internal static class DeepBotIdentity
 
     internal static bool IsBot(PlayerControl? player)
     {
-        return player is not null &&
-               player &&
-               player.Data is not null &&
-               (IsReservedClientId(player.OwnerId) ||
-                player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal));
+        if (player is null || !player || player.Data is null)
+        {
+            return false;
+        }
+
+        // Runtime LAN bots deliberately transfer PlayerControl/physics ownership
+        // to the host so their movement is replicated to guests. OwnerId is
+        // therefore not a stable identity after creation. The native
+        // NetworkedPlayerInfo keeps the reserved virtual client id and must be
+        // the primary discriminator; otherwise vanilla FixedUpdate reads the
+        // host's keyboard for every host-owned bot.
+        if (IsReservedClientId(player.Data.ClientId) ||
+            IsReservedClientId(player.OwnerId) ||
+            player.Data.PlayerName.StartsWith("DeepBot ", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        // Belt-and-suspenders fallback for the short native creation window in
+        // which PlayerInfo can be replaced while ClientData already owns the
+        // character. This is independent of the visible bot name.
+        var client = AmongUsClient.Instance;
+        if (!client)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < client.allClients.Count; index++)
+        {
+            var candidate = client.allClients[index];
+            if (candidate is not null &&
+                IsReservedClientId(candidate.Id) &&
+                candidate.Character &&
+                candidate.Character.PlayerId == player.PlayerId)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     internal static PlayerControl? FindLocalHumanPlayer()
