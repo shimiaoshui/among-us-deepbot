@@ -1,3 +1,12 @@
+# 0.10.2-lan-handshake-api-setup
+
+- Fixed Local/LAN clients being removed with “The host has no or a different version of The Other Roles” when TOR's initial host handshake arrived before the joining peer was ready. DeepBot now retries TOR's own reliable version handshake every two seconds while the LAN lobby is active.
+- The retry does not spoof or bypass compatibility checks. TOR still rejects a genuinely different version or module build.
+- Host and Client packages embed the same compatibility ID plus SHA-256 fingerprints for TOR, Reactor, and DeepBot. Both the installer and guarded launcher stop with a clear error if installed files do not match the release.
+- Added API base URL and masked API-key fields directly to the Host installer. The endpoint is written to the host configuration; the key is stored only in `%LOCALAPPDATA%\AmongUsDeepSeekBots\api-key.txt` and is excluded from logs, receipts, source, packages, and release assets.
+- Added an automated clean-install matrix for Host/Client installation, compatibility parity, guarded launcher validation, API configuration, key boundaries, and complete uninstallation.
+- No API key is included.
+
 # 0.10.1-installer-runtime-fix
 
 - Fixed clean-computer installations opening vanilla Among Us because the installer omitted the private `dotnet\coreclr.dll` runtime required by Doorstop/BepInEx IL2CPP.

@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace DeepBotInstaller;
@@ -10,9 +11,9 @@ namespace DeepBotInstaller;
 internal static class Program
 {
 #if HOST_INSTALLER
-    internal const string Mode = "Host";
+    internal static string Mode => "Host";
 #elif CLIENT_INSTALLER
-    internal const string Mode = "Client";
+    internal static string Mode => "Client";
 #else
 #error InstallerMode must be Host or Client.
 #endif
@@ -33,7 +34,13 @@ internal static class Program
             {
                 var candidates = InstallerForm.FindGameDirectories(args[pathIndex + 1]);
                 if (candidates.Count == 0) return 3;
-                InstallerForm.InstallPayload(candidates[0], createShortcut: false);
+                var apiBaseUrl = Mode == "Host"
+                    ? Environment.GetEnvironmentVariable("DEEPBOT_INSTALL_API_BASE_URL")
+                    : null;
+                var apiKey = Mode == "Host"
+                    ? Environment.GetEnvironmentVariable("DEEPBOT_INSTALL_API_KEY")
+                    : null;
+                InstallerForm.InstallPayload(candidates[0], createShortcut: false, apiBaseUrl, apiKey);
                 return 0;
             }
             catch (Exception ex)
@@ -70,6 +77,7 @@ internal sealed class InstallerForm : Form
         Path.Combine("BepInEx", "plugins", "TheOtherRoles.dll"),
         Path.Combine("BepInEx", "plugins", "AmongUsDeepSeekBots.dll"),
         Path.Combine("BepInEx", "config", "local.amongus.deepseekbots.cfg"),
+        "DeepBot-Compatibility.json",
         "Start-DeepBot.cmd",
         "Start-DeepBot.ps1"
     };
@@ -80,13 +88,25 @@ internal sealed class InstallerForm : Form
     private readonly Button _install = new() { Text = "Install", AutoSize = true };
     private readonly CheckBox _shortcut = new() { Text = "Create a desktop shortcut", Checked = true, AutoSize = true };
     private readonly CheckBox _launch = new() { Text = "Launch Among Us after installation", Checked = false, AutoSize = true };
+    private readonly TextBox _apiBaseUrl = new()
+    {
+        Dock = DockStyle.Fill,
+        Text = "https://apihub.agnes-ai.com/v1",
+        PlaceholderText = "https://apihub.agnes-ai.com/v1"
+    };
+    private readonly TextBox _apiKey = new()
+    {
+        Dock = DockStyle.Fill,
+        UseSystemPasswordChar = true,
+        PlaceholderText = "Enter the host API key (stored only for this Windows user)"
+    };
 
     internal InstallerForm()
     {
         Text = $"Among Us DeepBot {Program.Mode} Installer";
         Width = 720;
-        Height = 320;
-        MinimumSize = new Size(620, 300);
+        Height = Program.Mode == "Host" ? 470 : 320;
+        MinimumSize = new Size(620, Program.Mode == "Host" ? 440 : 300);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Segoe UI", 10f);
 
@@ -99,7 +119,7 @@ internal sealed class InstallerForm : Form
         var explanation = new Label
         {
             Text = Program.Mode == "Host"
-                ? "Installs TOR 4.6.0 and the host-authoritative DeepBot controller. The API key is not included."
+                ? "Installs the matched TOR 4.6.0 build and the host-authoritative DeepBot controller. The API key is saved only in your Windows user profile and is never copied into the game folder."
                 : "Installs TOR 4.6.0 and the passive LAN client. This client never creates or controls bots.",
             AutoSize = true,
             MaximumSize = new Size(650, 0)
@@ -132,7 +152,7 @@ internal sealed class InstallerForm : Form
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(24),
-            RowCount = 9,
+            RowCount = Program.Mode == "Host" ? 13 : 9,
             ColumnCount = 1
         };
         layout.RowStyles.Clear();
@@ -145,6 +165,23 @@ internal sealed class InstallerForm : Form
         layout.Controls.Add(new Label { Text = "Steam folder or Among Us folder:", AutoSize = true, Padding = new Padding(0, 12, 0, 0) });
         layout.Controls.Add(pathRow);
         layout.Controls.Add(_target);
+        if (Program.Mode == "Host")
+        {
+            layout.Controls.Add(new Label
+            {
+                Text = "AI API base URL:",
+                AutoSize = true,
+                Padding = new Padding(0, 10, 0, 0)
+            });
+            layout.Controls.Add(_apiBaseUrl);
+            layout.Controls.Add(new Label
+            {
+                Text = "AI API key (hidden; never included in logs, receipts, or release files):",
+                AutoSize = true,
+                Padding = new Padding(0, 6, 0, 0)
+            });
+            layout.Controls.Add(_apiKey);
+        }
         layout.Controls.Add(_shortcut);
         layout.Controls.Add(_launch);
         layout.Controls.Add(_status);
@@ -214,12 +251,15 @@ internal sealed class InstallerForm : Form
         try
         {
             var shortcut = _shortcut.Checked;
-            await Task.Run(() => InstallPayload(gameDirectory, shortcut));
+            var apiBaseUrl = Program.Mode == "Host" ? NormalizeApiBaseUrl(_apiBaseUrl.Text) : null;
+            var apiKey = Program.Mode == "Host" ? _apiKey.Text : null;
+            await Task.Run(() => InstallPayload(gameDirectory, shortcut, apiBaseUrl, apiKey));
+            _apiKey.Clear();
             _status.Text = $"Installed successfully to {gameDirectory}";
             MessageBox.Show(
                 this,
                 Program.Mode == "Host"
-                    ? $"Installation and boot-chain verification completed.\n\nTarget: {gameDirectory}\n\nUse the DeepBot desktop shortcut, open Local mode, and set the AI count in the lobby options. Configure your API key locally before using LLM meetings."
+                    ? $"Installation, TOR compatibility verification, and API configuration completed.\n\nTarget: {gameDirectory}\n\nUse the DeepBot desktop shortcut, open Local mode, and set the AI count in the lobby options. All players must install the Host/Client packages from this same release."
                     : $"Installation and boot-chain verification completed.\n\nTarget: {gameDirectory}\n\nUse the DeepBot desktop shortcut and join the host through Local mode. Bot creation and AI decisions remain host-authoritative.",
                 Text,
                 MessageBoxButtons.OK,
@@ -251,8 +291,17 @@ internal sealed class InstallerForm : Form
         }
     }
 
-    internal static void InstallPayload(string gameDirectory, bool createShortcut)
+    internal static void InstallPayload(
+        string gameDirectory,
+        bool createShortcut,
+        string? apiBaseUrl,
+        string? apiKey)
     {
+        if (Program.Mode == "Host" && !string.IsNullOrWhiteSpace(apiBaseUrl))
+        {
+            apiBaseUrl = NormalizeApiBaseUrl(apiBaseUrl);
+        }
+
         var backupDirectory = Path.Combine(
             gameDirectory,
             "DeepBot Installer Backups",
@@ -330,6 +379,15 @@ internal sealed class InstallerForm : Form
                 originalBackupSha256));
         }
 
+        if (Program.Mode == "Host" && !string.IsNullOrWhiteSpace(apiBaseUrl))
+        {
+            WriteApiBaseUrl(gameDirectory, apiBaseUrl);
+            RefreshInstalledHash(
+                installed,
+                Path.Combine("BepInEx", "config", "local.amongus.deepseekbots.cfg"),
+                gameDirectory);
+        }
+
         ValidateInstalledBootChain(gameDirectory);
 
         Directory.CreateDirectory(receiptDirectory);
@@ -349,6 +407,11 @@ internal sealed class InstallerForm : Form
             CreateDesktopShortcut(gameDirectory);
         }
 
+        if (Program.Mode == "Host" && !string.IsNullOrWhiteSpace(apiKey))
+        {
+            WriteLocalApiKey(apiKey);
+        }
+
         File.AppendAllLines(
             Path.Combine(gameDirectory, "DeepBot-Installer.log"),
             new[]
@@ -356,8 +419,81 @@ internal sealed class InstallerForm : Form
                 $"{DateTime.Now:O} mode={Program.Mode} files={installed.Count} receipt={receiptPath}",
                 $"target={gameDirectory}",
                 $"backup={backupDirectory}",
-                "bootChain=ok"
+                "bootChain=ok",
+                "torCompatibility=ok",
+                $"apiEndpointConfigured={(Program.Mode == "Host" && !string.IsNullOrWhiteSpace(apiBaseUrl) ? "yes" : "default")}",
+                $"apiKeyConfigured={(Program.Mode == "Host" && !string.IsNullOrWhiteSpace(apiKey) ? "yes" : "no")}"
             });
+    }
+
+    private static string NormalizeApiBaseUrl(string value)
+    {
+        var trimmed = value.Trim().TrimEnd('/');
+        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri) ||
+            uri.Scheme is not ("http" or "https") ||
+            string.IsNullOrWhiteSpace(uri.Host))
+        {
+            throw new InvalidDataException("Enter a valid absolute HTTP or HTTPS API base URL.");
+        }
+        return trimmed;
+    }
+
+    private static void WriteApiBaseUrl(string gameDirectory, string apiBaseUrl)
+    {
+        var configPath = Path.Combine(gameDirectory, "BepInEx", "config", "local.amongus.deepseekbots.cfg");
+        var config = File.ReadAllText(configPath);
+        var updated = Regex.Replace(
+            config,
+            @"(?im)^\s*ApiBaseUrl\s*=.*$",
+            "ApiBaseUrl = " + apiBaseUrl);
+        if (string.Equals(config, updated, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("The host payload is missing the ApiBaseUrl configuration entry.");
+        }
+
+        var tempPath = configPath + ".tmp";
+        File.WriteAllText(tempPath, updated);
+        File.Move(tempPath, configPath, overwrite: true);
+    }
+
+    private static void RefreshInstalledHash(
+        IList<InstalledFileReceipt> installed,
+        string relativePath,
+        string gameDirectory)
+    {
+        for (var index = 0; index < installed.Count; index++)
+        {
+            if (!string.Equals(installed[index].RelativePath, relativePath, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            installed[index] = installed[index] with
+            {
+                InstalledSha256 = ComputeSha256(Path.Combine(gameDirectory, relativePath))
+            };
+            return;
+        }
+
+        throw new InvalidDataException($"The installed payload did not record {relativePath}.");
+    }
+
+    private static void WriteLocalApiKey(string apiKey)
+    {
+        var key = apiKey.Trim();
+        if (key.Length == 0 || key.Contains('\r') || key.Contains('\n'))
+        {
+            throw new InvalidDataException("The API key must be a single non-empty line.");
+        }
+
+        var directory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AmongUsDeepSeekBots");
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "api-key.txt");
+        var tempPath = path + ".tmp";
+        File.WriteAllText(tempPath, key);
+        File.Move(tempPath, path, overwrite: true);
     }
 
     private static void ValidatePayloadBootChain(ZipArchive archive)
@@ -391,6 +527,19 @@ internal sealed class InstallerForm : Form
             !doorstop.Contains("coreclr_path = dotnet\\coreclr.dll", StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidDataException("doorstop_config.ini does not point to the installed BepInEx/CoreCLR runtime.");
+        }
+
+        var manifestPath = Path.Combine(gameDirectory, "DeepBot-Compatibility.json");
+        var manifest = JsonSerializer.Deserialize<CompatibilityManifest>(File.ReadAllText(manifestPath))
+                       ?? throw new InvalidDataException("DeepBot-Compatibility.json is invalid.");
+        var torPath = Path.Combine(gameDirectory, "BepInEx", "plugins", "TheOtherRoles.dll");
+        var reactorPath = Path.Combine(gameDirectory, "BepInEx", "plugins", "Reactor.dll");
+        var deepBotPath = Path.Combine(gameDirectory, "BepInEx", "plugins", "AmongUsDeepSeekBots.dll");
+        if (!string.Equals(ComputeSha256(torPath), manifest.TorSha256, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(ComputeSha256(reactorPath), manifest.ReactorSha256, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(ComputeSha256(deepBotPath), manifest.DeepBotSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("The installed TOR/DeepBot files do not match this release. Reinstall both Host and Client from the same release.");
         }
     }
 
@@ -524,3 +673,14 @@ internal sealed record InstalledFileReceipt(
     string InstalledSha256,
     string? OriginalBackupRelativePath,
     string? OriginalBackupSha256);
+
+internal sealed record CompatibilityManifest(
+    int SchemaVersion,
+    string ReleaseVersion,
+    string CompatibilityId,
+    string TorVersion,
+    string TorModuleVersionId,
+    string TorSha256,
+    string ReactorSha256,
+    string DeepBotSha256,
+    string Mode);

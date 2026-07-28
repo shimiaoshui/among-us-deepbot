@@ -8,6 +8,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TheOtherRolesDll,
 
+    [string]$ReleaseVersion = '0.10.2',
+
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\release-assets')
 )
 
@@ -92,6 +94,47 @@ Reset-GeneratedDirectory $hostStage
 Reset-GeneratedDirectory $clientStage
 Copy-Runtime $hostStage
 Copy-Runtime $clientStage
+
+$reactorSource = Join-Path $GameDirectory 'BepInEx\plugins\Reactor.dll'
+if (-not (Test-Path -LiteralPath $reactorSource)) {
+    throw "Required installer input is missing: $reactorSource"
+}
+$torSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $TheOtherRolesDll).Hash.ToLowerInvariant()
+$reactorSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $reactorSource).Hash.ToLowerInvariant()
+$deepBotSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $DeepBotDll).Hash.ToLowerInvariant()
+$torAssembly = [Reflection.Assembly]::LoadFile($TheOtherRolesDll)
+$torModuleVersionId = $torAssembly.ManifestModule.ModuleVersionId.ToString('D')
+$compatibilityId = "tor-4.6.0-$torModuleVersionId"
+
+foreach ($item in @(
+    @{ Stage = $hostStage; Mode = 'Host' },
+    @{ Stage = $clientStage; Mode = 'Client' }
+)) {
+    $manifest = [ordered]@{
+        SchemaVersion = 1
+        ReleaseVersion = $ReleaseVersion
+        CompatibilityId = $compatibilityId
+        TorVersion = '4.6.0'
+        TorModuleVersionId = $torModuleVersionId
+        TorSha256 = $torSha256
+        ReactorSha256 = $reactorSha256
+        DeepBotSha256 = $deepBotSha256
+        Mode = $item.Mode
+    }
+    $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $item.Stage 'DeepBot-Compatibility.json') -Encoding UTF8
+}
+
+foreach ($relative in @(
+    'BepInEx\plugins\TheOtherRoles.dll',
+    'BepInEx\plugins\Reactor.dll',
+    'BepInEx\plugins\AmongUsDeepSeekBots.dll'
+)) {
+    $hostHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $hostStage $relative)).Hash
+    $clientHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $clientStage $relative)).Hash
+    if (-not [string]::Equals($hostHash, $clientHash, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Host/client compatibility payload mismatch: $relative"
+    }
+}
 
 $hostConfig = @'
 ## Among Us DeepBot host configuration - no API key is included.
