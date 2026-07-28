@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $testBase = [IO.Path]::GetFullPath((Join-Path $repositoryRoot '.installer-tests'))
-$testRoot = [IO.Path]::GetFullPath((Join-Path $testBase 'v0.10.5-client-sync'))
+$testRoot = [IO.Path]::GetFullPath((Join-Path $testBase 'v0.10.6-client-authority-lock'))
 $allowedPrefix = $testBase.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
 if (-not $testRoot.StartsWith($allowedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to clear a test path outside $testBase"

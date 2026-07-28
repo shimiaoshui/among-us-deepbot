@@ -278,6 +278,6 @@ public sealed class DeepBotRuntime : MonoBehaviour
         var client = AmongUsClient.Instance;
         return client &&
                client.NetworkMode == NetworkModes.LocalGame &&
-               client.AmHost;
+               Plugin.AllowsWorldAuthority(client.AmHost);
     }
 }

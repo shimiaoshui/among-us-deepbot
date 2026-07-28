@@ -21,7 +21,7 @@ Every participant must use the same Among Us, BepInEx, TOR, and DeepBot versions
 
 The installer searches only a small bounded area under `steamapps\common`. It does not install or redistribute the Among Us game itself. Before overwriting an existing mod file, it creates a timestamped copy under `DeepBot Installer Backups` inside the selected game folder. It also writes a local install receipt containing relative paths and SHA-256 hashes; the receipt never contains an API key.
 
-Version 0.10.1 and newer also installs the private `dotnet\coreclr.dll` runtime required by BepInEx IL2CPP and verifies the complete boot chain before reporting success. Version 0.10.2 additionally verifies an exact TOR/Reactor/DeepBot compatibility fingerprint. Version 0.10.3 also prefers the actively used TOR installation when one Steam library contains several Among Us copies. Version 0.10.5 makes the mode-specific desktop shortcut mandatory for interactive installs and displays the exact mode, release, and game directory before launch. Use that shortcut: it checks the runtime, mode, bot count, and fingerprints first, so an incomplete, mixed, or wrong-directory release produces a clear error instead of silently launching vanilla Among Us or entering an incompatible lobby.
+Version 0.10.1 and newer also installs the private `dotnet\coreclr.dll` runtime required by BepInEx IL2CPP and verifies the complete boot chain before reporting success. Version 0.10.2 additionally verifies an exact TOR/Reactor/DeepBot compatibility fingerprint. Version 0.10.3 also prefers the actively used TOR installation when one Steam library contains several Among Us copies. Version 0.10.5 makes the mode-specific desktop shortcut mandatory for interactive installs and displays the exact mode, release, and game directory before launch. Version 0.10.6 also enforces Client mode inside the plugin, so a joining computer cannot create bots while it briefly owns the loopback lobby. Use the generated shortcut: it checks the runtime, mode, bot count, and fingerprints first, so an incomplete, mixed, or wrong-directory release produces a clear error instead of silently launching vanilla Among Us or entering an incompatible lobby.
 
 ## 3. Host setup
 
@@ -74,7 +74,8 @@ Never add an API key to this configuration file.
 
 After launching once, open `BepInEx\LogOutput.log`. A correct host installation should show:
 
-- `Among Us DeepSeek Bots 0.10.5-client-sync loaded`
+- `Among Us DeepSeek Bots 0.10.6-client-authority-lock loaded`
+- `installMode=Client` on every joining human computer
 - `gameRoot=...` points to the exact directory selected by the installer
 - a Client log reports `LocalBots=0`
 - `DeepBot LAN TOR handshake retry active`
@@ -91,7 +92,7 @@ The log must never contain the API-key value.
 
 **The client says the host has no or a different TOR version:** uninstall older packages on both computers, install the Host and Client installers from the same Release, and launch both through their generated DeepBot shortcuts. When selecting a Steam root, confirm that the installer shows the TOR game directory you actually use. The shortcut validates `DeepBot-Compatibility.json` against the installed TOR, Reactor, and DeepBot files before starting the game. Version 0.10.3 retries TOR's native LAN handshake but intentionally does not permit genuinely different TOR builds.
 
-**Bots are missing or copy a client's movement:** first confirm the log reports `0.10.5-client-sync`, `LocalBots=0`, the expected `gameRoot`, and `DeepBot passive client mode active`. If any value differs, uninstall the old client, install the current Client package, and launch only through `Among Us DeepBot Client`. Do not use Steam's generic Play button when more than one Among Us copy exists.
+**Bots are missing or copy a client's movement:** first confirm the log reports `0.10.6-client-authority-lock`, `installMode=Client`, `LocalBots=0`, the expected `gameRoot`, and `DeepBot passive client mode active`. If any value differs, uninstall the old client, install the current Client package, and launch only through `Among Us DeepBot Client`. Do not use Steam's generic Play button when more than one Among Us copy exists.
 
 **Bots do not move:** preserve the complete `BepInEx\LogOutput.log` and note the map, lobby settings, roles, and location. Look for `no route`, `stuck`, `replanning`, or an exception.
 

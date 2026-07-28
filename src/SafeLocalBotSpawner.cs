@@ -41,6 +41,12 @@ internal sealed class SafeLocalBotSpawner
 
     public void Tick(PluginConfig config)
     {
+        if (Plugin.IsPassiveClientInstall)
+        {
+            MaintainPassiveClientView();
+            return;
+        }
+
         var client = AmongUsClient.Instance;
         if (IsPassiveLanGuest(client))
         {

@@ -1,4 +1,10 @@
-# 0.10.5-client-sync
+# 0.10.6-client-authority-lock
+
+- Added a code-level Client authority lock based on `DeepBot-Compatibility.json`. A Client package can never create or control bots, even during the short loopback-host phase before it joins the real LAN host and even when TOR's lobby option still contains a nonzero AI count.
+- Client startup force-corrects the local fallback count to zero and logs `installMode=Client`; host authority now requires both native `AmHost` state and a non-Client package.
+- Rebuilt and clean-install tested all four 0.10.6 packages with matching fingerprints and no embedded API key.
+
+## Previous release: 0.10.5-client-sync
 
 - Published through GitHub's normal Latest channel so users downloading from the repository front page receive the current Client package instead of 0.10.3.
 - Interactive Host and Client installs always create a guarded, mode-specific desktop shortcut. The launcher shows the exact release, mode, and game directory before starting.
