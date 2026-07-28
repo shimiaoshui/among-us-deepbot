@@ -14,7 +14,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "local.amongus.deepseekbots";
     public const string PluginName = "Among Us DeepSeek Bots";
-    public const string PluginVersion = "0.10.2-lan-handshake";
+    public const string PluginVersion = "0.10.3-authority-handshake";
 
     private readonly Harmony _harmony = new(PluginGuid);
 

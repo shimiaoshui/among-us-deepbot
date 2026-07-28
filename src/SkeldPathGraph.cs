@@ -337,6 +337,24 @@ internal sealed class SkeldPathGraph
         return FindTopRoutes(from, NearestNode(target).Id, count);
     }
 
+    public bool TryResolveNavigationDestination(Vector2 from, Vector2 desired, out Vector2 reachable)
+    {
+        reachable = default;
+        var routes = FindTopRoutes(from, desired, 1);
+        if (routes.Count == 0 || routes[0].Count == 0)
+        {
+            return false;
+        }
+
+        // Live room centers and some console transforms can be inside scenery
+        // colliders (the Skeld Storage fuel/crate corner is one example).  The
+        // runtime grid already projects that transform onto a player-sized,
+        // reachable cell, so ability placement must use the projected endpoint
+        // itself instead of steering back toward the obstructed transform.
+        reachable = routes[0][^1].Position;
+        return true;
+    }
+
     private List<NavNode> FindShortestPath(string start, string goal, HashSet<(string From, string To)> bannedDirectedEdges)
     {
         var open = new PriorityQueue<string, float>();

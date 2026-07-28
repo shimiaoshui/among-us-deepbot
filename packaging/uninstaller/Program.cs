@@ -364,9 +364,33 @@ internal sealed class UninstallerForm : Form
 
         return result
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(path => string.Equals(Path.GetFileName(path), "Among Us", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .OrderByDescending(path => string.Equals(
+                path.TrimEnd(Path.DirectorySeparatorChar),
+                root.TrimEnd(Path.DirectorySeparatorChar),
+                StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(path => File.Exists(Path.Combine(
+                path,
+                "DeepBot Installer Records",
+                $"DeepBot-{Program.Mode}-Install.json")))
+            .ThenByDescending(path => File.Exists(Path.Combine(path, "DeepBot-Compatibility.json")))
+            .ThenByDescending(HasTorDeepBotPair)
+            .ThenByDescending(GetLastRuntimeActivityTicks)
+            .ThenBy(path => string.Equals(Path.GetFileName(path), "Among Us", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
             .ThenBy(path => path.Length)
             .ToList();
+    }
+
+    private static bool HasTorDeepBotPair(string directory)
+    {
+        return File.Exists(Path.Combine(directory, "BepInEx", "plugins", "TheOtherRoles.dll")) &&
+               File.Exists(Path.Combine(directory, "BepInEx", "plugins", "AmongUsDeepSeekBots.dll"));
+    }
+
+    private static long GetLastRuntimeActivityTicks(string directory)
+    {
+        var log = Path.Combine(directory, "BepInEx", "LogOutput.log");
+        try { return File.Exists(log) ? File.GetLastWriteTimeUtc(log).Ticks : 0L; }
+        catch { return 0L; }
     }
 
     private static IEnumerable<string> EnumerateDirectories(string root, int maxDepth)

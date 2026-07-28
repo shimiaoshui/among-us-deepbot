@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $testBase = [IO.Path]::GetFullPath((Join-Path $repositoryRoot '.installer-tests'))
-$testRoot = [IO.Path]::GetFullPath((Join-Path $testBase 'v0.10.2-lan-api'))
+$testRoot = [IO.Path]::GetFullPath((Join-Path $testBase 'v0.10.3-authority-handshake'))
 $allowedPrefix = $testBase.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
 if (-not $testRoot.StartsWith($allowedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to clear a test path outside $testBase"
@@ -20,6 +20,9 @@ if (Test-Path -LiteralPath $testRoot) {
 
 $hostDirectory = Join-Path $testRoot 'host\Among Us'
 $clientDirectory = Join-Path $testRoot 'client\Among Us'
+$multiSteamRoot = Join-Path $testRoot 'multi-install\steam'
+$plainGameDirectory = Join-Path $multiSteamRoot 'steamapps\common\Among Us'
+$activeTorDirectory = Join-Path $multiSteamRoot 'steamapps\common\TOR Active'
 New-Item -ItemType Directory -Force -Path $hostDirectory, $clientDirectory | Out-Null
 Copy-Item -LiteralPath (Join-Path $GameDirectory 'Among Us.exe') -Destination (Join-Path $hostDirectory 'Among Us.exe')
 Copy-Item -LiteralPath (Join-Path $GameDirectory 'Among Us.exe') -Destination (Join-Path $clientDirectory 'Among Us.exe')
@@ -73,6 +76,31 @@ try {
     $clientValidation = & $powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $clientDirectory 'Start-DeepBot.ps1') -ValidateOnly
     if ($LASTEXITCODE -ne 0) { throw 'Client launcher validation failed.' }
 
+    # A Steam library can contain a plain folder named "Among Us" alongside the
+    # actively used TOR copy.  Installing from the Steam root must prefer the
+    # TOR copy instead of silently modifying the unrelated vanilla folder.
+    New-Item -ItemType Directory -Force -Path $plainGameDirectory, (Join-Path $activeTorDirectory 'BepInEx\plugins') | Out-Null
+    Copy-Item -LiteralPath (Join-Path $GameDirectory 'Among Us.exe') -Destination (Join-Path $plainGameDirectory 'Among Us.exe')
+    Copy-Item -LiteralPath (Join-Path $GameDirectory 'Among Us.exe') -Destination (Join-Path $activeTorDirectory 'Among Us.exe')
+    Copy-Item -LiteralPath (Join-Path $GameDirectory 'BepInEx\plugins\TheOtherRoles.dll') -Destination (Join-Path $activeTorDirectory 'BepInEx\plugins\TheOtherRoles.dll')
+    Copy-Item -LiteralPath (Join-Path $GameDirectory 'BepInEx\plugins\AmongUsDeepSeekBots.dll') -Destination (Join-Path $activeTorDirectory 'BepInEx\plugins\AmongUsDeepSeekBots.dll')
+    New-Item -ItemType File -Force -Path (Join-Path $activeTorDirectory 'BepInEx\LogOutput.log') | Out-Null
+
+    $multiInstallProcess = Start-Process -FilePath (Join-Path $AssetDirectory 'AmongUs-DeepBot-Host-Installer.exe') -ArgumentList @('--silent', '--path', ('"' + $multiSteamRoot + '"')) -Wait -PassThru
+    if ($multiInstallProcess.ExitCode -ne 0) { throw "Multi-install host install failed: $($multiInstallProcess.ExitCode)" }
+    if (-not (Test-Path -LiteralPath (Join-Path $activeTorDirectory 'DeepBot-Compatibility.json'))) {
+        throw 'Steam-root install did not select the active TOR directory.'
+    }
+    if (Test-Path -LiteralPath (Join-Path $plainGameDirectory 'DeepBot-Compatibility.json')) {
+        throw 'Steam-root install incorrectly selected the plain Among Us directory.'
+    }
+
+    $multiUninstallProcess = Start-Process -FilePath (Join-Path $AssetDirectory 'AmongUs-DeepBot-Host-Uninstaller.exe') -ArgumentList @('--silent', '--path', ('"' + $multiSteamRoot + '"')) -Wait -PassThru
+    if ($multiUninstallProcess.ExitCode -ne 0) { throw "Multi-install host uninstall failed: $($multiUninstallProcess.ExitCode)" }
+    if (Test-Path -LiteralPath (Join-Path $activeTorDirectory 'DeepBot-Compatibility.json')) {
+        throw 'Steam-root uninstall left the TOR compatibility manifest behind.'
+    }
+
     $hostUninstallProcess = Start-Process -FilePath (Join-Path $AssetDirectory 'AmongUs-DeepBot-Host-Uninstaller.exe') -ArgumentList @('--silent', '--path', ('"' + $hostDirectory + '"')) -Wait -PassThru
     $hostUninstallExit = $hostUninstallProcess.ExitCode
     $clientUninstallProcess = Start-Process -FilePath (Join-Path $AssetDirectory 'AmongUs-DeepBot-Client-Uninstaller.exe') -ArgumentList @('--silent', '--path', ('"' + $clientDirectory + '"')) -Wait -PassThru
@@ -107,6 +135,7 @@ try {
         ManagedLeftovers = $leftovers.Count
         ApiEndpointWritten = $true
         ApiKeyBoundaryTest = $true
+        MultiInstallSelectionTest = $true
     }
 }
 finally {

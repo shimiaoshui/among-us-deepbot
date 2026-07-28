@@ -1,4 +1,15 @@
-# 0.10.2-lan-handshake-api-setup
+# 0.10.3-authority-handshake
+
+- Fixed passive clients participating in DeepBot's runtime control loop. A strict host-authority boundary now blocks every bot movement, physics, role-state, meeting, camera, memory, and world-control callback on clients.
+- Fixed bots appearing to mirror a human client's movement after installing the client package. Clients now render host-synchronized state only and log `DeepBot passive client mode active` when world control is disabled.
+- Fixed Steam-root installation choosing an unrelated vanilla folder named `Among Us` while the actively used TOR copy lived elsewhere in the same library. Existing matching receipts, compatibility manifests, TOR + DeepBot pairs, and recent runtime activity now outrank the folder name.
+- Added a multi-install regression test that builds a fake Steam library with both vanilla and TOR installations, verifies that installation targets TOR, and verifies that uninstallation selects and cleans the same target.
+- TOR's native Local/LAN version handshake retry now begins as soon as the local player exists and repeats once per second. TOR 4.6.0 version and module GUID validation remains authoritative.
+- Rebuilt the Host Installer, Client Installer, Host Uninstaller, and Client Uninstaller from one `0.10.3` source and compatibility fingerprint.
+- Fixed role-ability routes repeatedly steering toward obstructed live room-center transforms, including the Skeld Storage fuel/crate corner. Placement stages now operate from the runtime grid's reachable projected endpoint, and a physically abandoned ability target observes its unreachable cooldown instead of being assigned again immediately.
+- Verified both direct-folder and Steam-root installs, the complete launcher boot chain, matching host/client TOR-Reactor-DeepBot SHA-256 values, API-key storage boundaries, and clean uninstallation.
+
+## Previous release: 0.10.2-lan-handshake-api-setup
 
 - Fixed Local/LAN clients being removed with “The host has no or a different version of The Other Roles” when TOR's initial host handshake arrived before the joining peer was ready. DeepBot now retries TOR's own reliable version handshake every two seconds while the LAN lobby is active.
 - The retry does not spoof or bypass compatibility checks. TOR still rejects a genuinely different version or module build.

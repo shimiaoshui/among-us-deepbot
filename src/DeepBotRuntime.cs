@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using BepInEx.Logging;
+using InnerNet;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -22,6 +23,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
     private float _nextHostUiIsolationLogAt;
     private string _lastScene = string.Empty;
     private bool _started;
+    private bool _passiveClientLogged;
 
     public DeepBotRuntime(IntPtr ptr) : base(ptr)
     {
@@ -73,6 +75,24 @@ public sealed class DeepBotRuntime : MonoBehaviour
             return;
         }
 
+        // A LAN client is a renderer/receiver only.  Keeping the authority
+        // check at the runtime boundary prevents any client-side subsystem
+        // from changing bot physics, role state, position holds, meetings, or
+        // camera ownership even if an individual adapter forgets its own
+        // host guard.
+        if (!HasHostAuthority())
+        {
+            if (!_passiveClientLogged && AmongUsClient.Instance)
+            {
+                _passiveClientLogged = true;
+                _log.LogInfo(
+                    $"DeepBot passive client mode active: clientId={AmongUsClient.Instance.ClientId}, " +
+                    $"hostId={AmongUsClient.Instance.HostId}; world control disabled.");
+            }
+            return;
+        }
+        _passiveClientLogged = false;
+
         var now = Time.realtimeSinceStartup;
         _spawner.MaintainHostLocalView();
         TorIntroPresentationPatch.RefreshVisibleSpecificRole();
@@ -109,7 +129,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     private void LateUpdate()
     {
-        if (!_started || !Plugin.Settings.Enabled.Value)
+        if (!_started || !Plugin.Settings.Enabled.Value || !HasHostAuthority())
         {
             return;
         }
@@ -145,7 +165,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     internal void OnMeetingStarted()
     {
-        if (_started)
+        if (_started && HasHostAuthority())
         {
             _director.OnMeetingStarted();
             _social.OnMeetingStarted();
@@ -154,7 +174,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     internal void OnMeetingEnded()
     {
-        if (_started)
+        if (_started && HasHostAuthority())
         {
             _social.OnMeetingEnded();
             _director.OnMeetingEnded();
@@ -163,7 +183,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     internal void OnGameEnded(EndGameResult endGameResult)
     {
-        if (_started && Plugin.Settings.PostMatchReflection.Value)
+        if (_started && HasHostAuthority() && Plugin.Settings.PostMatchReflection.Value)
         {
             _evolution.OnGameEnded(endGameResult);
         }
@@ -171,7 +191,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     internal void CaptureGameEnding()
     {
-        if (_started && Plugin.Settings.PostMatchReflection.Value)
+        if (_started && HasHostAuthority() && Plugin.Settings.PostMatchReflection.Value)
         {
             _evolution.CaptureGameEnding();
         }
@@ -179,7 +199,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     internal void OnChat(PlayerControl source, string text)
     {
-        if (_started)
+        if (_started && HasHostAuthority())
         {
             _memory.RecordPublicChat(source, text);
             _social.OnChat(source, text);
@@ -188,7 +208,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     internal void OnBodyReportRequested(PlayerControl reporter, NetworkedPlayerInfo victim)
     {
-        if (_started)
+        if (_started && HasHostAuthority())
         {
             _social.RecordBodyReporter(reporter, victim);
         }
@@ -196,7 +216,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     internal void ApplyPhysicsMovement(PlayerPhysics physics)
     {
-        if (_started)
+        if (_started && HasHostAuthority())
         {
             _director.ApplyPhysicsMovement(physics);
         }
@@ -204,7 +224,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     internal int CapturePotentialMurderWitnessMask(PlayerControl killer, PlayerControl victim)
     {
-        if (!_started)
+        if (!_started || !HasHostAuthority())
         {
             return 0;
         }
@@ -225,6 +245,11 @@ public sealed class DeepBotRuntime : MonoBehaviour
         PlayerControl victim,
         int preEventWitnessMask = 0)
     {
+        if (!HasHostAuthority())
+        {
+            return;
+        }
+
         var preEventWitnessIds = Enumerable.Range(0, 32)
             .Where(playerId => (preEventWitnessMask & (1 << playerId)) != 0)
             .Select(playerId => (byte)playerId)
@@ -238,6 +263,17 @@ public sealed class DeepBotRuntime : MonoBehaviour
 
     internal void RecordObservedSpecialAction(PlayerControl actor, string action, string inference)
     {
-        _memory.RecordObservedSpecialAction(actor, action, inference);
+        if (HasHostAuthority())
+        {
+            _memory.RecordObservedSpecialAction(actor, action, inference);
+        }
+    }
+
+    private static bool HasHostAuthority()
+    {
+        var client = AmongUsClient.Instance;
+        return client &&
+               client.NetworkMode == NetworkModes.LocalGame &&
+               client.AmHost;
     }
 }

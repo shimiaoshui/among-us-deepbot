@@ -1185,7 +1185,7 @@ internal static class TorRoleAdapter
         }
 
         var current = bot.GetTruePosition();
-        var candidate = SkeldPathGraph.Instance.Nodes
+        var candidates = SkeldPathGraph.Instance.Nodes
             .Where(node =>
                 SkeldPathGraph.Instance.IsNodeAllowed(node.Id) &&
                 node.Kind is NodeKind.Corner or NodeKind.Door or NodeKind.Hall or NodeKind.Landmark &&
@@ -1200,15 +1200,23 @@ internal static class TorRoleAdapter
             })
             .OrderByDescending(item => item.Score)
             .ThenBy(item => item.Node.Id, StringComparer.Ordinal)
-            .FirstOrDefault();
-        if (candidate is null)
+            .ToArray();
+        foreach (var candidate in candidates)
         {
-            return false;
+            if (!SkeldPathGraph.Instance.TryResolveNavigationDestination(
+                    current,
+                    candidate.Node.Position,
+                    out var reachablePosition))
+            {
+                continue;
+            }
+
+            position = reachablePosition;
+            stage += $":{candidate.Node.Id}";
+            return true;
         }
 
-        position = candidate.Node.Position;
-        stage += $":{candidate.Node.Id}";
-        return true;
+        return false;
     }
 
     internal static bool TryGetAbilityEscapeDestination(
