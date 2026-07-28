@@ -5,6 +5,7 @@ using BepInEx.Unity.IL2CPP;
 using HarmonyLib;
 using Il2CppInterop.Runtime.Injection;
 using InnerNet;
+using System.Text.Json;
 using UnityEngine;
 
 namespace AmongUsDeepSeekBots;
@@ -14,7 +15,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "local.amongus.deepseekbots";
     public const string PluginName = "Among Us DeepSeek Bots";
-    public const string PluginVersion = "0.10.5-client-sync";
+    public const string PluginVersion = "0.10.6-client-authority-lock";
 
     private readonly Harmony _harmony = new(PluginGuid);
 
@@ -22,6 +23,13 @@ public sealed class Plugin : BasePlugin
     internal static ManualLogSource LogSource { get; private set; } = null!;
     internal static PluginConfig Settings { get; private set; } = null!;
     internal static DeepBotRuntime? Runtime { get; set; }
+    internal static string InstallMode { get; private set; } = "Unknown";
+    internal static bool IsPassiveClientInstall =>
+        string.Equals(InstallMode, "Client", StringComparison.OrdinalIgnoreCase);
+    internal static bool AllowsWorldAuthority(bool nativeHost) =>
+        AllowsWorldAuthorityForMode(InstallMode, nativeHost);
+    internal static bool AllowsWorldAuthorityForMode(string? installMode, bool nativeHost) =>
+        nativeHost && !string.Equals(installMode, "Client", StringComparison.OrdinalIgnoreCase);
 
     internal static void ApplyLateTorRolePatches()
     {
@@ -33,7 +41,13 @@ public sealed class Plugin : BasePlugin
     {
         Instance = this;
         LogSource = Log;
+        InstallMode = ReadInstallMode();
         Settings = PluginConfig.Bind(Config);
+        if (IsPassiveClientInstall && Settings.LocalBotCount.Value != 0)
+        {
+            Settings.LocalBotCount.Value = 0;
+            Log.LogWarning("DeepBot Client authority lock forced Local.BotCount to 0. TOR lobby options cannot enable local bot creation on a Client package.");
+        }
 
         _harmony.PatchAll(typeof(Plugin).Assembly);
         LogSpawnPatchTarget();
@@ -47,7 +61,13 @@ public sealed class Plugin : BasePlugin
 
         Log.LogInfo(
             $"{PluginName} {PluginVersion} loaded. Enabled={Settings.Enabled.Value}, " +
-            $"LocalBots={Settings.LocalBotCount.Value}, mode=rebuild-clean, gameRoot={Paths.GameRootPath}, config={Config.ConfigFilePath}");
+            $"LocalBots={Settings.LocalBotCount.Value}, installMode={InstallMode}, mode=rebuild-clean, " +
+            $"gameRoot={Paths.GameRootPath}, config={Config.ConfigFilePath}");
+        Log.LogInfo(
+            "DeepBot install authority self-test: level=ok, " +
+            $"clientLoopbackBlocked={!AllowsWorldAuthorityForMode("Client", true)}, " +
+            $"hostLoopbackAllowed={AllowsWorldAuthorityForMode("Host", true)}, " +
+            $"remoteGuestBlocked={!AllowsWorldAuthorityForMode("Host", false)}.");
     }
 
     public override bool Unload()
@@ -70,6 +90,29 @@ public sealed class Plugin : BasePlugin
         }
 
         Log.LogInfo($"DeepBot spawn-owner patch target resolved: {method.DeclaringType?.Name}.{method.Name}({string.Join(", ", method.GetParameters().Select(p => p.ParameterType.Name))}).");
+    }
+
+    private static string ReadInstallMode()
+    {
+        try
+        {
+            var path = Path.Combine(Paths.GameRootPath, "DeepBot-Compatibility.json");
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            if (document.RootElement.TryGetProperty("Mode", out var mode))
+            {
+                var value = mode.GetString();
+                if (value is "Host" or "Client")
+                {
+                    return value;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogSource?.LogWarning($"DeepBot install-mode manifest could not be read: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        return "Unknown";
     }
 }
 
