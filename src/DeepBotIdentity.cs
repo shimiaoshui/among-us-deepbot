@@ -68,6 +68,8 @@ internal static class DeepBotIdentity
                     candidate.Id == client.ClientId &&
                     candidate.Character &&
                     candidate.Character.Data is not null &&
+                    candidate.Character.OwnerId == client.ClientId &&
+                    candidate.Character.Data.ClientId == client.ClientId &&
                     !IsBot(candidate.Character))
                 {
                     return candidate.Character;
@@ -79,6 +81,7 @@ internal static class DeepBotIdentity
                 if (player &&
                     player.Data is not null &&
                     player.OwnerId == client.ClientId &&
+                    player.Data.ClientId == client.ClientId &&
                     !IsBot(player))
                 {
                     return player;

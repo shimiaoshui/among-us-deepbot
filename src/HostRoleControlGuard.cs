@@ -23,7 +23,7 @@ internal sealed class HostRoleControlGuard
         var client = AmongUsClient.Instance;
         if (!client ||
             client.NetworkMode != NetworkModes.LocalGame ||
-            !client.AmHost ||
+            !Plugin.AllowsWorldAuthority(client.AmHost) ||
             client.GameState != InnerNetClient.GameStates.Started ||
             !ShipStatus.Instance ||
             IntroCutscene.Instance ||

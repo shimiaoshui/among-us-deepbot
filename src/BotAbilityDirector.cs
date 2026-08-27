@@ -2068,7 +2068,7 @@ internal sealed class BotAbilityDirector
         var client = AmongUsClient.Instance;
         return client &&
             client.NetworkMode == NetworkModes.LocalGame &&
-            client.AmHost &&
+            Plugin.AllowsWorldAuthority(client.AmHost) &&
             client.ClientId >= 0 &&
             client.ClientId == client.HostId;
     }

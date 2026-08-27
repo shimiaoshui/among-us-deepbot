@@ -21,20 +21,37 @@ internal static class LocalBotSpawnOwnerPatch
             [typeof(InnerNetObject), typeof(int), typeof(SpawnFlags)]);
     }
 
-    private static void Prefix(InnerNetObject netObjParent, ref int ownerId)
+    private static void Prefix(InnerNetObject netObjParent, ref int ownerId, ref SpawnFlags flags)
     {
         var client = AmongUsClient.Instance;
         if (!Plugin.Settings.Enabled.Value ||
             !client ||
             client.NetworkMode != NetworkModes.LocalGame ||
-            !client.AmHost)
+            !Plugin.AllowsWorldAuthority(client.AmHost))
         {
+            return;
+        }
+
+        // During a native late-join snapshot, CreateSpawnMessage may be called
+        // after SendInitialData has entered its body. Unknown reserved owner
+        // ids make the guest wait forever in "Delay spawn for unowned". Send
+        // bot controls as host-owned presentation objects and deliberately
+        // clear IsClientCharacter so they cannot replace the host character.
+        if (DeepBotLateJoinInitialDataPatch.IsPreparingVirtualBotSnapshot)
+        {
+            if (FindDeepBotPlayer(netObjParent) is not null ||
+                ownerId is >= LocalBotClientIdStart and <= LocalBotClientIdEnd)
+            {
+                ownerId = client.ClientId;
+                flags &= ~SpawnFlags.IsClientCharacter;
+            }
+
             return;
         }
 
         if (ownerId is >= LocalBotClientIdStart and <= LocalBotClientIdEnd)
         {
-            RewriteToHostOwner(netObjParent, ref ownerId, "reserved DeepBot client id");
+            RewriteToHostOwner(netObjParent, ref ownerId, ref flags, "reserved DeepBot client id");
             return;
         }
 
@@ -43,20 +60,28 @@ internal static class LocalBotSpawnOwnerPatch
         {
             var matchedPlayer = player!;
             var playerName = matchedPlayer.Data?.PlayerName ?? "DeepBot PlayerControl";
-            RewriteToHostOwner(netObjParent, ref ownerId, playerName);
+            RewriteToHostOwner(netObjParent, ref ownerId, ref flags, playerName);
         }
     }
 
-    private static void RewriteToHostOwner(InnerNetObject obj, ref int ownerId, string reason)
+    private static void RewriteToHostOwner(
+        InnerNetObject obj,
+        ref int ownerId,
+        ref SpawnFlags flags,
+        string reason)
     {
         var client = AmongUsClient.Instance;
-        if (!client || ownerId == client.ClientId)
+        if (!client)
         {
             return;
         }
 
-        Plugin.LogSource.LogInfo($"DeepBot spawn owner rewrite: object={obj.GetType().Name}, reason={reason}, from={ownerId}, toHost={client.ClientId}.");
+        var previousOwner = ownerId;
         ownerId = client.ClientId;
+        flags &= ~SpawnFlags.IsClientCharacter;
+        Plugin.LogSource.LogInfo(
+            $"DeepBot spawn owner rewrite: object={obj.GetType().Name}, reason={reason}, " +
+            $"from={previousOwner}, toHost={client.ClientId}, isClientCharacter=false.");
     }
 
     private static PlayerControl? FindDeepBotPlayer(InnerNetObject obj)
@@ -74,4 +99,5 @@ internal static class LocalBotSpawnOwnerPatch
 
         return DeepBotIdentity.IsBot(player) ? player : null;
     }
+
 }

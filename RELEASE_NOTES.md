@@ -1,3 +1,14 @@
+# 0.10.22-model-only-meeting-speech
+
+- Removed every runtime local stock-sentence fallback from meeting chat. Bots now speak only with a fresh model response grounded in the current meeting; API failure or rejected unsafe text results in silence rather than templated filler.
+- Strengthened strategic deception for hidden hostile factions. Bots may intentionally use audited soft frames, false routes, false visible actions, and limited false-witness claims when tactically useful, while code-level ally and information-boundary guards remain authoritative.
+- Removed passive-client `ClientData` proxy duplication and retained only native synchronized player records for host-created bots, preventing TOR duplicate-key update failures and heartbeat starvation.
+- Added strict base-game fingerprints for `Among Us.exe` and `GameAssembly.dll`. Installers reject an incompatible Host/Client game build before writing any files, and the guarded launcher rechecks it before launch.
+- Kept the Client package passive with `BotCount = 0` and no API credential. The Host remains the only world, movement, role, meeting, and AI authority.
+- Included accumulated local-player ownership, remote kill presentation, skill-button isolation, late-join roster, native TOR role, delayed Vampire death, meeting-memory, and voice-input corrections made after 0.10.6.
+- Rebuilt Host Installer, Client Installer, Host Uninstaller, and Client Uninstaller from one `0.10.22` compatibility set. Clean install, wrong-build rejection, launcher validation, API-key boundary, and clean uninstall tests passed.
+- No API key is included.
+
 # 0.10.6-client-authority-lock
 
 - Added a code-level Client authority lock based on `DeepBot-Compatibility.json`. A Client package can never create or control bots, even during the short loopback-host phase before it joins the real LAN host and even when TOR's lobby option still contains a nonzero AI count.

@@ -99,6 +99,7 @@ internal sealed class SafeLocalBotSpawner
             RefreshLobbyAppearances(client);
         }
         EnsureHostLocalPlayer(client, "spawner tick");
+        TorCachedLocalPlayerGuard.EnsureMatches(_hostPlayer, _log, "spawner tick");
 
         if (Time.time >= _nextStatusAt)
         {
@@ -134,7 +135,7 @@ internal sealed class SafeLocalBotSpawner
     {
         reason = string.Empty;
         var client = AmongUsClient.Instance;
-        if (!client || !client.AmHost || client.NetworkMode != NetworkModes.LocalGame)
+        if (!client || !Plugin.AllowsWorldAuthority(client.AmHost) || client.NetworkMode != NetworkModes.LocalGame)
         {
             return true;
         }
@@ -304,13 +305,14 @@ internal sealed class SafeLocalBotSpawner
     public void MaintainHostLocalView()
     {
         var client = AmongUsClient.Instance;
-        if (client is null || !client || !client.AmHost || client.ClientId < 0)
+        if (client is null || !client || !Plugin.AllowsWorldAuthority(client.AmHost) || client.ClientId < 0)
         {
             return;
         }
 
         CaptureHostPlayer(client);
         EnsureHostLocalPlayer(client, "runtime frame");
+        TorCachedLocalPlayerGuard.EnsureMatches(_hostPlayer, _log, "host runtime frame");
         EnsureHostCameraTarget(client, "runtime frame");
         EnsureHostVisionLight(client, "runtime frame");
     }
@@ -324,6 +326,20 @@ internal sealed class SafeLocalBotSpawner
             return;
         }
 
+        // Keep native human ownership correct on every frame. In particular,
+        // this runs before the slower presentation-roster maintenance so TOR
+        // cannot initialize role buttons or death state against a bot object.
+        if (!DeepBotGuestRosterSync.EnsurePassiveGuestLocalPlayer(client!, "passive-frame"))
+        {
+            return;
+        }
+        TorCachedLocalPlayerGuard.EnsureMatches(PlayerControl.LocalPlayer, _log, "guest passive frame");
+        if (DeepBotGuestRosterSync.IsGuestEndGameCleanupActive)
+        {
+            return;
+        }
+        var staleProxyClientsRemoved = DeepBotGuestRosterSync.RemoveReservedGuestClientData(client!);
+
         var now = Time.realtimeSinceStartup;
         if (now < _nextPassiveRosterSyncAt)
         {
@@ -331,9 +347,15 @@ internal sealed class SafeLocalBotSpawner
         }
         _nextPassiveRosterSyncAt = now + PassiveRosterSyncSeconds;
 
+        // Host-owned late-join PlayerControls arrive without their virtual
+        // GameData/ClientData rows. Materialize the public presentation roster
+        // before any vanilla/TOR RPC tries to access character.Data.
+        DeepBotGuestRosterSync.ApplyPendingRoster(client!);
+
         var reservedInfos = 0;
         var matchedControls = 0;
-        var createdProxies = 0;
+        var controlOnlyFallbacks = 0;
+        var rosterPlayerIds = new HashSet<byte>();
         if (GameData.Instance)
         {
             foreach (var info in GameData.Instance.AllPlayers)
@@ -344,48 +366,37 @@ internal sealed class SafeLocalBotSpawner
                 }
 
                 reservedInfos++;
+                rosterPlayerIds.Add(info.PlayerId);
                 var character = FindPlayerControl(info.PlayerId);
                 if (character)
                 {
                     matchedControls++;
                 }
 
-                var proxy = FindClientData(client!, info.ClientId);
-                if (proxy is null)
-                {
-                    var platform = new PlatformSpecificData
-                    {
-                        Platform = Platforms.StandaloneSteamPC,
-                        PlatformName = "DeepBot Host Proxy"
-                    };
-                    proxy = new ClientData(info.ClientId, info.PlayerName, platform, 5u, string.Empty, string.Empty)
-                    {
-                        InScene = true,
-                        IsReady = true,
-                        IsBeingCreated = false,
-                        Character = character,
-                        ColorId = info.DefaultOutfit.ColorId
-                    };
-                    client!.allClients.Add(proxy);
-                    _passiveProxyClientIds.Add(info.ClientId);
-                    createdProxies++;
-                }
-                else
-                {
-                    proxy.InScene = true;
-                    proxy.IsReady = true;
-                    proxy.IsBeingCreated = false;
-                    proxy.PlayerName = info.PlayerName;
-                    proxy.ColorId = info.DefaultOutfit.ColorId;
-                    if (character && proxy.Character != character)
-                    {
-                        proxy.Character = character;
-                    }
-                }
             }
         }
 
-        PruneMissingPassiveGuestProxies(client!);
+        // A late-join snapshot can deliver the PlayerControl spawn one frame
+        // before the matching GameData.PlayerInfo.  The native renderer already
+        // has enough authoritative information on that control to display it;
+        // create only a local ClientData presentation proxy until GameData
+        // catches up.  This is deliberately read-only on the guest: no
+        // CreatePlayer call, RPC, role assignment, or AI decision is allowed.
+        foreach (var character in PlayerControl.AllPlayerControls)
+        {
+            if (!character ||
+                character.Data is null ||
+                !DeepBotIdentity.IsBot(character) ||
+                !DeepBotIdentity.IsReservedClientId(character.Data.ClientId) ||
+                character.Data.Disconnected ||
+                rosterPlayerIds.Contains(character.PlayerId))
+            {
+                continue;
+            }
+
+            controlOnlyFallbacks++;
+        }
+
         EnsureLivePlayersVisible(client!, botsOnly: true, allowLobby: true);
 
         if (Time.time >= _nextGuestStatusAt)
@@ -393,8 +404,57 @@ internal sealed class SafeLocalBotSpawner
             _nextGuestStatusAt = Time.time + 5f;
             _log.LogInfo(
                 $"DeepBot LAN guest presentation sync: clientId={client!.ClientId}, hostId={client.HostId}, " +
-                $"reservedInfos={reservedInfos}, matchedControls={matchedControls}, proxyClients={_passiveProxyClientIds.Count}, " +
-                $"createdNow={createdProxies}, clients={client.allClients.Count}. Host remains sole AI authority.");
+                $"reservedInfos={reservedInfos}, matchedControls={matchedControls}, proxyClients=0, " +
+                $"staleProxyClientsRemoved={staleProxyClientsRemoved}, controlOnlyFallbacks={controlOnlyFallbacks}, " +
+                $"clients={client.allClients.Count}. Host remains sole AI authority.");
+        }
+    }
+
+    private void EnsurePassiveGuestProxy(
+        AmongUsClient client,
+        int clientId,
+        string playerName,
+        int colorId,
+        PlayerControl? character,
+        ref int createdProxies)
+    {
+        if (!DeepBotIdentity.IsReservedClientId(clientId))
+        {
+            return;
+        }
+
+        var proxy = FindClientData(client, clientId);
+        if (proxy is null)
+        {
+            var platform = new PlatformSpecificData
+            {
+                Platform = Platforms.StandaloneSteamPC,
+                PlatformName = "DeepBot Host Proxy"
+            };
+            proxy = new ClientData(clientId, playerName, platform, 5u, string.Empty, string.Empty)
+            {
+                InScene = true,
+                IsReady = true,
+                IsBeingCreated = false,
+                Character = character,
+                ColorId = colorId
+            };
+            client.allClients.Add(proxy);
+            _passiveProxyClientIds.Add(clientId);
+            createdProxies++;
+            return;
+        }
+
+        _passiveProxyClientIds.Add(clientId);
+
+        proxy.InScene = true;
+        proxy.IsReady = true;
+        proxy.IsBeingCreated = false;
+        proxy.PlayerName = playerName;
+        proxy.ColorId = colorId;
+        if (character && proxy.Character != character)
+        {
+            proxy.Character = character;
         }
     }
 
@@ -412,6 +472,24 @@ internal sealed class SafeLocalBotSpawner
                         stillPresent = true;
                         break;
                     }
+                }
+            }
+
+            if (stillPresent)
+            {
+                continue;
+            }
+
+            foreach (var character in PlayerControl.AllPlayerControls)
+            {
+                if (character &&
+                    character.Data is not null &&
+                    !character.Data.Disconnected &&
+                    DeepBotIdentity.IsBot(character) &&
+                    character.Data.ClientId == clientId)
+                {
+                    stillPresent = true;
+                    break;
                 }
             }
 
@@ -517,6 +595,7 @@ internal sealed class SafeLocalBotSpawner
             // the camera target before the next runtime Update. Restore both in
             // the same call stack so no bot-view frame reaches the renderer.
             EnsureHostLocalPlayer(client, $"queued {displayName}");
+            TorCachedLocalPlayerGuard.EnsureMatches(_hostPlayer, _log, $"queued {displayName}");
             EnsureHostCameraTarget(client, $"queued {displayName}");
 
             _tracked.Add(new TrackedBotClient(clientId, botIndex, botClient));
@@ -563,6 +642,7 @@ internal sealed class SafeLocalBotSpawner
 
             AssignRuntimeOwnership(client, character, tracked.ClientId);
             EnsureHostLocalPlayer(client, $"configured {name}");
+            TorCachedLocalPlayerGuard.EnsureMatches(_hostPlayer, _log, $"configured {name}");
             EnsureHostCameraTarget(client, $"configured {name}");
 
             _log.LogInfo(
@@ -710,7 +790,7 @@ internal sealed class SafeLocalBotSpawner
             return false;
         }
 
-        if (!client.AmHost || client.ClientId < 0 || client.HostId != client.ClientId)
+        if (!Plugin.AllowsWorldAuthority(client.AmHost) || client.ClientId < 0 || client.HostId != client.ClientId)
         {
             reason = $"not local host: amHost={client.AmHost}, clientId={client.ClientId}, hostId={client.HostId}";
             return false;
@@ -1249,6 +1329,23 @@ internal sealed class SafeLocalBotSpawner
                 {
                     used = true;
                     break;
+                }
+            }
+
+            // A stale NetworkedPlayerInfo can survive a disconnect for a
+            // short window even after its ClientData has been removed.  Do
+            // not reuse that virtual id until both native collections agree
+            // it is free; otherwise a joining peer can bind the new bot to an
+            // old PlayerId during the initial snapshot.
+            if (!used && GameData.Instance)
+            {
+                foreach (var info in GameData.Instance.AllPlayers)
+                {
+                    if (info is not null && info.ClientId == id)
+                    {
+                        used = true;
+                        break;
+                    }
                 }
             }
 

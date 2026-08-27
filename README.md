@@ -2,7 +2,7 @@
 
 > Turn empty local-lobby slots into independent players that move, observe, deceive, discuss, vote, and learn from failed rounds.
 
-[![Release](https://img.shields.io/badge/release-0.10.6-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
+[![Release](https://img.shields.io/badge/release-0.10.22-00c2ff)](https://github.com/shimiaoshui/among-us-deepbot/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows-0078d4)](#requirements)
 [![Game](https://img.shields.io/badge/game-Among%20Us-e83b3b)](#)
 [![TOR](https://img.shields.io/badge/The%20Other%20Roles-4.6.0-8a5cff)](#the-other-roles-460-integration)
@@ -10,7 +10,7 @@
 
 **Among Us DeepBot** is a host-authoritative AI player plugin for Among Us local and LAN lobbies. The host can configure between `1` and `8` bots in the lobby. Each bot joins as a real network player, while movement, decisions, and synchronization remain under host control. Human players, bots, and compatible clients can therefore play in the same match.
 
-Current release: `0.10.6-client-authority-lock`. It ships separate one-click host and client installers for one fingerprinted TOR 4.6.0 compatibility build.
+Current release: `0.10.22-model-only-meeting-speech`. It ships separate one-click host and client installers for one fingerprinted TOR 4.6.0 compatibility build.
 
 ## More than an auto-walking bot
 
@@ -44,7 +44,18 @@ flowchart LR
 
 DeepBot does not force every bot to play an identical optimal strategy. Personality affects work rate, risk tolerance, trust in testimony, speaking style, and vote thresholds. One bot may rush tasks, another may wander or follow a trusted player, one may trust only eyewitness evidence, and another may be persuaded by a credible account.
 
-## Highlights in 0.10.6
+## Highlights in 0.10.22
+
+- Meeting speech is model-authored only. API failure or a rejected unsafe answer now produces silence instead of a reusable local stock sentence.
+- Hidden hostile roles can deliberately use audited soft frames, false routes, false visible actions, and rare false-witness plays when that serves their win condition. Legal-target, ally, Lover, Lawyer-client, and private-information guards still have final authority.
+- Passive clients no longer materialize duplicate local `ClientData` proxy rows for host-created bots. They bind presentation to the native synchronized player records, preventing TOR's duplicate-player dictionary exception and the resulting heartbeat disconnect.
+- Host and Client installers now fingerprint both `Among Us.exe` and `GameAssembly.dll`. A mismatched base-game build is rejected before any file is changed instead of failing later inside a LAN lobby.
+- Client packages remain presentation-only with `BotCount = 0`; only the Host simulates bot decisions, physics, abilities, meetings, and role state.
+- All four Windows packages were rebuilt from one source/fingerprint set and passed clean install, guarded-launch, wrong-base-build rejection, API-key boundary, and clean uninstall tests.
+
+The release also includes the accumulated post-0.10.6 fixes for local-player ownership, remote kill presentation, role-button isolation, native TOR ability handling, delayed Vampire death, late-join roster synchronization, meeting continuity, and voice dictation.
+
+## Previous highlights in 0.10.6
 
 - Client mode is now a code-level authority lock read from the signed release manifest. Even while the joining computer temporarily hosts its loopback lobby, TOR's lobby AI-count option cannot make that Client package create or control bots.
 

@@ -42,6 +42,23 @@ internal static class TorLanVersionHandshakeReliabilityPatch
 
         var clientId = client.ClientId;
         var hostId = client.HostId;
+        // TOR's own client-side GameStartManager patch already sends the
+        // guest's version handshake.  Retrying shareGameVersion from a guest
+        // can race the local PlayerControl/RPC ownership setup and throw a
+        // TargetInvocationException, which adds noise and can interfere with
+        // the join countdown.  Only the host needs the extra broadcast: it
+        // is the side whose first handshake can be sent before a new guest is
+        // ready to receive it.
+        if (!Plugin.AllowsWorldAuthority(client.AmHost))
+        {
+            ResetSessionIfNeeded(client);
+            return;
+        }
+
+        // Keep the public presentation roster available for guests that join
+        // after the native initial snapshot or miss its immediately-following
+        // custom packet. This does not grant guest-side AI authority.
+        DeepBotGuestRosterSync.TickHost();
         if (clientId != _lastClientId || hostId != _lastHostId)
         {
             _lastClientId = clientId;
@@ -60,8 +77,13 @@ internal static class TorLanVersionHandshakeReliabilityPatch
 
         try
         {
+            var torAssembly = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(assembly => string.Equals(
+                    assembly.GetName().Name,
+                    "TheOtherRoles",
+                    StringComparison.OrdinalIgnoreCase));
             _shareGameVersion ??= AccessTools.Method(
-                AccessTools.TypeByName("TheOtherRoles.Helpers"),
+                torAssembly?.GetType("TheOtherRoles.Helpers", false),
                 "shareGameVersion");
             if (_shareGameVersion is null)
             {

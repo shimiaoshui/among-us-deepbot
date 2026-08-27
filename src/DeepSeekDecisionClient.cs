@@ -15,6 +15,10 @@ namespace AmongUsDeepSeekBots;
 
 internal sealed class DeepSeekDecisionClient
 {
+    private const int MeetingParallelism = 2;
+    private const int MeetingTimeoutSeconds = 12;
+    private const int MeetingTimeoutsBeforeCircuitBreak = 2;
+    private static readonly TimeSpan MeetingCircuitBreakDuration = TimeSpan.FromSeconds(45);
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -24,34 +28,42 @@ internal sealed class DeepSeekDecisionClient
     private readonly HttpClient _http = new();
     private readonly Func<string> _model;
     private readonly Func<string> _apiBaseUrl;
-    private readonly Func<string?> _apiKey;
+    private readonly Func<string[]> _apiKeys;
     private readonly Action<string> _log;
-    private readonly SemaphoreSlim _requestGate = new(1, 1);
+    // Meeting discussion must never sit behind a long-running world-action
+    // request. Keep a small, dedicated lane for meeting decisions while
+    // retaining a single serialized lane for movement/ability/reflection work.
+    private readonly SemaphoreSlim _generalRequestGate = new(1, 1);
+    private readonly SemaphoreSlim _meetingRequestGate = new(MeetingParallelism, MeetingParallelism);
     private readonly object _rateLimitGate = new();
-    private DateTimeOffset _requestBackoffUntil;
     private DateTimeOffset _nextBackoffStatusLogAt;
-    private int _consecutiveRateLimits;
+    private readonly Dictionary<string, DateTimeOffset> _keyBackoffUntil = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _keyConsecutiveRateLimits = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _invalidApiKeys = new(StringComparer.Ordinal);
+    private int _consecutiveMeetingTimeouts;
+    private DateTimeOffset _meetingCircuitOpenUntil;
+    private DateTimeOffset _nextMeetingCircuitStatusLogAt;
+    private int _nextGeneralKeyIndex = -1;
+    private int _nextMeetingKeyIndex = -1;
 
-    public DeepSeekDecisionClient(Func<string> model, Func<string> apiBaseUrl, Func<string?> apiKey, Action<string> log)
+    public DeepSeekDecisionClient(Func<string> model, Func<string> apiBaseUrl, Func<string[]> apiKeys, Action<string> log)
     {
         _model = model;
         _apiBaseUrl = apiBaseUrl;
-        _apiKey = apiKey;
+        _apiKeys = apiKeys;
         _log = log;
-        // Agnes reasoning models may spend a sizeable part of the response budget on
-        // reasoning_content before producing the final JSON. Twenty seconds was too
-        // short for real meeting prompts and caused every follow-up to fall back.
-        _http.Timeout = TimeSpan.FromSeconds(60);
+        // Per-operation timeouts are applied after the request obtains its
+        // lane, so waiting behind another bot does not consume its own budget.
+        _http.Timeout = Timeout.InfiniteTimeSpan;
     }
 
     public async Task<BotActionDecision?> GetActionAsync(BotActionPrompt prompt, CancellationToken cancellationToken)
     {
-        var key = _apiKey();
-        if (string.IsNullOrWhiteSpace(key))
+        var keyLease = TryAcquireApiKey("action");
+        if (keyLease is null)
         {
             return null;
         }
-        if (ShouldSkipForSharedBackoff("action")) return null;
 
         var request = new
         {
@@ -67,10 +79,10 @@ internal sealed class DeepSeekDecisionClient
         };
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, NormalizeEndpoint(_apiBaseUrl()));
-        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", keyLease.Key);
         httpRequest.Content = new StringContent(JsonSerializer.Serialize(request, JsonOptions), Encoding.UTF8, "application/json");
 
-        using var response = await SendWithSharedRateGuardAsync(httpRequest, "action", cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithSharedRateGuardAsync(httpRequest, "action", keyLease, cancellationToken).ConfigureAwait(false);
         if (response is null) return null;
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
@@ -249,23 +261,39 @@ internal sealed class DeepSeekDecisionClient
         var illegalCompleteVoteRejected = EnforceLegalMeetingVote(
             new BotMeetingDecision("test", 7, false, "test", 0.9f, null, "none"),
             "0,2,8") is { SkipVote: true, VotePlayerId: null };
+        var generalOrder = BuildCandidateIndices(4, false, 0);
+        var meetingOrder = BuildCandidateIndices(4, true, 0);
+        var keyRotationValid =
+            generalOrder.SequenceEqual(new[] { 0, 1, 2, 3 }) &&
+            meetingOrder.SequenceEqual(new[] { 3, 0, 1, 2 }) &&
+            generalOrder.Distinct().Count() == 4 &&
+            meetingOrder.Distinct().Count() == 4;
+        var meetingCircuitPolicyValid = MeetingParallelism == 2 &&
+                                        MeetingTimeoutSeconds < 18 &&
+                                        MeetingTimeoutsBeforeCircuitBreak == 2 &&
+                                        MeetingCircuitBreakDuration >= TimeSpan.FromSeconds(30);
         log.LogInfo(
             $"DeepBot LLM decision parser self-test: " +
-            $"level={(visibleNameResolves && hiddenNameRejected && completeLeadingMeetingFieldsRecovered && illegalRecoveredVoteRejected && illegalCompleteVoteRejected ? "ok" : "error")}, " +
+            $"level={(visibleNameResolves && hiddenNameRejected && completeLeadingMeetingFieldsRecovered && illegalRecoveredVoteRejected && illegalCompleteVoteRejected && keyRotationValid && meetingCircuitPolicyValid ? "ok" : "error")}, " +
             $"visibleNameResolves={visibleNameResolves}, hiddenNameRejected={hiddenNameRejected}, " +
             $"truncatedMeetingRecovered={completeLeadingMeetingFieldsRecovered}, " +
             $"illegalRecoveredVoteRejected={illegalRecoveredVoteRejected}, " +
-            $"illegalCompleteVoteRejected={illegalCompleteVoteRejected}.");
+            $"illegalCompleteVoteRejected={illegalCompleteVoteRejected}, keyRotationValid={keyRotationValid}, " +
+            $"meetingCircuitPolicyValid={meetingCircuitPolicyValid}.");
     }
 
     public async Task<BotMeetingDecision?> GetMeetingDecisionAsync(BotMeetingPrompt prompt, CancellationToken cancellationToken)
     {
-        var key = _apiKey();
-        if (string.IsNullOrWhiteSpace(key))
+        if (IsMeetingCircuitOpen("meeting"))
         {
             return null;
         }
-        if (ShouldSkipForSharedBackoff("meeting")) return null;
+
+        var keyLease = TryAcquireApiKey("meeting");
+        if (keyLease is null)
+        {
+            return null;
+        }
 
         var request = new
         {
@@ -284,10 +312,10 @@ internal sealed class DeepSeekDecisionClient
         };
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, NormalizeEndpoint(_apiBaseUrl()));
-        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", keyLease.Key);
         httpRequest.Content = new StringContent(JsonSerializer.Serialize(request, JsonOptions), Encoding.UTF8, "application/json");
 
-        using var response = await SendWithSharedRateGuardAsync(httpRequest, "meeting", cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithSharedRateGuardAsync(httpRequest, "meeting", keyLease, cancellationToken).ConfigureAwait(false);
         if (response is null) return null;
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
@@ -489,12 +517,11 @@ internal sealed class DeepSeekDecisionClient
         BotAbilityPrompt prompt,
         CancellationToken cancellationToken)
     {
-        var key = _apiKey();
-        if (string.IsNullOrWhiteSpace(key))
+        var keyLease = TryAcquireApiKey("ability");
+        if (keyLease is null)
         {
             return null;
         }
-        if (ShouldSkipForSharedBackoff("ability")) return null;
 
         var request = new
         {
@@ -528,10 +555,10 @@ Output exactly: {"use":true|false,"ability_action":"role|vent|hold","target_play
         };
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, NormalizeEndpoint(_apiBaseUrl()));
-        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", keyLease.Key);
         httpRequest.Content = new StringContent(JsonSerializer.Serialize(request, JsonOptions), Encoding.UTF8, "application/json");
 
-        using var response = await SendWithSharedRateGuardAsync(httpRequest, "ability", cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithSharedRateGuardAsync(httpRequest, "ability", keyLease, cancellationToken).ConfigureAwait(false);
         if (response is null) return null;
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
@@ -577,9 +604,8 @@ Output exactly: {"use":true|false,"ability_action":"role|vent|hold","target_play
         BotReflectionPrompt prompt,
         CancellationToken cancellationToken)
     {
-        var key = _apiKey();
-        if (string.IsNullOrWhiteSpace(key)) return null;
-        if (ShouldSkipForSharedBackoff("reflection")) return null;
+        var keyLease = TryAcquireApiKey("reflection");
+        if (keyLease is null) return null;
 
         var request = new
         {
@@ -609,10 +635,10 @@ Output exactly: {"summary":"one short Chinese outcome diagnosis","lessons":[{"ke
         };
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, NormalizeEndpoint(_apiBaseUrl()));
-        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+        httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", keyLease.Key);
         httpRequest.Content = new StringContent(JsonSerializer.Serialize(request, JsonOptions), Encoding.UTF8, "application/json");
 
-        using var response = await SendWithSharedRateGuardAsync(httpRequest, "reflection", cancellationToken).ConfigureAwait(false);
+        using var response = await SendWithSharedRateGuardAsync(httpRequest, "reflection", keyLease, cancellationToken).ConfigureAwait(false);
         if (response is null) return null;
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
@@ -654,55 +680,91 @@ Output exactly: {"summary":"one short Chinese outcome diagnosis","lessons":[{"ke
         }
     }
 
-    public static string? LoadHostApiKey()
+    public static string? LoadHostApiKey() => LoadHostApiKeys().FirstOrDefault();
+
+    public static string[] LoadHostApiKeys()
     {
-        var runtimeKey = Environment.GetEnvironmentVariable("AMONG_US_DEEPBOT_API_KEY")?.Trim();
-        if (!string.IsNullOrWhiteSpace(runtimeKey) &&
-            runtimeKey.StartsWith("sk-", StringComparison.Ordinal))
-        {
-            return runtimeKey;
-        }
+        var keys = new List<string>();
+        AddApiKeys(Environment.GetEnvironmentVariable("AMONG_US_DEEPBOT_API_KEYS"), keys);
+        AddApiKeys(Environment.GetEnvironmentVariable("AMONG_US_DEEPBOT_API_KEY"), keys);
 
-        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AmongUsDeepSeekBots");
-        var path = Path.Combine(dir, "api-key.txt");
-        if (!File.Exists(path))
-        {
-            return null;
-        }
+        var dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "AmongUsDeepSeekBots");
+        var poolPath = Path.Combine(dir, "api-keys.txt");
+        var legacyPath = Path.Combine(dir, "api-key.txt");
+        if (File.Exists(poolPath)) AddApiKeys(File.ReadAllText(poolPath), keys);
+        if (File.Exists(legacyPath)) AddApiKeys(File.ReadAllText(legacyPath), keys);
+        return keys
+            .Where(key => key.StartsWith("sk-", StringComparison.Ordinal) && key.Length >= 12)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+    }
 
-        var key = File.ReadAllText(path).Trim();
-        return key.StartsWith("sk-", StringComparison.Ordinal) ? key : null;
+    private static void AddApiKeys(string? raw, ICollection<string> keys)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return;
+        foreach (var key in raw.Split(
+                     new[] { '\r', '\n', ';', ',' },
+                     StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            keys.Add(key);
+        }
     }
 
     private async Task<HttpResponseMessage?> SendWithSharedRateGuardAsync(
         HttpRequestMessage request,
         string operation,
+        ApiKeyLease keyLease,
         CancellationToken cancellationToken)
     {
-        if (ShouldSkipForSharedBackoff(operation))
-        {
-            return null;
-        }
-
-        await _requestGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var meetingRequest = string.Equals(operation, "meeting", StringComparison.OrdinalIgnoreCase);
+        var requestGate = meetingRequest ? _meetingRequestGate : _generalRequestGate;
+        await requestGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (ShouldSkipForSharedBackoff(operation))
+            if (meetingRequest && IsMeetingCircuitOpen(operation))
             {
                 return null;
             }
 
-            var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            using var requestTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            requestTimeout.CancelAfter(TimeSpan.FromSeconds(meetingRequest ? MeetingTimeoutSeconds : 35));
+            HttpResponseMessage response;
+            try
+            {
+                response = await _http.SendAsync(request, requestTimeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                if (meetingRequest)
+                {
+                    RegisterMeetingTimeout(operation);
+                }
+                _log(
+                    $"DeepSeek {operation} request timed out after " +
+                    $"{(meetingRequest ? MeetingTimeoutSeconds : 35)}s; local strategic fallback remains active.");
+                return null;
+            }
             if ((int)response.StatusCode == 429)
             {
-                RegisterRateLimit(response, operation);
+                RegisterRateLimit(response, operation, keyLease);
+            }
+            else if ((int)response.StatusCode == 401)
+            {
+                RegisterInvalidCredential(operation, keyLease);
             }
             else if (response.IsSuccessStatusCode)
             {
                 lock (_rateLimitGate)
                 {
-                    _consecutiveRateLimits = 0;
-                    _requestBackoffUntil = default;
+                    _keyConsecutiveRateLimits.Remove(keyLease.Key);
+                    _keyBackoffUntil.Remove(keyLease.Key);
+                    if (meetingRequest)
+                    {
+                        _consecutiveMeetingTimeouts = 0;
+                        _meetingCircuitOpenUntil = default;
+                    }
                 }
             }
 
@@ -710,54 +772,188 @@ Output exactly: {"summary":"one short Chinese outcome diagnosis","lessons":[{"ke
         }
         finally
         {
-            _requestGate.Release();
+            requestGate.Release();
         }
     }
 
-    private bool ShouldSkipForSharedBackoff(string operation)
+    private bool IsMeetingCircuitOpen(string operation)
     {
         lock (_rateLimitGate)
         {
             var now = DateTimeOffset.UtcNow;
-            if (now >= _requestBackoffUntil)
+            if (_meetingCircuitOpenUntil <= now)
             {
+                if (_meetingCircuitOpenUntil != default)
+                {
+                    _meetingCircuitOpenUntil = default;
+                    _consecutiveMeetingTimeouts = 0;
+                    _log("DeepSeek meeting circuit recovery probe enabled; remote meeting calls may resume with two bounded requests.");
+                }
                 return false;
             }
 
-            if (now >= _nextBackoffStatusLogAt)
+            if (now >= _nextMeetingCircuitStatusLogAt)
             {
-                _nextBackoffStatusLogAt = now.AddSeconds(20);
+                _nextMeetingCircuitStatusLogAt = now.AddSeconds(10);
                 _log(
-                    $"DeepSeek {operation} request skipped during shared rate-limit backoff; " +
-                    $"remaining={Math.Max(1, (int)Math.Ceiling((_requestBackoffUntil - now).TotalSeconds))}s; local strategic fallback remains active.");
+                    $"DeepSeek {operation} request bypassed while the meeting API circuit is open; " +
+                    $"retryIn={Math.Max(1, (int)Math.Ceiling((_meetingCircuitOpenUntil - now).TotalSeconds))}s, " +
+                    "local memory-based discussion remains active.");
             }
 
             return true;
         }
     }
 
-    private void RegisterRateLimit(HttpResponseMessage response, string operation)
+    private void RegisterMeetingTimeout(string operation)
     {
         lock (_rateLimitGate)
         {
-            _consecutiveRateLimits++;
+            _consecutiveMeetingTimeouts++;
+            if (_consecutiveMeetingTimeouts < MeetingTimeoutsBeforeCircuitBreak)
+            {
+                return;
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            _meetingCircuitOpenUntil = now.Add(MeetingCircuitBreakDuration);
+            _nextMeetingCircuitStatusLogAt = now.AddSeconds(10);
+            _log(
+                $"DeepSeek {operation} circuit opened after {_consecutiveMeetingTimeouts} consecutive timeouts; " +
+                $"pausing remote meeting calls for {MeetingCircuitBreakDuration.TotalSeconds:0}s so queued bots can discuss locally without waiting.");
+        }
+    }
+
+    private ApiKeyLease? TryAcquireApiKey(string operation)
+    {
+        var keys = _apiKeys();
+        if (keys.Length == 0) return null;
+
+        lock (_rateLimitGate)
+        {
+            var now = DateTimeOffset.UtcNow;
+            var isMeeting = string.Equals(operation, "meeting", StringComparison.OrdinalIgnoreCase);
+            var seed = isMeeting
+                ? AdvanceRoundRobin(ref _nextMeetingKeyIndex, keys.Length)
+                : AdvanceRoundRobin(ref _nextGeneralKeyIndex, Math.Max(1, keys.Length - 1));
+            foreach (var index in BuildCandidateIndices(keys.Length, isMeeting, seed))
+            {
+                var key = keys[index];
+                if (_invalidApiKeys.Contains(key))
+                {
+                    continue;
+                }
+                if (!_keyBackoffUntil.TryGetValue(key, out var until) || now >= until)
+                {
+                    return new ApiKeyLease(key, index, keys.Length);
+                }
+            }
+
+            if (now >= _nextBackoffStatusLogAt)
+            {
+                _nextBackoffStatusLogAt = now.AddSeconds(20);
+                var earliest = keys
+                    .Where(key => !_invalidApiKeys.Contains(key))
+                    .Select(key => _keyBackoffUntil.GetValueOrDefault(key, now))
+                    .OrderBy(value => value)
+                    .FirstOrDefault();
+                var invalidCount = keys.Count(key => _invalidApiKeys.Contains(key));
+                var retrySeconds = earliest == default
+                    ? 0
+                    : Math.Max(1, (int)Math.Ceiling((earliest - now).TotalSeconds));
+                _log(
+                    $"DeepSeek {operation} request skipped because no usable local API key is available; " +
+                    $"configured={keys.Length}, invalid={invalidCount}, cooling={keys.Length - invalidCount}, " +
+                    $"nextRetryIn={retrySeconds}s; " +
+                    "no credential content was logged.");
+            }
+            return null;
+        }
+    }
+
+    private static int AdvanceRoundRobin(ref int counter, int modulo)
+    {
+        if (modulo <= 1)
+        {
+            Interlocked.Increment(ref counter);
+            return 0;
+        }
+
+        return (int)((uint)Interlocked.Increment(ref counter) % (uint)modulo);
+    }
+
+    private static int[] BuildCandidateIndices(int keyCount, bool isMeeting, int seed)
+    {
+        if (keyCount <= 0)
+        {
+            return Array.Empty<int>();
+        }
+
+        if (keyCount == 1)
+        {
+            return new[] { 0 };
+        }
+
+        if (isMeeting)
+        {
+            var start = (keyCount - 1 + seed) % keyCount;
+            return Enumerable.Range(0, keyCount)
+                .Select(offset => (start + offset) % keyCount)
+                .ToArray();
+        }
+
+        var normalCount = keyCount - 1;
+        var normalStart = seed % normalCount;
+        return Enumerable.Range(0, normalCount)
+            .Select(offset => (normalStart + offset) % normalCount)
+            .Append(keyCount - 1)
+            .ToArray();
+    }
+
+    private void RegisterInvalidCredential(string operation, ApiKeyLease keyLease)
+    {
+        lock (_rateLimitGate)
+        {
+            if (!_invalidApiKeys.Add(keyLease.Key))
+            {
+                return;
+            }
+
+            _keyBackoffUntil.Remove(keyLease.Key);
+            _keyConsecutiveRateLimits.Remove(keyLease.Key);
+            _log(
+                $"DeepSeek {operation} rejected local key slot {keyLease.Index + 1}/{keyLease.Total} with HTTP 401; " +
+                $"quarantined for this game process (invalid={_invalidApiKeys.Count}/{keyLease.Total}). " +
+                "Other configured keys remain eligible; no credential content was logged.");
+        }
+    }
+
+    private void RegisterRateLimit(HttpResponseMessage response, string operation, ApiKeyLease keyLease)
+    {
+        lock (_rateLimitGate)
+        {
+            var consecutive = _keyConsecutiveRateLimits.GetValueOrDefault(keyLease.Key) + 1;
+            _keyConsecutiveRateLimits[keyLease.Key] = consecutive;
             var serverDelay = response.Headers.RetryAfter?.Delta ??
                               (response.Headers.RetryAfter?.Date is { } retryAt
                                   ? retryAt - DateTimeOffset.UtcNow
                                   : TimeSpan.Zero);
-            var exponentialSeconds = Math.Min(180d, 15d * Math.Pow(2d, Math.Min(4, _consecutiveRateLimits - 1)));
+            var exponentialSeconds = Math.Min(180d, 15d * Math.Pow(2d, Math.Min(4, consecutive - 1)));
             var delay = serverDelay > TimeSpan.Zero
                 ? serverDelay
                 : TimeSpan.FromSeconds(exponentialSeconds);
             if (delay < TimeSpan.FromSeconds(15)) delay = TimeSpan.FromSeconds(15);
             if (delay > TimeSpan.FromMinutes(5)) delay = TimeSpan.FromMinutes(5);
-            _requestBackoffUntil = DateTimeOffset.UtcNow.Add(delay);
+            _keyBackoffUntil[keyLease.Key] = DateTimeOffset.UtcNow.Add(delay);
             _nextBackoffStatusLogAt = DateTimeOffset.UtcNow.AddSeconds(20);
             _log(
-                $"DeepSeek {operation} rate-limited; pausing all LLM request types for {Math.Ceiling(delay.TotalSeconds):0}s " +
-                $"(consecutive429={_consecutiveRateLimits}). Local action, role and meeting safeguards remain active.");
+                $"DeepSeek {operation} rate-limited on local key slot {keyLease.Index + 1}/{keyLease.Total}; " +
+                $"cooling only that key for {Math.Ceiling(delay.TotalSeconds):0}s (consecutive429={consecutive}). " +
+                "Other configured keys remain eligible; no credential content was logged.");
         }
     }
+
+    private sealed record ApiKeyLease(string Key, int Index, int Total);
 
     private static string NormalizeEndpoint(string apiBaseUrl)
     {
@@ -791,7 +987,7 @@ Use sabotage/fake task/shadow/murder with caution; do not run straight to a vict
         return """
 You are independently role-playing one real player in an Among Us meeting. Output JSON only.
 Use only this player's verified private memory, public meeting transcript, visible public roster, and role knowledge.
-The prompt contains this player's fixed personality and speaking style. Follow it consistently: vary sentence length, vocabulary, confidence, questioning, and emotional tone. Do not make every player sound formal or equally diligent.
+The prompt contains this player's fixed personality and speaking style. Follow it consistently: vary sentence length, vocabulary, confidence, questioning, and emotional tone. Do not make every player sound formal or equally diligent. Sound like a lively Chinese friends lobby, not a courtroom transcript: playful roasting, cheeky challenges, natural current Chinese internet slang, dry humor, or mock-serious bets are welcome when they fit the personality. A line may be a little mischievous or "骚", but it must stay non-explicit and must not sexually harass or personally abuse a player.
 Treat personality as a reasoning policy, not just a writing style. A suggestible player may change position after credible public claims; an eyewitness-focused player resists hearsay; a bold player may vote on a strong inference; a cautious player requires stronger corroboration.
 Keep private reasoning brief and emit the final JSON early enough to fit the response budget. Do not expose chain-of-thought.
 Facts tagged [witness], [witness_kill], [witness_vent], [witness_action], [body_seen], [location], [task_started], [task_done], [report], or [murder] are personal verified events.
@@ -801,22 +997,25 @@ The private memory block belongs only to this player. Never borrow, merge, or im
 Do not phrase an inference as a completed murder fact. Without this player's own [witness_kill] event, say "I suspect" or ask for a normal route; never say "your murder route", "I saw you kill", or otherwise tell a player to explain a kill as if it were already proven.
 Interpret claim polarity before reacting: phrases such as "可能是船员", "是好人", "可信", "不怀疑", and "不像内鬼" support the named player and reduce suspicion; they are not accusations. Only hostile wording such as "内鬼", "凶手", "可疑", or "投他" raises suspicion. If a supportive claim conflicts with a personal witnessed kill, state that concrete conflict.
 The evidence ledger is this player's private running interpretation of public claims. Compare it with private memory, earlier decisions, contradictions, alibis, and the latest message before deciding.
-Use this strict evidence order: personal witnessed kill/action > a specific public eyewitness statement with place and action > independently matching concrete statements > unsupported accusation > tone, confidence, repetition, anger, or insults. The last group has zero evidentiary value.
+Use this evidence order: personal witnessed kill/action > a specific public eyewitness statement with a named target and visible action > independently matching concrete statements > unsupported accusation > tone, confidence, repetition, anger, or insults. The last group has zero evidentiary value. Human testimony is meaningful social evidence, not noise: a trusting, social, bold, or intuitive personality may substantially update from one concrete human eyewitness claim and may vote on it as an explicitly fallible judgment; a cautious personality may ask for corroboration. Do not make every personality dismiss the human until a perfect proof chain exists.
 Apply spatial logic in the correct direction. A body being far from someone's stated location is not itself a contradiction and normally supports a limited alibi. A contradiction exists only when the same person is placed in mutually exclusive locations during the same interval, a witness directly conflicts with that route, or the claimed travel time is physically impossible. Never argue that "the body was far away, therefore that player is suspicious." A companion's sighting covers only the interval actually observed; it does not prove innocence for the whole round.
 A location sentence such as "我在某处看到Orion" means only that Orion was seen alive at that location. Never reinterpret "看到/目击某人在某地" as "目睹某人死亡", a corpse report, or a kill. The PublicPlayers alive/dead field is authoritative for whether a player is currently dead.
 Seeing a suspect alive earlier is not counter-evidence to that suspect committing a later kill. It conflicts with an eyewitness accusation only if both claims refer to the same time interval and physically incompatible locations. Do not call an ordinary earlier sighting an alibi for the rest of the round.
 Recent continuous personal contact is counter-evidence for that observed interval. If this player continuously watched a candidate and saw no hostile act, do not invent a gap or vote that candidate from bare speech; state the limited observed interval accurately.
 Never turn your own earlier model conclusion, vote, suspicion score, or wording into new evidence. "I thought so last round" is continuity, not corroboration.
+If private memory contains [deception_plan], remember that this player deliberately lied. Keep the public cover story internally consistent if it is still useful, but never treat the player's own fabricated statement as evidence or let the lie overwrite verified private memory.
 Continuity still matters: lack of fresh evidence does not make a previously suspected living player innocent. Keep a prior suspicion as a fallible belief until a credible alibi, contradictory observation, role change, or stronger alternative weakens it. Never call a carried suspect clear, safe, innocent, or trustworthy merely because the current meeting added nothing. A bold or intuitive personality may vote on a strong but incomplete inference; label it as personal judgment rather than pretending it is proven. A cautious personality may keep suspecting while skipping.
 Two players repeating a conclusion is not meaningful corroboration unless each gives a distinct concrete observation that can be checked. Never claim "cross-verified" or "several people proved it" when the transcript contains only opinions, denials, or copied accusations.
-Crew must reason honestly from evidence, admit uncertainty, and avoid fabricated alibis.
+Crew must reason honestly from evidence, admit uncertainty, and avoid fabricated alibis. Crew deception_intent is always none.
 Impostors must conceal their role, protect known impostor teammates, maintain a plausible story, and redirect suspicion without revealing hidden information. Knowledge that an ally vanished, killed, vented, sabotaged, transformed, or used another role ability is private teammate information: never name, accuse, probe, vote, or sacrifice that ally because of it, and never disclose the ally's ability or exact role. A "trial accusation" against an ally is forbidden; redirect toward a legal opponent or skip instead.
+Hidden hostile factions may deliberately deceive a legal opponent when it serves a concrete win plan. Do not default to honest passive speech: actively consider a consistent frame, false route, or false visible action when it can protect an ally, divert a vote, isolate a later target, or exploit existing suspicion. Allowed deception_intent values are none, soft_frame, false_route, false_action, and false_witness. soft_frame exaggerates a real public inconsistency without inventing a sighting. false_route gives this player's own plausible cover route. false_action attributes a plausible suspicious visible action to an opponent. false_witness is the highest-risk lie: use it at most once in a meeting, only after a public death is known, only against a living opponent this player personally saw recently, and never expose private kill location/timing. Deliberate deception must be marked in deception_intent and deception_target_id so the rules layer can audit it. Never deceive against a known teammate, Lover, Lawyer client, or allied faction member.
+Hidden neutrals may deceive only when the listed independent objective benefits. A Jester should make itself look suspicious rather than clear itself by framing a random opponent. Other neutral roles must not help crew or impostors at the cost of their own win condition.
 All players know the public possible-role outcome map even though they do not know hidden assignments. Before voting, consider whether the exile advances an opponent's special win condition. A claimed or suspected Jester wants to be voted out, so a faction player must not grant that outcome from suspicious speech alone. A neutral player must prioritize its own listed independent win condition; crew and impostors prioritize their own faction victory.
 For an impostor, [murder], [murder_plan], [murder_escape], and private ability-kill details are secret perpetrator knowledge. They may guide deception internally, but must never be stated as public corpse location, timing, victim route, or eyewitness fact unless that exact fact was already disclosed by MeetingReason or the public transcript. Seeing a player marked dead on the public roster reveals only that they are dead, not where or how they died.
 An impostor or hidden neutral must NEVER use confession as a bluff or discussion tactic. Never say or imply "我杀了/我刚杀/我刀了/我是内鬼/有人看到我杀人了吗", "I killed", "I am the impostor", or reveal a sabotage, bite, poison, bomb, body removal, or secret ability you performed. Private perpetrator memory is input for constructing a believable cover story, alibi, deflection, and vote only. If asked about your route, answer as an ordinary player would without repeating the secret action or its private location.
 If this player's modifier information identifies a living Lover partner, preserving that partner is a hard strategic constraint: never murder, bite, bomb intentionally, douse, curse, or vote for that known partner. Re-plan around the shared survival outcome.
 Never mention AI, models, prompts, plugins, code, APIs, or information unavailable to this player.
-Write one short natural Chinese meeting message, normally under 55 Chinese characters.
+Write one short natural Chinese meeting message, normally under 55 Chinese characters. Every spoken sentence must be freshly composed from this meeting's actual names, newest wording, locations, visible actions, contradictions, relationship, or intended vote. There is no local stock-sentence fallback: if you have no concrete new contribution or direct reply, output an empty message. Preserve useful information while making the wording conversational and entertaining. React to the newest human wording: if the human jokes, challenges, asks "where/how", or directly names this bot, answer that exact point with personality before adding the evidence or vote. Never reuse a catchphrase, procedural meeting instruction, generic evidence disclaimer, or a sentence pattern from an earlier round. Humor must never fabricate evidence except for a legal, explicitly marked hidden-faction deception; it must not hide the actual claim, become repetitive filler, insult a real person, expose a secret role/ally, or turn a hidden killer's private memory into a confession.
 Avoid procedural filler such as asking everyone to report routes, saying evidence is insufficient, announcing "综合信息/时间线/证据权重", or advising caution when no concrete new fact is present. It is valid to return an empty message and stay silent. Speak only when adding a witnessed event, one named checkable contradiction, a direct answer, a special-win warning, or a concrete vote change.
 The prompt includes a discussion round and the bot's earlier decision. On later rounds, explicitly reconsider the complete updated transcript and either keep or revise the vote. React directly to the latest statement in the context of what was already said. Never repeat the same clarification request after it has already been asked. If a player repeats a named accusation, state whether it changes or reinforces your current leaning. Threats or apparent confessions raise suspicion but are not automatically eyewitness proof.
 Maintain one continuous position across rounds. Do not reverse a concrete suspect or vote merely because that suspect counter-accuses someone, repeats an unsupported claim, or speaks confidently. Change the candidate only when the updated transcript adds a new eyewitness event, an independently corroborated contradiction, a credible exoneration, or another explicit evidence delta; when changing, state the new evidence that caused it.
@@ -825,9 +1024,11 @@ ConversationFocus names the newest public statement that still deserves an answe
 Reconstruct a compact timeline from private events and public claims: who was personally seen where, exactly which two statements conflict, whether alleged corroboration contains distinct observations, and whether the accusation matches personal memory. A claimed color is a player alias, not a separate person.
 Choose a concrete candidate when evidence and personality justify it. Skip only when no legal candidate reaches this player's own evidence threshold; do not default to skip merely because certainty is below 100 percent.
 A bold or intuitive player may cast a clearly labelled judgment vote from accumulated prior suspicion plus one credible new clue even without a closed proof chain. A cautious eyewitness-focused player may skip the same case. Do not require every vote to have a complete proof chain, but never upgrade an unsupported accusation or repeated opinion into a fact.
+Personal eyewitness evidence is the strongest basis, not a prerequisite for voting. Route inconsistencies, a credible named public statement, remembered suspicion, visible role-capability clues, defensive companionship, conversational credibility and this personality's risk tolerance must all affect the decision. In an ordinary meeting, different personalities should often reach different votes from the same incomplete information. Do not make the whole lobby skip merely because nobody personally witnessed the kill.
 vote_player_id must be one of LegalVotePlayerIds or null. Use skip_vote=true for skip. Never vote for an explicitly known ally, Lover partner, Jackal-faction partner, or a Lawyer's assigned client.
 Also choose an optional post-meeting social intent using only public discussion and private memory. follow_intent is "trust", "suspect", or "none"; follow_player_id must be a living legal player id or null. Following means observing that player after everyone respawns, not knowing their hidden location.
-Output exactly: {"message":"...","vote_player_id":number|null,"skip_vote":true|false,"reason":"short private rationale","confidence":0.0,"follow_player_id":number|null,"follow_intent":"trust|suspect|none"}
+Choose one post_meeting_action from none, observe, protect, isolate, frame, eliminate, rush_tasks, fake_task, sabotage. action_target_id must be a living legal player id for target-based actions or null. Crew may use observe, protect, or rush_tasks. Hidden factions may use isolate, frame, eliminate, fake_task, or sabotage only when their native role and current room rules permit it. This is a tactical intent, never permission to bypass cooldowns, range, physics, visibility, or TOR role rules.
+Output exactly: {"message":"...","vote_player_id":number|null,"skip_vote":true|false,"reason":"short private rationale","confidence":0.0,"follow_player_id":number|null,"follow_intent":"trust|suspect|none","deception_intent":"none|soft_frame|false_route|false_action|false_witness","deception_target_id":number|null,"post_meeting_action":"none|observe|protect|isolate|frame|eliminate|rush_tasks|fake_task|sabotage","action_target_id":number|null}
 """;
     }
 
@@ -961,7 +1162,11 @@ internal sealed record BotMeetingDecision(
     [property: JsonPropertyName("reason")] string? Reason,
     [property: JsonPropertyName("confidence")] float Confidence,
     [property: JsonPropertyName("follow_player_id")] int? FollowPlayerId = null,
-    [property: JsonPropertyName("follow_intent")] string? FollowIntent = null);
+    [property: JsonPropertyName("follow_intent")] string? FollowIntent = null,
+    [property: JsonPropertyName("deception_intent")] string? DeceptionIntent = null,
+    [property: JsonPropertyName("deception_target_id")] int? DeceptionTargetId = null,
+    [property: JsonPropertyName("post_meeting_action")] string? PostMeetingAction = null,
+    [property: JsonPropertyName("action_target_id")] int? ActionTargetId = null);
 
 internal sealed record BotAbilityPrompt(
     byte BotId,

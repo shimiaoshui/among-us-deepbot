@@ -178,6 +178,30 @@ internal sealed class BotActionDirector
                 state.GhostTaskModeLogged = false;
             }
 
+            var taskRush = ShouldRushTasks(bot, out var taskRushReason);
+            if (taskRush)
+            {
+                state.PostTaskPauseUntil = 0f;
+                state.PostTaskWanderPending = false;
+                state.PendingDecision = null;
+                if (state.HasActiveRoute && state.ActionKind is not BotActionKind.Task and not BotActionKind.Emergency)
+                {
+                    state.ClearRoute();
+                }
+                state.NextDecisionAt = Mathf.Min(state.NextDecisionAt, Time.time);
+                if (!state.TaskRushLogged)
+                {
+                    state.TaskRushLogged = true;
+                    _log.LogInfo(
+                        $"DeepBot task rush activated: bot={bot.Data?.PlayerName}({bot.PlayerId}), reason={taskRushReason}, " +
+                        $"remaining={CountIncompleteNormalTasks(bot)}.");
+                }
+            }
+            else
+            {
+                state.TaskRushLogged = false;
+            }
+
             if (IsImpostor(bot) && state.NextSabotageAt <= 0f)
             {
                 state.NextSabotageAt = _playClockStartedAt + UnityEngine.Random.Range(40f, 65f);
@@ -193,6 +217,27 @@ internal sealed class BotActionDirector
                 TryAssignEmergencyRoute(bot, state, "decision"))
             {
                 CompleteRoundResumeIntent(bot, state, "emergency");
+                continue;
+            }
+
+            if (taskRush &&
+                (isDeadCrewmate || IsTaskCompletingRole(bot)) &&
+                (!state.HasActiveRoute || state.ActionKind != BotActionKind.Task) &&
+                TryFindAssignedTaskTarget(bot, state, out var rushedTaskTarget))
+            {
+                AssignRoute(
+                    bot,
+                    state,
+                    rushedTaskTarget.Position,
+                    $"TASK_{rushedTaskTarget.Task.Id}",
+                    $"task-rush:{taskRushReason}:{rushedTaskTarget.Task.TaskType}:{rushedTaskTarget.Source}",
+                    TaskDwellSecondsMin,
+                    TaskDwellSecondsMax,
+                    BotActionKind.Task,
+                    rushedTaskTarget.Task.Id,
+                    null,
+                    rushedTaskTarget.UseDistance);
+                state.TaskSelectionEpoch++;
                 continue;
             }
 
@@ -691,6 +736,7 @@ internal sealed class BotActionDirector
         }
 
         _observedMatchSerial = serial;
+        MeetingBehaviorDirectives.ResetForMatch(serial);
         _states.Clear();
         ResetActivePlayGate();
         _roundResumeEpoch = 0;
@@ -1469,6 +1515,15 @@ internal sealed class BotActionDirector
             var target = FindPlayerControl((byte)decision.TargetPlayerId.Value);
             if (target is null)
             {
+                return false;
+            }
+
+            if (ShouldPreserveMeetingFrameTarget(bot, target))
+            {
+                _memory.RecordAction(
+                    bot,
+                    "murder_plan",
+                    $"held kill on {target.Data?.PlayerName}({target.PlayerId}) because the latest meeting plan needs that scapegoat alive");
                 return false;
             }
 
@@ -2867,28 +2922,99 @@ internal sealed class BotActionDirector
         }
 
         state.LastConsumedMeetingSerial = intent.MeetingSerial;
-        if (!intent.FollowPlayerId.HasValue ||
-            intent.FollowIntent is not ("trust" or "suspect"))
+        var tacticalAction = intent.TacticalAction;
+        if (tacticalAction == "rush_tasks")
+        {
+            _memory.RecordAction(bot, "post_meeting_tactic", "meeting requested immediate task focus");
+            return false;
+        }
+
+        if (tacticalAction == "fake_task" && IsImpostor(bot))
+        {
+            var fakeTaskNode = PickFakeTaskNode();
+            AssignRoute(
+                bot,
+                state,
+                fakeTaskNode,
+                $"meeting-tactic:fake-task:{intent.Reason}",
+                2.2f,
+                5.2f,
+                BotActionKind.Llm,
+                null,
+                null);
+            _memory.RecordAction(bot, "post_meeting_tactic", $"fake_task at {fakeTaskNode}; {intent.Reason}");
+            return state.ActionKind == BotActionKind.Llm;
+        }
+
+        if (tacticalAction == "sabotage" && IsImpostor(bot))
+        {
+            if (TrySelectStrategicSabotage(bot, state, out var plan) &&
+                TryTriggerSabotage(bot, state, plan.Intent, $"meeting tactic: {intent.Reason}"))
+            {
+                _memory.RecordAction(
+                    bot,
+                    "post_meeting_tactic",
+                    $"sabotage={plan.Intent}; goal={plan.Goal}; meetingReason={intent.Reason}");
+            }
+            // Whether the native sabotage was ready or held, never freeze at
+            // spawn: immediately take plausible cover and reconsider later.
+            var coverNode = PickFakeTaskNode();
+            AssignRoute(
+                bot,
+                state,
+                coverNode,
+                $"meeting-tactic:sabotage-cover:{intent.Reason}",
+                1.8f,
+                4.5f,
+                BotActionKind.Llm,
+                null,
+                null);
+            return state.ActionKind == BotActionKind.Llm;
+        }
+
+        var targetId = intent.ActionTargetId ?? intent.FollowPlayerId;
+        if (!targetId.HasValue)
         {
             return false;
         }
 
-        var target = FindPlayerControl(intent.FollowPlayerId.Value);
+        var target = FindPlayerControl(targetId.Value);
         if (target is null ||
             target.Data is null ||
             target.Data.IsDead ||
             target.Data.Disconnected ||
-            !CanObservePlayer(bot, target))
+            !TryPickKnownTargetNode(bot, state, target, out var knownTargetNode))
         {
             _memory.RecordAction(
                 bot,
                 "post_meeting_social",
-                $"did not follow playerId={intent.FollowPlayerId}; target was not personally visible after respawn");
+                $"could not start tactic={tacticalAction} for playerId={targetId}; no current or recent personal sighting");
             return false;
         }
 
+        if (tacticalAction == "eliminate" && IsImpostor(bot) &&
+            TryAssignMurderPursuitRoute(
+                bot,
+                state,
+                target,
+                $"meeting-directed-eliminate:{intent.Reason}"))
+        {
+            _memory.RecordAction(
+                bot,
+                "post_meeting_tactic",
+                $"eliminate {target.Data.PlayerName}({target.PlayerId}); confidence={intent.Confidence:0.00}");
+            return true;
+        }
+
         var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
-        var minimumConfidence = intent.FollowIntent == "suspect"
+        var socialIntent = tacticalAction is "isolate" or "frame" or "eliminate"
+            ? "suspect"
+            : intent.FollowIntent;
+        if (socialIntent is not ("trust" or "suspect"))
+        {
+            socialIntent = tacticalAction == "protect" ? "trust" : "suspect";
+        }
+        var minimumConfidence = socialIntent == "suspect"
             ? Mathf.Lerp(0.65f, 0.28f, personality.VoteBoldness)
             : Mathf.Lerp(0.62f, 0.25f, personality.SocialSuggestibility);
         if (intent.Confidence < minimumConfidence)
@@ -2901,23 +3027,21 @@ internal sealed class BotActionDirector
         AssignRoute(
             bot,
             state,
-            target.GetTruePosition(),
-            $"POST_MEETING_{intent.FollowIntent.ToUpperInvariant()}_{target.PlayerId}",
-            $"meeting-memory:{intent.FollowIntent}:{intent.Reason}",
+            knownTargetNode,
+            $"meeting-memory:{tacticalAction}:{socialIntent}:{intent.Reason}",
             1.2f,
             2.8f,
             BotActionKind.Observe,
             null,
-            target.PlayerId,
-            1.8f);
+            target.PlayerId);
         _memory.RecordAction(
             bot,
             "post_meeting_social",
-            $"chose to observe {target.Data.PlayerName}({target.PlayerId}) as {intent.FollowIntent}; confidence={intent.Confidence:0.00}");
+            $"chose tactic={tacticalAction} toward {target.Data.PlayerName}({target.PlayerId}) as {socialIntent}; confidence={intent.Confidence:0.00}");
         _log.LogInfo(
             $"DeepBot post-meeting social intent started: bot={bot.Data?.PlayerName}, " +
-            $"target={target.Data.PlayerName}({target.PlayerId}), intent={intent.FollowIntent}, " +
-            $"confidence={intent.Confidence:0.00}, visibleAtStart=true.");
+            $"target={target.Data.PlayerName}({target.PlayerId}), intent={socialIntent}, tactic={tacticalAction}, " +
+            $"confidence={intent.Confidence:0.00}, routeFromPersonalKnowledge=true.");
         return state.ActionKind == BotActionKind.Observe;
     }
 
@@ -3027,6 +3151,13 @@ internal sealed class BotActionDirector
 
     private void SchedulePostTaskPersonality(PlayerControl bot, BotRuntimeState state)
     {
+        if (ShouldRushTasks(bot, out _))
+        {
+            state.PostTaskPauseUntil = 0f;
+            state.PostTaskWanderPending = false;
+            return;
+        }
+
         var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
         var pause = UnityEngine.Random.Range(
             personality.PostTaskPauseMin,
@@ -5518,7 +5649,8 @@ internal sealed class BotActionDirector
                     ((killer.PlayerId + player.PlayerId + state.MurderTargetEpoch) % 5) * 0.08f) +
                     (isRolePriority ? 8f : 0f) -
                     observation.Age * 0.22f +
-                    movementOpportunity;
+                    movementOpportunity +
+                    GetPostMeetingMurderBias(killer, player);
                 return new
                 {
                     Player = player,
@@ -5613,6 +5745,13 @@ internal sealed class BotActionDirector
         BotRuntimeState state,
         string source)
     {
+        if (_memory.TryGetPostMeetingIntent(killer.PlayerId, out var intent) &&
+            intent.ActionTargetId == requested.PlayerId &&
+            intent.TacticalAction is "eliminate" or "isolate")
+        {
+            return requested;
+        }
+
         if (IsDeepBotPlayer(requested))
         {
             return requested;
@@ -5642,6 +5781,30 @@ internal sealed class BotActionDirector
             $"requested={requested.Data?.PlayerName}({requested.PlayerId}), selected={preferred.Data?.PlayerName}({preferred.PlayerId}), " +
             $"source={source}.");
         return preferred;
+    }
+
+    private float GetPostMeetingMurderBias(PlayerControl killer, PlayerControl candidate)
+    {
+        if (!_memory.TryGetPostMeetingIntent(killer.PlayerId, out var intent) ||
+            intent.ActionTargetId != candidate.PlayerId)
+        {
+            return 0f;
+        }
+
+        return intent.TacticalAction switch
+        {
+            "eliminate" => 7f,
+            "isolate" => 3f,
+            "frame" => -12f,
+            _ => 0f
+        };
+    }
+
+    private bool ShouldPreserveMeetingFrameTarget(PlayerControl killer, PlayerControl candidate)
+    {
+        return _memory.TryGetPostMeetingIntent(killer.PlayerId, out var intent) &&
+               intent.TacticalAction == "frame" &&
+               intent.ActionTargetId == candidate.PlayerId;
     }
 
     private bool UpdateMurderPursuit(PlayerControl killer, BotRuntimeState state)
@@ -6568,7 +6731,7 @@ internal sealed class BotActionDirector
         var client = AmongUsClient.Instance;
         return client &&
             client.NetworkMode == NetworkModes.LocalGame &&
-            client.AmHost &&
+            Plugin.AllowsWorldAuthority(client.AmHost) &&
             client.ClientId >= 0 &&
             client.ClientId == client.HostId &&
             client.GameState == InnerNetClient.GameStates.Started &&
@@ -6650,6 +6813,56 @@ internal sealed class BotActionDirector
         }
 
         return count;
+    }
+
+    private bool ShouldRushTasks(PlayerControl bot, out string reason)
+    {
+        reason = string.Empty;
+        if (!bot || CountIncompleteNormalTasks(bot) == 0)
+        {
+            return false;
+        }
+
+        if (MeetingBehaviorDirectives.ShouldRushTasks(bot.PlayerId, _memory.MatchSerial))
+        {
+            reason = "human-meeting-directive";
+            return true;
+        }
+
+        if (_memory.TryGetPostMeetingIntent(bot.PlayerId, out var meetingIntent) &&
+            meetingIntent.TacticalAction == "rush_tasks")
+        {
+            reason = "model-post-meeting-plan";
+            return true;
+        }
+
+        var remainingTaskHolders = PlayerControl.AllPlayerControls
+            .ToArray()
+            .Where(player => player && player.Data is not null && !player.Data.Disconnected)
+            .Where(player => !IsImpostor(player))
+            .Where(player => !TorRoleAdapter.TryGetRole(player, out var role) || !role.IsNeutral)
+            .Where(player => CountIncompleteNormalTasks(player) > 0)
+            .ToArray();
+        if (remainingTaskHolders.Length is < 1 or > 2 ||
+            remainingTaskHolders.Any(player => !DeepBotIdentity.IsBot(player)) ||
+            !remainingTaskHolders.Any(player => player.PlayerId == bot.PlayerId))
+        {
+            return false;
+        }
+
+        if (!GameData.Instance || GameData.Instance.TotalTasks <= 0)
+        {
+            return false;
+        }
+
+        var progress = GameData.Instance.CompletedTasks / (float)GameData.Instance.TotalTasks;
+        if (progress < 0.65f)
+        {
+            return false;
+        }
+
+        reason = $"crew-task-endgame-catchup:{remainingTaskHolders.Length}-bot-holders:progress={progress:P0}";
+        return true;
     }
 
     private static bool IsImpostor(PlayerControl player)
@@ -6753,6 +6966,7 @@ internal sealed class BotActionDirector
         public float LastKillTimerSampleAt { get; set; }
         public float PostTaskPauseUntil { get; set; }
         public bool PostTaskWanderPending { get; set; }
+        public bool TaskRushLogged { get; set; }
         public bool RoundResumeIntentPending { get; set; }
         public string RoundResumeReason { get; set; } = string.Empty;
         public string RoundResumeIntent { get; set; } = string.Empty;

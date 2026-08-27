@@ -15,7 +15,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "local.amongus.deepseekbots";
     public const string PluginName = "Among Us DeepSeek Bots";
-    public const string PluginVersion = "0.10.6-client-authority-lock";
+    public const string PluginVersion = "0.10.22-model-only-meeting-speech";
 
     private readonly Harmony _harmony = new(PluginGuid);
 
@@ -29,12 +29,13 @@ public sealed class Plugin : BasePlugin
     internal static bool AllowsWorldAuthority(bool nativeHost) =>
         AllowsWorldAuthorityForMode(InstallMode, nativeHost);
     internal static bool AllowsWorldAuthorityForMode(string? installMode, bool nativeHost) =>
-        nativeHost && !string.Equals(installMode, "Client", StringComparison.OrdinalIgnoreCase);
+        nativeHost && string.Equals(installMode, "Host", StringComparison.OrdinalIgnoreCase);
 
     internal static void ApplyLateTorRolePatches()
     {
         TorAuthoritativeRoleTextPatch.TryApplyLate(Instance._harmony);
         TorNinjaTraceColorGuardPatch.TryApplyLate(Instance._harmony);
+        TorCustomButtonLayoutPatch.TryApplyLate(Instance._harmony);
     }
 
     public override void Load()
@@ -51,6 +52,8 @@ public sealed class Plugin : BasePlugin
 
         _harmony.PatchAll(typeof(Plugin).Assembly);
         LogSpawnPatchTarget();
+        LogLateJoinPatchTarget();
+        LogAuthoritySelfTest();
 
         ClassInjector.RegisterTypeInIl2Cpp<DeepBotRuntime>();
 
@@ -92,6 +95,39 @@ public sealed class Plugin : BasePlugin
         Log.LogInfo($"DeepBot spawn-owner patch target resolved: {method.DeclaringType?.Name}.{method.Name}({string.Join(", ", method.GetParameters().Select(p => p.ParameterType.Name))}).");
     }
 
+    private void LogLateJoinPatchTarget()
+    {
+        var method = AccessTools.Method(
+            typeof(InnerNetClient),
+            nameof(InnerNetClient.SendInitialData),
+            [typeof(int)]);
+
+        if (method is null)
+        {
+            Log.LogWarning("DeepBot late-join patch target not found: InnerNetClient.SendInitialData(Int32).");
+            return;
+        }
+
+        Log.LogInfo(
+            $"DeepBot late-join patch target resolved: {method.DeclaringType?.Name}.{method.Name}" +
+            $"({string.Join(", ", method.GetParameters().Select(p => p.ParameterType.Name))}).");
+    }
+
+    private void LogAuthoritySelfTest()
+    {
+        var clientPackageBlocked = !AllowsWorldAuthorityForMode("Client", true);
+        var hostPackageAllowed = AllowsWorldAuthorityForMode("Host", true);
+        var unknownPackageBlocked = !AllowsWorldAuthorityForMode("Unknown", true);
+        var remoteGuestBlocked = !AllowsWorldAuthorityForMode("Host", false);
+        var level = clientPackageBlocked && hostPackageAllowed && unknownPackageBlocked && remoteGuestBlocked
+            ? "ok"
+            : "error";
+        Log.LogInfo(
+            $"DeepBot LAN authority self-test: level={level}, clientPackageBlocked={clientPackageBlocked}, " +
+            $"hostPackageAllowed={hostPackageAllowed}, unknownPackageBlocked={unknownPackageBlocked}, " +
+            $"remoteGuestBlocked={remoteGuestBlocked}.");
+    }
+
     private static string ReadInstallMode()
     {
         try
@@ -112,6 +148,13 @@ public sealed class Plugin : BasePlugin
             LogSource?.LogWarning($"DeepBot install-mode manifest could not be read: {ex.GetType().Name}: {ex.Message}");
         }
 
+        // Fail closed.  The install manifest is the package boundary that
+        // distinguishes the authoritative Host payload from the passive
+        // Client payload.  Treating a missing/invalid manifest as Host would
+        // let a copied Client DLL create a second bot authority when a guest
+        // becomes a local host.  Official installers always write this file;
+        // an incomplete install must therefore disable world authority until
+        // the matching package is installed again.
         return "Unknown";
     }
 }

@@ -319,6 +319,8 @@ internal sealed class InstallerForm : Form
                             ?? throw new InvalidOperationException("The embedded payload is missing.");
         using var archive = new ZipArchive(payload, ZipArchiveMode.Read, leaveOpen: false);
         ValidatePayloadBootChain(archive);
+        var payloadManifest = ReadPayloadManifest(archive);
+        ValidateBaseGameBuild(gameDirectory, payloadManifest);
         var root = Path.GetFullPath(gameDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var receiptDirectory = Path.Combine(gameDirectory, "DeepBot Installer Records");
         var receiptPath = Path.Combine(receiptDirectory, $"DeepBot-{Program.Mode}-Install.json");
@@ -495,11 +497,19 @@ internal sealed class InstallerForm : Form
             throw new InvalidDataException("The API key must be a single non-empty line.");
         }
 
-        var directory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "AmongUsDeepSeekBots");
+        // Installer verification must never touch a real player's permanent
+        // credential.  The override is intentionally installer-only; the
+        // game plugin continues to read the normal LocalAppData location.
+        var isolatedTestPath = Environment.GetEnvironmentVariable("DEEPBOT_INSTALL_API_KEY_PATH");
+        var path = string.IsNullOrWhiteSpace(isolatedTestPath)
+            ? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AmongUsDeepSeekBots",
+                "api-key.txt")
+            : Path.GetFullPath(isolatedTestPath);
+        var directory = Path.GetDirectoryName(path)
+            ?? throw new InvalidDataException("The API key path has no parent directory.");
         Directory.CreateDirectory(directory);
-        var path = Path.Combine(directory, "api-key.txt");
         var tempPath = path + ".tmp";
         File.WriteAllText(tempPath, key);
         File.Move(tempPath, path, overwrite: true);
@@ -516,6 +526,37 @@ internal sealed class InstallerForm : Form
         {
             throw new InvalidDataException(
                 "The installer payload is incomplete and cannot start BepInEx. Missing: " + string.Join(", ", missing));
+        }
+    }
+
+    private static CompatibilityManifest ReadPayloadManifest(ZipArchive archive)
+    {
+        var entry = archive.Entries.FirstOrDefault(candidate =>
+            string.Equals(
+                candidate.FullName.Replace('/', Path.DirectorySeparatorChar).TrimStart(Path.DirectorySeparatorChar),
+                "DeepBot-Compatibility.json",
+                StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidDataException("The installer payload has no compatibility manifest.");
+        using var stream = entry.Open();
+        return JsonSerializer.Deserialize<CompatibilityManifest>(stream)
+               ?? throw new InvalidDataException("The embedded compatibility manifest is invalid.");
+    }
+
+    private static void ValidateBaseGameBuild(string gameDirectory, CompatibilityManifest manifest)
+    {
+        var gameExe = Path.Combine(gameDirectory, "Among Us.exe");
+        var gameAssembly = Path.Combine(gameDirectory, "GameAssembly.dll");
+        if (!File.Exists(gameExe) || !File.Exists(gameAssembly))
+        {
+            throw new InvalidDataException(
+                "The selected folder is not a complete Among Us installation (Among Us.exe or GameAssembly.dll is missing).");
+        }
+
+        if (!string.Equals(ComputeSha256(gameExe), manifest.GameExeSha256, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(ComputeSha256(gameAssembly), manifest.GameAssemblySha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                "This Among Us base game build does not match the Host release. Update Steam and make sure Host and Client use the same Among Us build, then run this installer again. No files were changed.");
         }
     }
 
@@ -546,6 +587,7 @@ internal sealed class InstallerForm : Form
             throw new InvalidDataException(
                 $"The embedded package is {manifest.Mode}, but this installer is {Program.Mode}. Download the matching installer again.");
         }
+        ValidateBaseGameBuild(gameDirectory, manifest);
 
         var configPath = Path.Combine(gameDirectory, "BepInEx", "config", "local.amongus.deepseekbots.cfg");
         var config = File.ReadAllText(configPath);
@@ -732,4 +774,6 @@ internal sealed record CompatibilityManifest(
     string TorSha256,
     string ReactorSha256,
     string DeepBotSha256,
+    string GameExeSha256,
+    string GameAssemblySha256,
     string Mode);

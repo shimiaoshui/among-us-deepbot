@@ -334,7 +334,8 @@ internal static class BotBehaviorPolicy
         }
 
         if (ContainsIndexedAlias(compactText, "player", playerId) ||
-            ContainsIndexedAlias(compactText, "玩家", playerId))
+            ContainsIndexedAlias(compactText, "玩家", playerId) ||
+            ContainsChinesePlayerNumber(compactText, playerId))
         {
             return true;
         }
@@ -385,6 +386,8 @@ internal static class BotBehaviorPolicy
         AddIndex(indexes, compactText, localizedColorName);
         AddIndex(indexes, compactText, $"player{playerId}");
         AddIndex(indexes, compactText, $"玩家{playerId}");
+        AddIndex(indexes, compactText, $"{playerId}号");
+        AddIndex(indexes, compactText, $"{ToChinesePlayerNumber(playerId)}号");
 
         var compactName = CompactMeetingText(displayName ?? string.Empty);
         const string botPrefix = "deepbot";
@@ -461,19 +464,45 @@ internal static class BotBehaviorPolicy
 
     private static bool ContainsChinesePlayerNumber(string value, int number)
     {
-        var alias = $"{number}号";
-        var index = value.IndexOf(alias, StringComparison.Ordinal);
-        while (index >= 0)
+        foreach (var alias in new[] { $"{number}号", $"{ToChinesePlayerNumber(number)}号" })
         {
-            if (index == 0 || !char.IsDigit(value[index - 1]))
+            var index = value.IndexOf(alias, StringComparison.Ordinal);
+            while (index >= 0)
             {
-                return true;
-            }
+                if (index == 0 || !char.IsDigit(value[index - 1]))
+                {
+                    return true;
+                }
 
-            index = value.IndexOf(alias, index + 1, StringComparison.Ordinal);
+                index = value.IndexOf(alias, index + 1, StringComparison.Ordinal);
+            }
         }
 
         return false;
+    }
+
+    private static string ToChinesePlayerNumber(int number)
+    {
+        return number switch
+        {
+            0 => "零",
+            1 => "一",
+            2 => "二",
+            3 => "三",
+            4 => "四",
+            5 => "五",
+            6 => "六",
+            7 => "七",
+            8 => "八",
+            9 => "九",
+            10 => "十",
+            11 => "十一",
+            12 => "十二",
+            13 => "十三",
+            14 => "十四",
+            15 => "十五",
+            _ => number.ToString()
+        };
     }
 
     private static bool ContainsColorAlias(string value, string alias)
@@ -769,6 +798,8 @@ internal static class BotBehaviorPolicy
         var meetingAliasesValid =
             MentionsPlayerAlias("投bot2", 7, "DeepBot 2") &&
             MentionsPlayerAlias("我怀疑 2号", 7, "DeepBot 2") &&
+            MentionsPlayerAlias("我怀疑是一号", 1, "Iris") &&
+            MentionsPlayerAlias("先问7号", 7, "Foxtrot") &&
             MentionsPlayerAlias("粉色是内鬼", 7, "DeepBot 2", 3, "粉红色") &&
             MentionsPlayerAlias("pink is sus", 7, "DeepBot 2", 3, "Pink") &&
             !MentionsPlayerAlias("粉色是内鬼", 8, "DeepBot 3", 1, "蓝色") &&

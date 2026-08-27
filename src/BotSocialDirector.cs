@@ -181,6 +181,7 @@ internal sealed class BotSocialDirector
             state.PendingGeneration = 0;
             state.LastMessage = string.Empty;
             state.HumanReconsiderRequested = false;
+            state.DeceptionUsed = false;
             state.LastSubmittedVoteId = null;
             state.PendingNativeVoteId = null;
             state.VoteCommandSentAt = 0f;
@@ -256,6 +257,12 @@ internal sealed class BotSocialDirector
             {
                 followIntent = "none";
             }
+            var tacticalAction = NormalizePostMeetingAction(decision?.PostMeetingAction);
+            var actionTargetId = ValidateActionTargetId(bot, tacticalAction, decision?.ActionTargetId);
+            if (RequiresPostMeetingTarget(tacticalAction) && !actionTargetId.HasValue)
+            {
+                tacticalAction = "none";
+            }
 
             _memory.RecordMeetingConclusion(
                 bot,
@@ -263,6 +270,8 @@ internal sealed class BotSocialDirector
                 state.LastSubmittedVoteId,
                 followPlayerId,
                 followIntent,
+                tacticalAction,
+                actionTargetId,
                 decision?.Confidence ?? 0f,
                 decision?.Reason ?? "meeting ended without model conclusion");
 
@@ -365,6 +374,11 @@ internal sealed class BotSocialDirector
         if (!isBotSource)
         {
             _humanTranscriptVersion++;
+            MeetingBehaviorDirectives.TryRecordHumanDirective(
+                clean,
+                EnumerateDeepBots(),
+                _memory.MatchSerial,
+                _log);
         }
         _lastTranscriptAt = Time.time;
         _log.LogInfo(
@@ -486,10 +500,14 @@ internal sealed class BotSocialDirector
                             killerId == player.PlayerId;
                         if (!personallyWitnessedKill)
                         {
-                            var trustInfluence = 0.16f * Mathf.Lerp(
-                                0.35f,
-                                0.85f,
-                                personality.SocialSuggestibility);
+                            var trustInfluence = 0.24f * CalculateSpeakerCredibilityMultiplier(
+                                    !isBotSource,
+                                    concreteEvidenceClaim,
+                                    personality) *
+                                Mathf.Lerp(
+                                    0.55f,
+                                    1.10f,
+                                    personality.SocialSuggestibility);
                             state.BeliefScores[player.PlayerId] =
                                 state.BeliefScores.GetValueOrDefault(player.PlayerId) - trustInfluence;
                         }
@@ -509,10 +527,10 @@ internal sealed class BotSocialDirector
                     {
                         claimStrength *= 0.08f;
                     }
-                    if (isBotSource)
-                    {
-                        claimStrength *= 0.90f;
-                    }
+                    claimStrength *= CalculateSpeakerCredibilityMultiplier(
+                        !isBotSource,
+                        concreteEvidenceClaim,
+                        personality);
 
                     var influence = claimStrength * Mathf.Lerp(
                         0.55f,
@@ -553,9 +571,10 @@ internal sealed class BotSocialDirector
                 state.HumanReconsiderRequested = true;
             }
 
-            var directlyAddressed =
-                MentionsPlayer(clean, bot);
-            if (!isBotSource && directlyAddressed)
+            var directlyAddressed = MentionsPlayer(clean, bot);
+            var selectedResponder = !isBotSource &&
+                (directlyAddressed || fastResponderIds.Contains(bot.PlayerId));
+            if (selectedResponder)
             {
                 state.PendingHumanReactionVersion = _humanTranscriptVersion;
                 state.PendingHumanText = clean;
@@ -565,6 +584,10 @@ internal sealed class BotSocialDirector
                     directlyAddressed,
                     explicitAccusation || selfIncriminating || hasSuspicionLanguage,
                     state.DecisionRounds);
+                _log.LogInfo(
+                    $"DeepBot human meeting response scheduled: meeting={_meetingSerial}, " +
+                    $"bot={bot.Data?.PlayerName}({bot.PlayerId}), directlyAddressed={directlyAddressed}, " +
+                    $"humanVersion={_humanTranscriptVersion}, delay={Math.Max(0f, state.HumanReactionAt - Time.time):0.0}s.");
             }
 
             var delay = GetMeetingThoughtDelay(
@@ -892,11 +915,6 @@ internal sealed class BotSocialDirector
             EnsureCurrentMeetingState(bot, state);
             Stop(bot);
 
-            if (config.MeetingChat.Value)
-            {
-                TrySendHumanReaction(bot, state);
-            }
-
             if (state.DecisionCompleted &&
                 !state.DecisionApplied &&
                 Time.time >= state.DecisionReadyAt)
@@ -922,7 +940,9 @@ internal sealed class BotSocialDirector
                 !state.Spoken &&
                 Time.time >= state.SpeakAt)
             {
-                SendMeetingLine(bot, state, BuildPersonalityFallbackMeetingLine(bot), "fallback-rules");
+                // Meeting speech is model-authored only. If the meeting brain is
+                // disabled, silence is preferable to a reusable rules template.
+                state.Spoken = true;
             }
 
             if (config.MeetingVote.Value &&
@@ -1204,6 +1224,10 @@ internal sealed class BotSocialDirector
                 : $"message={state.LastMessage}; vote={DescribeVote(state.MeetingDecision)}; " +
                   $"follow={state.MeetingDecision.FollowPlayerId?.ToString() ?? "none"}:" +
                   $"{NormalizeFollowIntent(state.MeetingDecision.FollowIntent)}; " +
+                  $"deception={NormalizeDeceptionIntent(state.MeetingDecision.DeceptionIntent)}:" +
+                  $"{state.MeetingDecision.DeceptionTargetId?.ToString() ?? "none"}; " +
+                  $"postAction={NormalizePostMeetingAction(state.MeetingDecision.PostMeetingAction)}:" +
+                  $"{state.MeetingDecision.ActionTargetId?.ToString() ?? "none"}; " +
                   $"private_reason={state.MeetingDecision.Reason ?? "none"}");
     }
 
@@ -1232,11 +1256,12 @@ internal sealed class BotSocialDirector
             receivedDecision = EnforceGroundedMeetingDecision(bot, state, receivedDecision);
             receivedDecision = EnforceCrossMeetingSuspicionContinuity(bot, state, receivedDecision);
             receivedDecision = EnforceProtectedAllyMeetingDecision(bot, receivedDecision);
+            receivedDecision = ValidateStrategicMeetingDecision(bot, state, receivedDecision);
         }
         if (TryGetActionableWitnessedKiller(bot, out var witnessedKiller))
         {
             receivedDecision = new BotMeetingDecision(
-                $"我亲眼看到{witnessedKiller.Data!.PlayerName}杀了人，这能证明其拥有杀人能力；我会投他。",
+                SanitizeMeetingMessage(receivedDecision?.Message),
                 witnessedKiller.PlayerId,
                 false,
                 $"Hard eyewitness evidence: personally witnessed playerId={witnessedKiller.PlayerId} kill.",
@@ -1264,10 +1289,9 @@ internal sealed class BotSocialDirector
 
         var decision = state.MeetingDecision;
         var message = SanitizeMeetingMessage(receivedDecision?.Message);
-        if (string.IsNullOrWhiteSpace(message))
-        {
-            message = BuildContextualFallbackMeetingLine(bot, state);
-        }
+        // Never manufacture a meeting line locally. API failure, an empty model
+        // response, or a safety rejection means this bot stays silent while its
+        // already-grounded vote can still be preserved.
 
         if (IsGenericMeetingFiller(message) &&
             _lastReporterId != bot.PlayerId &&
@@ -1281,7 +1305,12 @@ internal sealed class BotSocialDirector
             (state.MessagesSent < MaxAutonomousMeetingMessagesPerBot || analyzedNewHumanStatement) &&
             !string.Equals(message, state.LastMessage, StringComparison.Ordinal))
         {
-            SendMeetingLine(bot, state, message, receivedDecision is null ? "api-null-preserved" : "deepseek");
+            SendMeetingLine(
+                bot,
+                state,
+                message,
+                "deepseek",
+                receivedDecision);
         }
         else
         {
@@ -1292,6 +1321,8 @@ internal sealed class BotSocialDirector
             $"DeepBot meeting API applied: meeting={_meetingSerial}, bot={bot.Data?.PlayerName}({bot.PlayerId}), round={state.DecisionRounds}, messages={state.MessagesSent}, " +
             $"decision={(receivedDecision is null ? (decision is null ? "fallback" : "preserved") : "deepseek")}, vote={DescribeVote(decision)}, confidence={decision?.Confidence ?? 0f:0.00}, " +
             $"follow={decision?.FollowPlayerId?.ToString() ?? "none"}:{NormalizeFollowIntent(decision?.FollowIntent)}, " +
+            $"deception={NormalizeDeceptionIntent(decision?.DeceptionIntent)}:{decision?.DeceptionTargetId?.ToString() ?? "none"}, " +
+            $"tactic={NormalizePostMeetingAction(decision?.PostMeetingAction)}:{decision?.ActionTargetId?.ToString() ?? "none"}, " +
             $"reason={decision?.Reason ?? "none"}.");
         state.DecisionCompleted = false;
         state.DecisionApplied = false;
@@ -1306,7 +1337,12 @@ internal sealed class BotSocialDirector
         }
     }
 
-    private void SendMeetingLine(PlayerControl bot, SocialState state, string line, string source)
+    private void SendMeetingLine(
+        PlayerControl bot,
+        SocialState state,
+        string line,
+        string source,
+        BotMeetingDecision? sourceDecision = null)
     {
         state.Spoken = true;
         if (string.IsNullOrWhiteSpace(line))
@@ -1320,7 +1356,7 @@ internal sealed class BotSocialDirector
             source += "-ally-secrecy-guard";
         }
 
-        line = EnforcePrivateEvidenceBoundary(bot, line, out var evidenceRewritten);
+        line = EnforcePrivateEvidenceBoundary(bot, line, sourceDecision, out var evidenceRewritten);
         if (evidenceRewritten)
         {
             source += "-evidence-guard";
@@ -1428,7 +1464,7 @@ internal sealed class BotSocialDirector
             $"DeepBot protected-ally speech guard removed public ally disclosure: meeting={_meetingSerial}, " +
             $"bot={bot.Data?.PlayerName}({bot.PlayerId}), ally={protectedMention!.Data?.PlayerName}({protectedMention.PlayerId}), " +
             $"original={line}.");
-        return "这条说法没有给出可核对的现场目击，我先看尸体附近的公开线索。";
+        return string.Empty;
     }
 
     private static bool ShouldBlockProtectedAllyDisclosure(
@@ -1466,28 +1502,8 @@ internal sealed class BotSocialDirector
         }
 
         rewritten = true;
-        if (_memory.TryGetLatestWitnessedKiller(bot.PlayerId, out var killerId))
-        {
-            var killer = FindPlayer(killerId);
-            if (killer?.Data is not null && !killer.Data.IsDead && !killer.Data.Disconnected)
-            {
-                return $"我亲眼看到{killer.Data.PlayerName}杀人，我投他。";
-            }
-        }
-
-        var voteId = state.MeetingDecision?.VotePlayerId;
-        if (voteId.HasValue)
-        {
-            var target = voteId.Value is >= byte.MinValue and <= byte.MaxValue
-                ? FindPlayer((byte)voteId.Value)
-                : null;
-            if (target?.Data is not null && !target.Data.IsDead && !target.Data.Disconnected)
-            {
-                return $"我目前仍偏向{target.Data.PlayerName}，这轮没有新的亲眼目击让我改票。";
-            }
-        }
-
-        // Silence is safer than inventing which public speaker owned a claim.
+        // Safety guards reject model text; they never replace it with a stock
+        // sentence. The next model round can answer using corrected context.
         return string.Empty;
     }
 
@@ -1513,17 +1529,17 @@ internal sealed class BotSocialDirector
         }
 
         rewritten = true;
-        var previous = _transcript.LastOrDefault(entry => entry.PlayerId != bot.PlayerId);
-        var replacement = previous is null
-            ? "我还活着，当前公开信息里没有我的死亡事件。"
-            : $"我还活着。{previous.Name}刚才说的是位置或路线，不是我的死亡信息。";
         _log.LogWarning(
             $"DeepBot meeting living-state guard rewrote impossible self-death claim: " +
-            $"bot={bot.Data.PlayerName}({bot.PlayerId}), original={line}, replacement={replacement}");
-        return replacement;
+            $"bot={bot.Data.PlayerName}({bot.PlayerId}), original={line}, replacement=silence");
+        return string.Empty;
     }
 
-    private string EnforcePrivateEvidenceBoundary(PlayerControl bot, string line, out bool rewritten)
+    private string EnforcePrivateEvidenceBoundary(
+        PlayerControl bot,
+        string line,
+        BotMeetingDecision? sourceDecision,
+        out bool rewritten)
     {
         rewritten = false;
         var mustConcealHiddenActions = IsImpostor(bot) ||
@@ -1531,14 +1547,11 @@ internal sealed class BotSocialDirector
         if (BotBehaviorPolicy.ShouldRewriteSelfIncriminatingSecret(line, mustConcealHiddenActions))
         {
             rewritten = true;
-            var secrecyReplacement = TryGetActionableWitnessedKiller(bot, out var witnessedKiller)
-                ? $"我亲眼看到{witnessedKiller.Data!.PlayerName}杀了人，我会投他。"
-                : "这轮我没亲眼看清是谁动手，先核对具体路线和时间。";
             _log.LogWarning(
                 $"DeepBot meeting secrecy guard rewrote self-incriminating line: " +
                 $"bot={bot.Data?.PlayerName}({bot.PlayerId}), role={(mustConcealHiddenActions ? "hidden" : "public")}, " +
-                $"original={line}, replacement={secrecyReplacement}");
-            return secrecyReplacement;
+                $"original={line}, replacement=silence");
+            return string.Empty;
         }
 
         var referencedTarget = EnumerateLivingPlayers()
@@ -1554,7 +1567,14 @@ internal sealed class BotSocialDirector
 
         var hasPersonalWitness = _memory.TryGetLatestWitnessedKiller(bot.PlayerId, out var witnessedKillerId);
         var referencedTargetMatchesWitness = referencedTarget is null || referencedTarget.PlayerId == witnessedKillerId;
-        if (!BotBehaviorPolicy.ShouldRewriteUnsupportedMurderFact(
+        var auditedFalseWitness =
+            sourceDecision is not null &&
+            NormalizeDeceptionIntent(sourceDecision.DeceptionIntent) == "false_witness" &&
+            sourceDecision.DeceptionTargetId is >= byte.MinValue and <= byte.MaxValue &&
+            referencedTarget is not null &&
+            referencedTarget.PlayerId == (byte)sourceDecision.DeceptionTargetId.Value &&
+            MentionsPlayer(line, referencedTarget);
+        if (auditedFalseWitness || !BotBehaviorPolicy.ShouldRewriteUnsupportedMurderFact(
                 line,
                 hasPersonalWitness,
                 referencedTargetMatchesWitness))
@@ -1564,15 +1584,10 @@ internal sealed class BotSocialDirector
 
         rewritten = true;
         var targetName = referencedTarget?.Data?.PlayerName;
-        var replacement = hasPersonalWitness && referencedTargetMatchesWitness && !string.IsNullOrWhiteSpace(targetName)
-            ? $"我亲眼看见{targetName}动手，我会投{targetName}。"
-            : string.IsNullOrWhiteSpace(targetName)
-                ? "我没有亲眼看到击杀，只能按公开发言和路线判断。"
-                : $"我没有亲眼看见{targetName}杀人，只是怀疑。{targetName}请解释上一轮的位置。";
         _log.LogWarning(
             $"DeepBot meeting evidence guard rewrote unsupported private claim: bot={bot.Data?.PlayerName}({bot.PlayerId}), " +
-            $"target={targetName ?? "unknown"}, original={line}, replacement={replacement}");
-        return replacement;
+            $"target={targetName ?? "unknown"}, original={line}, replacement=silence");
+        return string.Empty;
     }
 
     private void TrySendHumanReaction(PlayerControl bot, SocialState state)
@@ -1654,7 +1669,7 @@ internal sealed class BotSocialDirector
                 return personality.Name switch
                 {
                     "急性子" => $"我目前也偏投{targetName}，这条指认算加重疑点。",
-                    "认真派" => $"我已把{targetName}列为首要嫌疑，这条说法会并入现有证据。",
+                    "果断派" => $"我已把{targetName}列为首要嫌疑，这轮愿意直接押他。",
                     "社交派" => $"我现在也更怀疑{targetName}，还有相反路线或不在场证明吗？",
                     "谨慎派" => $"对{targetName}的疑点在累积，但我仍区分转述与亲眼证据。",
                     "懒散派" => $"行，{targetName}现在确实最可疑，我暂时票他。",
@@ -1665,7 +1680,7 @@ internal sealed class BotSocialDirector
             return personality.Name switch
             {
                 "急性子" => $"先记{targetName}，但你马上补地点和时间。",
-                "认真派" => $"你指认{targetName}的依据是什么？请给出地点、时间和目击动作。",
+                "果断派" => $"你指认{targetName}，给我一个具体动作，我就敢下票。",
                 "社交派" => $"你怀疑{targetName}？还有谁见过他，大家把路线接上。",
                 "谨慎派" => $"我听到你指认{targetName}了，但我需要具体证据才会改票。",
                 "懒散派" => $"行，{targetName}先记一笔，不过光报名字还不够。",
@@ -1680,7 +1695,7 @@ internal sealed class BotSocialDirector
             return personality.Name switch
             {
                 "急性子" => $"{speakerName}这句威胁我记下了；像认狼，但还要结合路线。",
-                "认真派" => $"{speakerName}的自证式威胁会提高嫌疑，但不能替代目击证据。",
+                "果断派" => $"{speakerName}这句很可疑，我先把票往他那边压。",
                 "社交派" => $"{speakerName}，你这是玩笑还是认狼？先把刚才路线说清楚。",
                 "谨慎派" => $"这句威胁值得警惕，不过我不会只凭一句话定罪。",
                 "懒散派" => $"这种话挺招怀疑的，{speakerName}先进入观察名单吧。",
@@ -1705,9 +1720,11 @@ internal sealed class BotSocialDirector
         {
             return personality.Name switch
             {
-                "急性子" => $"我在{_lastReportNode ?? "附近"}报的尸体，没看清谁动手，先对路线。",
-                "懒散派" => $"尸体在{_lastReportNode ?? "附近"}，我真没看见是谁，别急着乱票。",
-                _ => $"我在{_lastReportNode ?? "附近"}发现尸体，但没有亲眼看到凶手。"
+                "急性子" => $"{_lastReportNode ?? "附近"}有尸体，凶手溜得挺快；我没看清脸。",
+                "社交派" => $"{_lastReportNode ?? "附近"}躺了一个，我只负责报警，不负责编凶手。",
+                "谨慎派" => $"尸体在{_lastReportNode ?? "附近"}，凶手没给我签名，暂时认不出。",
+                "懒散派" => $"{_lastReportNode ?? "附近"}有尸体，我真没看见谁下的手，别硬塞给我。",
+                _ => $"我在{_lastReportNode ?? "附近"}发现尸体，没亲眼看到凶手。"
             };
         }
 
@@ -1723,11 +1740,12 @@ internal sealed class BotSocialDirector
             {
                 return personality.Name switch
                 {
-                    "急性子" => $"{target.Data.PlayerName}先把路线说清楚，我目前偏怀疑你。",
-                    "社交派" => $"{target.Data.PlayerName}，你刚才具体在哪？大家把时间线对一下。",
-                    "谨慎派" => $"我也注意到{target.Data.PlayerName}，但现有说法还不足以下结论。",
-                    "懒散派" => $"{target.Data.PlayerName}有点怪，不过就这点信息我还不想硬票。",
-                    _ => $"目前对{target.Data.PlayerName}的疑点最多，但我会继续听新证据。"
+                    "急性子" => $"{target.Data.PlayerName}味儿有点重，路线赶紧交一下。",
+                    "果断派" => $"我先押{target.Data.PlayerName}，能不能翻盘看你解释。",
+                    "社交派" => $"{target.Data.PlayerName}来，麦给你，刚才到底在哪？",
+                    "谨慎派" => $"{target.Data.PlayerName}身上有疑点，不过我先不把锅焊死。",
+                    "懒散派" => $"{target.Data.PlayerName}有点怪，我先记账，暂时不硬票。",
+                    _ => $"我现在更怀疑{target.Data.PlayerName}，等他回应。"
                 };
             }
         }
@@ -1736,22 +1754,24 @@ internal sealed class BotSocialDirector
         {
             return personality.Name switch
             {
-                "急性子" => "都直接报位置和遇到的人，别讲没用的。",
-                "社交派" => "谁最后见过死者？大家按顺序把路线接起来吧。",
-                "谨慎派" => "先区分亲眼所见和别人转述，再决定投票。",
-                "懒散派" => "信息还太少吧，我先听着，别这么快乱票。",
-                _ => "先把各自路线说清楚，没有硬证据就谨慎投票。"
+                "急性子" => "有位置说位置，有目击说目击，别搁这写散文。",
+                "果断派" => "谁有具体人和地点就端上来，我准备下注。",
+                "社交派" => "最后见过死者的来接麦，别让尸体白躺。",
+                "谨慎派" => "亲眼和听说分开讲，别把瓜皮当瓜瓤。",
+                "懒散派" => "我先吃会儿瓜，有真目击再叫我投。",
+                _ => "有具体目击就说，空喊名字不算。"
             };
         }
 
         var location = SkeldPathGraph.Instance.NearestNode(bot.GetTruePosition()).Name;
         return personality.Name switch
         {
-            "急性子" => $"我刚在{location}，谁经过那里直接说。",
-            "社交派" => $"我在{location}附近，有人能互证路线吗？",
-            "谨慎派" => $"我只能确认自己刚在{location}附近，其他信息暂不确定。",
-            "懒散派" => $"我刚才在{location}晃着，没看到特别的。",
-            _ => $"我会按自己在{location}附近看到的情况判断。"
+            "急性子" => $"我刚在{location}，路过的自己举手，省点审讯费。",
+            "果断派" => $"我在{location}，谁和这段路线冲突我就先押谁。",
+            "社交派" => $"我在{location}附近，路过的朋友来对个暗号。",
+            "谨慎派" => $"我只能确认自己在{location}，别的信息先不脑补。",
+            "懒散派" => $"我刚在{location}晃悠，瓜没吃到，尸体倒遇上了。",
+            _ => $"我刚在{location}附近，只按自己看到的判断。"
         };
     }
 
@@ -1760,7 +1780,7 @@ internal sealed class BotSocialDirector
         return BotPersonalityCatalog.ForPlayer(playerId).Name switch
         {
             "急性子" => UnityEngine.Random.Range(2.5f, 4.5f),
-            "认真派" => UnityEngine.Random.Range(4.0f, 6.5f),
+            "果断派" => UnityEngine.Random.Range(2.3f, 4.2f),
             "社交派" => UnityEngine.Random.Range(3.5f, 7.0f),
             "谨慎派" => UnityEngine.Random.Range(6.0f, 9.5f),
             "懒散派" => UnityEngine.Random.Range(7.5f, 11.0f),
@@ -1792,7 +1812,7 @@ internal sealed class BotSocialDirector
         var window = personality switch
         {
             "急性子" => (2.8f, 4.8f),
-            "认真派" => (4.0f, 6.4f),
+            "果断派" => (2.5f, 4.4f),
             "社交派" => (3.5f, 5.8f),
             "谨慎派" => (5.0f, 7.8f),
             "懒散派" => (6.0f, 9.0f),
@@ -1811,7 +1831,7 @@ internal sealed class BotSocialDirector
         var window = personality switch
         {
             "急性子" => (1.4f, 2.4f),
-            "认真派" => (2.0f, 3.5f),
+            "果断派" => (1.5f, 2.8f),
             "社交派" => (1.7f, 3.0f),
             "谨慎派" => (2.6f, 4.3f),
             "懒散派" => (3.2f, 5.2f),
@@ -2029,7 +2049,7 @@ internal sealed class BotSocialDirector
                     var groundedEvidence = crewAligned
                         ? GetGroundedEvidenceScore(bot, state, target)
                         : 0f;
-                    if (BotBehaviorPolicy.ShouldCommitMeetingCandidate(
+                    var rulesCommit = BotBehaviorPolicy.ShouldCommitMeetingCandidate(
                             validTarget,
                             decision.SkipVote,
                             crewAligned,
@@ -2037,7 +2057,17 @@ internal sealed class BotSocialDirector
                             decision.Confidence,
                             confidenceThreshold,
                             groundedEvidence,
-                            groundedThreshold))
+                            groundedThreshold);
+                    var subjectiveCommit = crewAligned &&
+                        CanCommitSubjectiveCrewVote(
+                            bot,
+                            state,
+                            target,
+                            decision.Confidence,
+                            personality,
+                            out _,
+                            out _);
+                    if (rulesCommit || subjectiveCommit)
                     {
                         return target.PlayerId;
                     }
@@ -2055,19 +2085,37 @@ internal sealed class BotSocialDirector
             return SkipVoteId;
         }
 
-        var accused = candidates
+        var ranked = candidates
             .Select(player => new
             {
                 Player = player,
-                Score = GetGroundedEvidenceScore(bot, state, player)
+                Score = GetGroundedEvidenceScore(bot, state, player),
+                Readiness = CalculateSubjectiveVoteReadiness(
+                    GetGroundedEvidenceScore(bot, state, player),
+                    state.MeetingDecision?.Confidence ?? 0.48f,
+                    personality.VoteBoldness,
+                    personality.SocialSuggestibility)
             })
-            .OrderByDescending(item => item.Score)
+            .OrderByDescending(item => item.Readiness)
+            .ThenByDescending(item => item.Score)
             .ThenBy(item => item.Player.PlayerId)
-            .First();
-        var publicClaimThreshold = GetRuleVoteThreshold(personality);
-        return accused.Score >= publicClaimThreshold
-            ? accused.Player.PlayerId
-            : SkipVoteId;
+            .ToArray();
+        foreach (var accused in ranked)
+        {
+            if (CanCommitSubjectiveCrewVote(
+                    bot,
+                    state,
+                    accused.Player,
+                    state.MeetingDecision?.Confidence ?? 0.48f,
+                    personality,
+                    out _,
+                    out _))
+            {
+                return accused.Player.PlayerId;
+            }
+        }
+
+        return SkipVoteId;
     }
 
     private string BuildEvidenceLedger(PlayerControl bot, SocialState state)
@@ -2157,15 +2205,32 @@ internal sealed class BotSocialDirector
         var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
         var groundedScore = GetGroundedEvidenceScore(bot, state, target);
         var threshold = GetCrewDecisionThreshold(personality);
-        if (groundedScore >= threshold)
+        var subjectiveAllowed = CanCommitSubjectiveCrewVote(
+            bot,
+            state,
+            target,
+            decision.Confidence,
+            personality,
+            out var subjectiveReadiness,
+            out var subjectiveThreshold);
+        if (groundedScore >= threshold || subjectiveAllowed)
         {
+            if (groundedScore < threshold)
+            {
+                _log.LogInfo(
+                    $"DeepBot subjective crew vote accepted: meeting={_meetingSerial}, " +
+                    $"bot={bot.Data?.PlayerName}({bot.PlayerId}), target={target.Data?.PlayerName}({target.PlayerId}), " +
+                    $"grounded={groundedScore:0.00}/{threshold:0.00}, " +
+                    $"subjective={subjectiveReadiness:0.00}/{subjectiveThreshold:0.00}, " +
+                    $"confidence={decision.Confidence:0.00}, personality={personality.Name}.");
+            }
             return decision;
         }
 
         var contact = _memory.GetPersonalContactEvidence(bot.PlayerId, target.PlayerId);
-        var message = contact.IsRecent && contact.ContinuousSeconds >= 5f
+        var message = contact.IsRecent && contact.ContinuousSeconds >= 10f
             ? $"我刚连续看着{target.Data!.PlayerName}约{Mathf.RoundToInt(contact.ContinuousSeconds)}秒，那段没见他动手；这票先撤。"
-            : $"对{target.Data!.PlayerName}现在只有口头指认，没到我的投票线。";
+            : $"我对{target.Data!.PlayerName}有疑点，但按我的判断这轮还没到下注线。";
         _log.LogWarning(
             $"DeepBot grounded vote guard blocked unsupported crew vote: meeting={_meetingSerial}, " +
             $"bot={bot.Data?.PlayerName}({bot.PlayerId}), target={target.Data?.PlayerName}({target.PlayerId}), " +
@@ -2339,6 +2404,24 @@ internal sealed class BotSocialDirector
             0.90f, 0.70f, 1.25f, 0.10f, 0.20f, true);
         var bareAccusationLowWeight = CalculatePublicClaimStrength(true, false) <= 0.25f;
         var concreteEyewitnessHigherWeight = CalculatePublicClaimStrength(true, true) >= 0.75f;
+        var humanConcreteTestimonyMatters =
+            CalculateSpeakerCredibilityMultiplier(
+                true,
+                true,
+                BotPersonalityCatalog.ForPlayer(3)) >
+            CalculateSpeakerCredibilityMultiplier(
+                false,
+                true,
+                BotPersonalityCatalog.ForPlayer(3));
+        var personalitiesTrustDifferently =
+            CalculateSpeakerCredibilityMultiplier(
+                true,
+                true,
+                BotPersonalityCatalog.ForPlayer(3)) >
+            CalculateSpeakerCredibilityMultiplier(
+                true,
+                true,
+                BotPersonalityCatalog.ForPlayer(4));
         var sustainedContactIsCounterEvidence = CalculateContactDefense(18f, 24f, 1f) >= 0.65f;
         var carriedSuspicionPersists = CalculateCarriedSuspicion(0f, 0.90f) >= 0.60f &&
                                        CalculateCarriedSuspicion(0.90f, 0f) >= 0.60f;
@@ -2366,11 +2449,58 @@ internal sealed class BotSocialDirector
             ShouldBlockProtectedAllyDisclosure(true, false) &&
             ShouldBlockProtectedAllyDisclosure(false, true) &&
             !ShouldBlockProtectedAllyDisclosure(false, false);
+        var strategicDeceptionPolicy =
+            NormalizeDeceptionIntent("FALSE_WITNESS") == "false_witness" &&
+            NormalizeDeceptionIntent("invent-anything") == "none" &&
+            !IsStrategicDeceptionAllowed(false, false, true, true, false) &&
+            !IsStrategicDeceptionAllowed(true, true, true, true, false) &&
+            !IsStrategicDeceptionAllowed(true, false, false, true, false) &&
+            !IsStrategicDeceptionAllowed(true, false, true, false, false) &&
+            !IsStrategicDeceptionAllowed(true, false, true, true, true) &&
+            IsStrategicDeceptionAllowed(true, false, true, true, false);
+        var postMeetingTactics =
+            NormalizePostMeetingAction("RUSH_TASKS") == "rush_tasks" &&
+            NormalizePostMeetingAction("invent") == "none" &&
+            RequiresPostMeetingTarget("frame") &&
+            !RequiresPostMeetingTarget("sabotage");
+        var boldSubjectiveReadiness = CalculateSubjectiveVoteReadiness(0.22f, 0.76f, 0.90f, 0.75f);
+        var cautiousSubjectiveReadiness = CalculateSubjectiveVoteReadiness(0.22f, 0.76f, 0.15f, 0.20f);
+        var subjectiveVotingVariesByPersonality =
+            ShouldCommitSubjectiveCrewVote(
+                true,
+                false,
+                0.76f,
+                0.90f,
+                boldSubjectiveReadiness,
+                GetSubjectiveVoteThreshold(0.90f, 0.75f)) &&
+            !ShouldCommitSubjectiveCrewVote(
+                true,
+                false,
+                0.76f,
+                0.15f,
+                cautiousSubjectiveReadiness,
+                GetSubjectiveVoteThreshold(0.15f, 0.20f));
+        var companionshipStillDefends = !ShouldCommitSubjectiveCrewVote(
+            true,
+            true,
+            0.90f,
+            0.95f,
+            2f,
+            0.4f);
+        var impulsiveInferenceCanVote = ShouldCommitSubjectiveCrewVote(
+            false,
+            false,
+            0.85f,
+            0.95f,
+            CalculateSubjectiveVoteReadiness(0f, 0.85f, 0.95f, 0.50f),
+            GetSubjectiveVoteThreshold(0.95f, 0.50f));
         var level = repeatedCounterAccusationBlocked &&
                     corroboratedEvidenceAllowsChange &&
                     witnessedKillAllowsChange &&
                     bareAccusationLowWeight &&
                     concreteEyewitnessHigherWeight &&
+                    humanConcreteTestimonyMatters &&
+                    personalitiesTrustDifferently &&
                     sustainedContactIsCounterEvidence &&
                     carriedSuspicionPersists &&
                     counterEvidenceReducesPrior &&
@@ -2381,7 +2511,12 @@ internal sealed class BotSocialDirector
                     personalityVoteThresholdsDiffer &&
                     factionReportStrategyVaries &&
                     deliberateReplies &&
-                    protectedAllyDisclosureBlocked
+                    protectedAllyDisclosureBlocked &&
+                    strategicDeceptionPolicy &&
+                    postMeetingTactics &&
+                    subjectiveVotingVariesByPersonality &&
+                    companionshipStillDefends &&
+                    impulsiveInferenceCanVote
             ? "ok"
             : "error";
         log.LogInfo(
@@ -2390,6 +2525,7 @@ internal sealed class BotSocialDirector
             $"corroboratedEvidenceAllowsChange={corroboratedEvidenceAllowsChange}, " +
             $"witnessedKillAllowsChange={witnessedKillAllowsChange}, " +
             $"bareAccusationLowWeight={bareAccusationLowWeight}, concreteEyewitnessHigherWeight={concreteEyewitnessHigherWeight}, " +
+            $"humanConcreteTestimonyMatters={humanConcreteTestimonyMatters}, personalitiesTrustDifferently={personalitiesTrustDifferently}, " +
             $"sustainedContactIsCounterEvidence={sustainedContactIsCounterEvidence}, " +
             $"carriedSuspicionPersists={carriedSuspicionPersists}, counterEvidenceReducesPrior={counterEvidenceReducesPrior}, " +
             $"noEvidenceDoesNotErasePrior={noEvidenceDoesNotErasePrior}, " +
@@ -2399,6 +2535,9 @@ internal sealed class BotSocialDirector
             $"personalityVoteThresholdsDiffer={personalityVoteThresholdsDiffer}, " +
             $"factionReportStrategyVaries={factionReportStrategyVaries}, " +
             $"deliberateReplies={deliberateReplies}, protectedAllyDisclosureBlocked={protectedAllyDisclosureBlocked}, " +
+            $"strategicDeceptionPolicy={strategicDeceptionPolicy}, postMeetingTactics={postMeetingTactics}, " +
+            $"subjectiveVotingVariesByPersonality={subjectiveVotingVariesByPersonality}, " +
+            $"companionshipStillDefends={companionshipStillDefends}, impulsiveInferenceCanVote={impulsiveInferenceCanVote}, " +
             $"fastestReplyMin={urgentDirectWindow.Minimum:0.0}s.");
     }
 
@@ -2454,11 +2593,11 @@ internal sealed class BotSocialDirector
             return ready
                 ? personality.Name switch
                 {
-                    "急性子" => $"{name}前后不太对，我这票押他。",
-                    "认真派" => $"{name}的说法没把疑点解释掉，我投他。",
-                    "社交派" => $"我还是更怀疑{name}，这票按自己的判断来。",
-                    "谨慎派" => $"我没完全确定，但{name}的嫌疑没有洗掉。",
-                    "懒散派" => $"{name}最不对劲，我先投他。",
+                    "急性子" => $"{name}这味儿没散，我先一票送检。",
+                    "果断派" => $"{name}没把疑点洗掉，我这把就押他。",
+                    "社交派" => $"{name}的故事我没听圆，这票我先点他。",
+                    "谨慎派" => $"我没完全确定，但{name}这口锅还没卸掉。",
+                    "懒散派" => $"懒得绕了，{name}最怪，我先投他。",
                     _ => $"我这轮更怀疑{name}，投他。"
                 }
                 : personality.Name switch
@@ -2484,19 +2623,58 @@ internal sealed class BotSocialDirector
         if (observation.Contains("vent", StringComparison.OrdinalIgnoreCase))
         {
             return readyToVote
-                ? $"我看到{name}进管了；能跳管的不只内鬼，但我这轮倾向投他。"
-                : $"我看到{name}进管了；先记作能跳管，不直接定成内鬼。";
+                ? $"我亲眼看{name}进管了。职业可能不止一种，但这票我押他。"
+                : $"{name}当我面进管了；先记能力，别急着把职业焊死。";
         }
 
         if (observation.Contains("kill", StringComparison.OrdinalIgnoreCase) ||
             observation.Contains("murder", StringComparison.OrdinalIgnoreCase))
         {
-            return $"我亲眼看到{name}杀人，我投他。";
+            return $"{name}当我面开刀，演都不演了；我投他。";
         }
 
         return readyToVote
-            ? $"我亲眼看到{name}用了可疑能力，这票我押他。"
-            : $"我亲眼看到{name}用了特殊能力，先记下但不乱定职业。";
+            ? $"我亲眼看{name}用了可疑能力，这票先押他。"
+            : $"{name}当我面掏了特殊能力；先记账，不乱猜职业。";
+    }
+
+    private static string BuildWitnessedKillMeetingLine(PlayerControl bot, PlayerControl killer)
+    {
+        var name = killer.Data?.PlayerName ?? $"{killer.PlayerId}号";
+        var variants = BotPersonalityCatalog.ForPlayer(bot.PlayerId).Name switch
+        {
+            "急性子" => new[]
+            {
+                $"{name}当我面开刀，演都懒得演了；投他。",
+                $"别盘了，我亲眼看{name}下刀，这票送他起飞。"
+            },
+            "果断派" => new[]
+            {
+                $"{name}的刀我亲眼验过，保真；这票押他。",
+                $"我看到{name}开刀，赔率都省了，直接投。"
+            },
+            "社交派" => new[]
+            {
+                $"{name}，你这刀法挺社牛，我就在旁边；投你。",
+                $"我亲眼看{name}下刀，来，话筒给你表演。"
+            },
+            "谨慎派" => new[]
+            {
+                $"这次不用脑补：我亲眼看到{name}下刀，投他。",
+                $"{name}当面开刀，这条不是瓜，是我亲眼所见。"
+            },
+            "懒散派" => new[]
+            {
+                $"本来想摸鱼，结果{name}当面开刀；只能投了。",
+                $"{name}刀都亮我脸上了，懒得绕，投他。"
+            },
+            _ => new[]
+            {
+                $"我亲眼看{name}开刀，这味不用闻了，投他。",
+                $"直觉先放一边：{name}的刀我真看见了，投。"
+            }
+        };
+        return variants[UnityEngine.Random.Range(0, variants.Length)];
     }
 
     private static string BuildPublicConcreteClaimFallback(
@@ -2522,7 +2700,7 @@ internal sealed class BotSocialDirector
         return personality.Name switch
         {
             "急性子" => $"{sourceName}说亲眼看到{targetName}{action}{priorText}，我这票投{targetName}。",
-            "认真派" => $"{sourceName}给出了对{targetName}{action}的具体目击{priorText}；结合现有疑点，我投{targetName}。",
+            "果断派" => $"{sourceName}说看到{targetName}{action}{priorText}，够我下注了，投{targetName}。",
             "社交派" => $"{sourceName}的目击把矛头指向{targetName}{priorText}，我倾向跟这条具体信息投{targetName}。",
             "谨慎派" => $"我没有亲眼看到，但{sourceName}对{targetName}{action}的描述足够具体{priorText}；这次我投{targetName}。",
             _ => $"{sourceName}说看到{targetName}{action}{priorText}，目前{targetName}最可疑，我投他。"
@@ -2571,7 +2749,8 @@ internal sealed class BotSocialDirector
         string[] supportivePhrases =
         [
             "是船员", "像船员", "可能是船员", "应该是船员", "是好人", "像好人",
-            "可能是好人", "可信", "我信", "可以信", "不怀疑", "不像内鬼", "不是内鬼"
+            "可能是好人", "可信", "我信", "可以信", "不怀疑", "不像内鬼", "不是内鬼",
+            "我能保", "保一下", "可以保", "互保", "一直和我在一起", "全程跟我", "全程在一起"
         ];
         return supportivePhrases.Any(phrase => text.Contains(phrase, StringComparison.OrdinalIgnoreCase));
     }
@@ -2650,6 +2829,28 @@ internal sealed class BotSocialDirector
         return concreteEvidence ? 0.78f : 0.24f;
     }
 
+    private static float CalculateSpeakerCredibilityMultiplier(
+        bool isHumanSpeaker,
+        bool concreteEvidence,
+        BotPersonalityProfile personality)
+    {
+        // Human testimony is part of the social game, not untrusted noise.
+        // Concrete first-person claims can materially move suggestible and
+        // impulsive personalities; cautious personalities still ask for
+        // corroboration. Bot speech is a little easier to discount so one
+        // generated line cannot mechanically cascade the whole lobby.
+        if (isHumanSpeaker)
+        {
+            return concreteEvidence
+                ? Mathf.Lerp(0.95f, 1.42f, personality.SocialSuggestibility)
+                : Mathf.Lerp(0.78f, 1.24f, personality.SocialSuggestibility);
+        }
+
+        return concreteEvidence
+            ? Mathf.Lerp(0.78f, 1.04f, personality.SocialSuggestibility)
+            : Mathf.Lerp(0.66f, 0.94f, personality.SocialSuggestibility);
+    }
+
     private static float CalculateContactDefense(
         float continuousSeconds,
         float totalVisibleSeconds,
@@ -2687,10 +2888,105 @@ internal sealed class BotSocialDirector
         // cannot erase an ability the observer personally saw.
         var personality = BotPersonalityCatalog.ForPlayer(bot.PlayerId);
         var subjectivePriorWeight = GetSubjectivePriorWeight(personality);
+        var effectiveContactDefense = contactDefense;
+        if (_latestConcreteClaimsByTarget.ContainsKey(target.PlayerId) && currentPublicClaimScore > 0f)
+        {
+            // Recent companionship is real counter-evidence, but without an
+            // exact timestamp it cannot erase another player's concrete
+            // eyewitness report completely.
+            var maximumRefutationFraction = Mathf.Lerp(
+                0.72f,
+                0.32f,
+                personality.SocialSuggestibility);
+            effectiveContactDefense = Mathf.Min(
+                contactDefense,
+                currentPublicClaimScore * maximumRefutationFraction);
+        }
+
         var interpretedPublicSuspicion = Mathf.Max(
             0f,
-            currentPublicClaimScore - contactDefense + carriedPriorSuspicion * subjectivePriorWeight);
+            currentPublicClaimScore - effectiveContactDefense + carriedPriorSuspicion * subjectivePriorWeight);
         return Mathf.Max(interpretedPublicSuspicion, personalRoleEvidence.HostilityScore);
+    }
+
+    private bool CanCommitSubjectiveCrewVote(
+        PlayerControl bot,
+        SocialState state,
+        PlayerControl target,
+        float modelConfidence,
+        BotPersonalityProfile personality,
+        out float readiness,
+        out float threshold)
+    {
+        var grounded = GetGroundedEvidenceScore(bot, state, target);
+        var contact = _memory.GetPersonalContactEvidence(bot.PlayerId, target.PlayerId);
+        var roleEvidence = _memory.GetPersonalRoleEvidence(bot.PlayerId, target.PlayerId);
+        var hasSocialBasis =
+            state.BeliefScores.GetValueOrDefault(target.PlayerId) >= 0.06f ||
+            state.PersistentPublicSuspicion.GetValueOrDefault(target.PlayerId) >= 0.12f ||
+            _accusations.GetValueOrDefault(target.PlayerId) > 0 ||
+            _latestConcreteClaimsByTarget.ContainsKey(target.PlayerId) ||
+            roleEvidence.HostilityScore >= 0.18f;
+        var strongRecentCompanionship =
+            contact.IsRecent &&
+            contact.ContinuousSeconds >= 10f &&
+            roleEvidence.HostilityScore < 0.55f &&
+            grounded < 0.90f;
+        readiness = CalculateSubjectiveVoteReadiness(
+            grounded,
+            modelConfidence,
+            personality.VoteBoldness,
+            personality.SocialSuggestibility);
+        threshold = GetSubjectiveVoteThreshold(
+            personality.VoteBoldness,
+            personality.SocialSuggestibility);
+        return ShouldCommitSubjectiveCrewVote(
+            hasSocialBasis,
+            strongRecentCompanionship,
+            modelConfidence,
+            personality.VoteBoldness,
+            readiness,
+            threshold);
+    }
+
+    private static float CalculateSubjectiveVoteReadiness(
+        float groundedEvidence,
+        float modelConfidence,
+        float voteBoldness,
+        float socialSuggestibility)
+    {
+        var boldness = Mathf.Clamp01(voteBoldness);
+        var suggestibility = Mathf.Clamp01(socialSuggestibility);
+        var confidenceWeight = Mathf.Lerp(0.12f, 0.42f, boldness);
+        return Mathf.Max(0f, groundedEvidence) +
+               Mathf.Clamp01(modelConfidence) * confidenceWeight +
+               boldness * 0.20f +
+               suggestibility * 0.08f;
+    }
+
+    private static float GetSubjectiveVoteThreshold(float voteBoldness, float socialSuggestibility)
+    {
+        var commitment = Mathf.Clamp01(
+            Mathf.Clamp01(voteBoldness) * 0.72f +
+            Mathf.Clamp01(socialSuggestibility) * 0.28f);
+        return Mathf.Lerp(0.94f, 0.44f, commitment);
+    }
+
+    private static bool ShouldCommitSubjectiveCrewVote(
+        bool hasSocialBasis,
+        bool strongRecentCompanionship,
+        float modelConfidence,
+        float voteBoldness,
+        float readiness,
+        float threshold)
+    {
+        if (strongRecentCompanionship)
+        {
+            return false;
+        }
+
+        var impulsiveInference = voteBoldness >= 0.72f && modelConfidence >= 0.72f;
+        return (hasSocialBasis || impulsiveInference) && readiness >= threshold;
     }
 
     private bool ShouldProtectClaimedJester(PlayerControl bot, byte targetId)
@@ -2723,8 +3019,8 @@ internal sealed class BotSocialDirector
         var subjectiveCommitment = Mathf.Clamp01(
             personality.VoteBoldness * 0.70f + personality.SocialSuggestibility * 0.30f);
         return Mathf.Lerp(
-            1.20f,
-            0.42f,
+            1.10f,
+            0.35f,
             subjectiveCommitment);
     }
 
@@ -2741,7 +3037,7 @@ internal sealed class BotSocialDirector
     {
         var intuition = Mathf.Clamp01(
             personality.VoteBoldness * 0.65f + personality.SocialSuggestibility * 0.35f);
-        return Mathf.Lerp(0.52f, 0.92f, intuition);
+        return Mathf.Lerp(0.50f, 1.02f, intuition);
     }
 
     private SocialState GetState(PlayerControl bot)
@@ -2829,6 +3125,202 @@ internal sealed class BotSocialDirector
             mentionsCurrentCandidate);
     }
 
+    private BotMeetingDecision ValidateStrategicMeetingDecision(
+        PlayerControl bot,
+        SocialState state,
+        BotMeetingDecision decision)
+    {
+        var deception = NormalizeDeceptionIntent(decision.DeceptionIntent);
+        var tactic = NormalizePostMeetingAction(decision.PostMeetingAction);
+        var tacticTarget = ValidateActionTargetId(bot, tactic, decision.ActionTargetId);
+        if (!IsPostMeetingActionAllowed(bot, tactic) ||
+            RequiresPostMeetingTarget(tactic) && !tacticTarget.HasValue)
+        {
+            tactic = "none";
+            tacticTarget = null;
+        }
+
+        if (deception == "none")
+        {
+            return decision with
+            {
+                DeceptionIntent = "none",
+                DeceptionTargetId = null,
+                PostMeetingAction = tactic,
+                ActionTargetId = tacticTarget
+            };
+        }
+
+        var target = decision.DeceptionTargetId is >= byte.MinValue and <= byte.MaxValue
+            ? FindPlayer((byte)decision.DeceptionTargetId.Value)
+            : null;
+        var targetRequired = deception is "soft_frame" or "false_action" or "false_witness";
+        var targetLegal = !targetRequired ||
+            target is not null &&
+            IsAlive(target) &&
+            target.PlayerId != bot.PlayerId &&
+            !TorRoleAdapter.ShouldProtectMeetingTarget(bot, target) &&
+            !ShouldProtectClaimedJester(bot, target.PlayerId) &&
+            !string.IsNullOrWhiteSpace(decision.Message) &&
+            MentionsPlayer(decision.Message!, target);
+        var falseWitnessLegal = deception != "false_witness" ||
+            target is not null &&
+            HasPublicDeathInCurrentMeeting() &&
+            _memory.GetPersonalContactEvidence(bot.PlayerId, target.PlayerId) is var contact &&
+            contact.IsRecent &&
+            contact.LastSeenSecondsAgo <= 30f;
+        var hiddenFaction = !IsCrewAligned(bot);
+        var jesterSelfStrategy = TorRoleAdapter.TryGetRole(bot, out var role) &&
+                                 role.Name == "Jester" &&
+                                 deception is not "false_route";
+        var allowed = IsStrategicDeceptionAllowed(
+            hiddenFaction,
+            state.DeceptionUsed,
+            targetLegal,
+            falseWitnessLegal,
+            jesterSelfStrategy);
+        if (!allowed)
+        {
+            _log.LogWarning(
+                $"DeepBot strategic deception rejected: meeting={_meetingSerial}, " +
+                $"bot={bot.Data?.PlayerName}({bot.PlayerId}), intent={deception}, " +
+                $"target={target?.Data?.PlayerName ?? "none"}({target?.PlayerId.ToString() ?? "none"}), " +
+                $"hiddenFaction={hiddenFaction}, alreadyUsed={state.DeceptionUsed}, " +
+                $"targetLegal={targetLegal}, falseWitnessLegal={falseWitnessLegal}, jesterSelfStrategy={jesterSelfStrategy}.");
+            return decision with
+            {
+                DeceptionIntent = "none",
+                DeceptionTargetId = null,
+                PostMeetingAction = tactic,
+                ActionTargetId = tacticTarget,
+                Message = deception == "false_route"
+                    ? decision.Message
+                    : string.Empty
+            };
+        }
+
+        state.DeceptionUsed = true;
+        _memory.RecordAction(
+            bot,
+            "deception_plan",
+            $"meeting={_meetingSerial}; intent={deception}; " +
+            $"target={(target is null ? "none" : $"{target.Data?.PlayerName}({target.PlayerId})")}; " +
+            $"private_reason={decision.Reason ?? "none"}");
+        _log.LogInfo(
+            $"DeepBot strategic deception approved: meeting={_meetingSerial}, " +
+            $"bot={bot.Data?.PlayerName}({bot.PlayerId}), intent={deception}, " +
+            $"target={target?.Data?.PlayerName ?? "none"}({target?.PlayerId.ToString() ?? "none"}).");
+        return decision with
+        {
+            DeceptionIntent = deception,
+            DeceptionTargetId = target?.PlayerId,
+            PostMeetingAction = tactic,
+            ActionTargetId = tacticTarget
+        };
+    }
+
+    private bool HasPublicDeathInCurrentMeeting()
+    {
+        return _lastReporterId.HasValue ||
+               PlayerControl.AllPlayerControls.ToArray()
+                   .Any(player => player && player.Data is not null && player.Data.IsDead);
+    }
+
+    private static string NormalizeDeceptionIntent(string? value)
+    {
+        return value?.Trim().ToLowerInvariant() switch
+        {
+            "soft_frame" => "soft_frame",
+            "false_route" => "false_route",
+            "false_action" => "false_action",
+            "false_witness" => "false_witness",
+            _ => "none"
+        };
+    }
+
+    private static bool IsStrategicDeceptionAllowed(
+        bool hiddenFaction,
+        bool alreadyUsed,
+        bool targetLegal,
+        bool falseWitnessLegal,
+        bool jesterSelfStrategy)
+    {
+        return hiddenFaction &&
+               !alreadyUsed &&
+               targetLegal &&
+               falseWitnessLegal &&
+               !jesterSelfStrategy;
+    }
+
+    private static string NormalizePostMeetingAction(string? value)
+    {
+        return value?.Trim().ToLowerInvariant() switch
+        {
+            "observe" => "observe",
+            "protect" => "protect",
+            "isolate" => "isolate",
+            "frame" => "frame",
+            "eliminate" => "eliminate",
+            "rush_tasks" => "rush_tasks",
+            "fake_task" => "fake_task",
+            "sabotage" => "sabotage",
+            _ => "none"
+        };
+    }
+
+    private static bool RequiresPostMeetingTarget(string action)
+    {
+        return action is "observe" or "protect" or "isolate" or "frame" or "eliminate";
+    }
+
+    private static bool IsPostMeetingActionAllowed(PlayerControl bot, string action)
+    {
+        if (action == "none")
+        {
+            return true;
+        }
+
+        if (IsCrewAligned(bot))
+        {
+            return action is "observe" or "protect" or "rush_tasks";
+        }
+
+        if (IsImpostor(bot))
+        {
+            return action is "observe" or "protect" or "isolate" or "frame" or
+                   "eliminate" or "fake_task" or "sabotage";
+        }
+
+        // Neutral roles can plan independent cover, observation and target
+        // isolation. The native TOR role controller still has final authority
+        // over whether a kill, sabotage or active skill exists.
+        return action is "observe" or "isolate" or "frame" or "eliminate" or "fake_task";
+    }
+
+    private static byte? ValidateActionTargetId(PlayerControl bot, string action, int? requestedPlayerId)
+    {
+        if (!RequiresPostMeetingTarget(action) ||
+            !requestedPlayerId.HasValue ||
+            requestedPlayerId.Value is < byte.MinValue or > byte.MaxValue)
+        {
+            return null;
+        }
+
+        var target = FindPlayer((byte)requestedPlayerId.Value);
+        if (target is null || !IsAlive(target) || target.PlayerId == bot.PlayerId)
+        {
+            return null;
+        }
+
+        if (action is "isolate" or "frame" or "eliminate" &&
+            TorRoleAdapter.ShouldProtectMeetingTarget(bot, target))
+        {
+            return null;
+        }
+
+        return target.PlayerId;
+    }
+
     private static string NormalizeFollowIntent(string? value)
     {
         return value?.Trim().ToLowerInvariant() switch
@@ -2909,7 +3401,7 @@ internal sealed class BotSocialDirector
         var client = AmongUsClient.Instance;
         return client &&
             client.NetworkMode == NetworkModes.LocalGame &&
-            client.AmHost &&
+            Plugin.AllowsWorldAuthority(client.AmHost) &&
             client.ClientId >= 0 &&
             client.ClientId == client.HostId;
     }
@@ -3147,6 +3639,7 @@ internal sealed class BotSocialDirector
         public int PendingGeneration { get; set; }
         public string LastMessage { get; set; } = string.Empty;
         public bool HumanReconsiderRequested { get; set; }
+        public bool DeceptionUsed { get; set; }
         public byte? LastSubmittedVoteId { get; set; }
         public byte? PendingNativeVoteId { get; set; }
         public float VoteCommandSentAt { get; set; }

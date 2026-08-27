@@ -36,7 +36,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
         _deepSeek = new DeepSeekDecisionClient(
             () => Plugin.Settings.Model.Value,
             () => Plugin.Settings.ApiBaseUrl.Value,
-            DeepSeekDecisionClient.LoadHostApiKey,
+            DeepSeekDecisionClient.LoadHostApiKeys,
             message => _log.LogWarning(message));
         _evolutionSkills = new BotEvolutionSkillStore(_log);
         _memory = new BotMatchMemory(_log, _evolutionSkills);
@@ -46,6 +46,7 @@ public sealed class DeepBotRuntime : MonoBehaviour
         _abilities = new BotAbilityDirector(_log, _memory, _director, _deepSeek);
         TorRoleAdapter.Initialize(_log);
         TorRoleAdapter.LogRoleCoverageSelfTest(_log);
+        BotPlayerLocalityIsolationPatch.LogSelfTest(_log);
         _hostRoleControls = new HostRoleControlGuard(_log);
         Plugin.Runtime = this;
         _started = true;
@@ -65,7 +66,9 @@ public sealed class DeepBotRuntime : MonoBehaviour
         BotAbilityDirector.LogSelfTest(_log);
         DeepSeekDecisionClient.LogSelfTest(_log);
         SmoothTaskProgressPatch.LogSelfTest(_log);
-        _log.LogInfo($"DeepBotRuntime started. graph={SkeldPathGraph.Instance.Summary}, hostKey={(DeepSeekDecisionClient.LoadHostApiKey() is null ? "missing" : "configured")}.");
+        VoiceChatDictationPatch.LogSelfTest(_log);
+        var apiKeyCount = DeepSeekDecisionClient.LoadHostApiKeys().Length;
+        _log.LogInfo($"DeepBotRuntime started. graph={SkeldPathGraph.Instance.Summary}, hostKeys={(apiKeyCount == 0 ? "missing" : $"configured:{apiKeyCount}")}; credential content is never logged.");
     }
 
     private void Update()
@@ -199,6 +202,20 @@ public sealed class DeepBotRuntime : MonoBehaviour
         {
             _evolution.CaptureGameEnding();
         }
+    }
+
+    internal void PrepareGameEnding()
+    {
+        var client = AmongUsClient.Instance;
+        if (!_started || !client || client.AmHost)
+        {
+            return;
+        }
+
+        var removed = DeepBotGuestRosterSync.PreparePassiveGuestEndGame(client);
+        _log.LogInfo(
+            $"DeepBot passive guest endgame cleanup: removedProxyClients={removed}, " +
+            $"clientId={client.ClientId}, local={PlayerControl.LocalPlayer?.PlayerId.ToString() ?? "missing"}.");
     }
 
     internal void OnChat(PlayerControl source, string text)

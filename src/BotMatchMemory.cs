@@ -425,6 +425,8 @@ internal sealed class BotMatchMemory
         byte? votedPlayerId,
         byte? followPlayerId,
         string followIntent,
+        string tacticalAction,
+        byte? actionTargetId,
         float confidence,
         string reason)
     {
@@ -435,11 +437,14 @@ internal sealed class BotMatchMemory
 
         var state = GetState(bot, Plugin.Settings.MaxMemoryEvents.Value);
         var normalizedIntent = followIntent is "trust" or "suspect" ? followIntent : "none";
+        var normalizedAction = string.IsNullOrWhiteSpace(tacticalAction) ? "none" : tacticalAction.Trim();
         state.PostMeetingIntent = new PostMeetingSocialIntent(
             meetingSerial,
             votedPlayerId,
             followPlayerId,
             normalizedIntent,
+            normalizedAction,
+            actionTargetId,
             Mathf.Clamp01(confidence),
             string.IsNullOrWhiteSpace(reason) ? "no private rationale" : reason.Trim());
         Append(
@@ -447,7 +452,9 @@ internal sealed class BotMatchMemory
             "meeting_conclusion",
             $"meeting={meetingSerial}; vote={(votedPlayerId.HasValue ? votedPlayerId.Value.ToString() : "skip")}; " +
             $"follow={(followPlayerId.HasValue ? followPlayerId.Value.ToString() : "none")}; " +
-            $"intent={normalizedIntent}; confidence={confidence:0.00}; reason={reason}",
+            $"intent={normalizedIntent}; tactic={normalizedAction}; " +
+            $"actionTarget={(actionTargetId.HasValue ? actionTargetId.Value.ToString() : "none")}; " +
+            $"confidence={confidence:0.00}; reason={reason}",
             null);
     }
 
@@ -748,7 +755,7 @@ internal sealed class BotMatchMemory
         var client = AmongUsClient.Instance;
         return client &&
             client.NetworkMode == NetworkModes.LocalGame &&
-            client.AmHost &&
+            Plugin.AllowsWorldAuthority(client.AmHost) &&
             client.ClientId >= 0 &&
             client.ClientId == client.HostId &&
             client.GameState == InnerNetClient.GameStates.Started &&
@@ -952,5 +959,7 @@ internal readonly record struct PostMeetingSocialIntent(
     byte? VotedPlayerId,
     byte? FollowPlayerId,
     string FollowIntent,
+    string TacticalAction,
+    byte? ActionTargetId,
     float Confidence,
     string Reason);

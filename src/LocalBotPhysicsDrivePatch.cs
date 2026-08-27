@@ -31,6 +31,10 @@ internal static class LocalBotPhysicsDrivePatch
     private static bool IsHostAuthority()
     {
         var client = AmongUsClient.Instance;
-        return client && client.NetworkMode == NetworkModes.LocalGame && client.AmHost;
+        return client &&
+               client.NetworkMode == NetworkModes.LocalGame &&
+               client.ClientId >= 0 &&
+               client.ClientId == client.HostId &&
+               Plugin.AllowsWorldAuthority(client.AmHost);
     }
 }

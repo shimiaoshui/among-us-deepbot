@@ -2,14 +2,16 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$GameDirectory,
 
-    [string]$AssetDirectory = (Join-Path $PSScriptRoot '..\release-assets')
+    [string]$AssetDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$scriptRoot = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { $PSScriptRoot }
+$AssetDirectory = if ([string]::IsNullOrWhiteSpace($AssetDirectory)) { Join-Path $scriptRoot '..\release-assets' } else { $AssetDirectory }
 $powershell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$repositoryRoot = [IO.Path]::GetFullPath((Join-Path $scriptRoot '..'))
 $testBase = [IO.Path]::GetFullPath((Join-Path $repositoryRoot '.installer-tests'))
-$testRoot = [IO.Path]::GetFullPath((Join-Path $testBase 'v0.10.6-client-authority-lock'))
+$testRoot = [IO.Path]::GetFullPath((Join-Path $testBase 'v0.10.22-client-base-build-gate'))
 $allowedPrefix = $testBase.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
 if (-not $testRoot.StartsWith($allowedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Refusing to clear a test path outside $testBase"
@@ -26,24 +28,21 @@ $activeTorDirectory = Join-Path $multiSteamRoot 'steamapps\common\TOR Active'
 New-Item -ItemType Directory -Force -Path $hostDirectory, $clientDirectory | Out-Null
 Copy-Item -LiteralPath (Join-Path $GameDirectory 'Among Us.exe') -Destination (Join-Path $hostDirectory 'Among Us.exe')
 Copy-Item -LiteralPath (Join-Path $GameDirectory 'Among Us.exe') -Destination (Join-Path $clientDirectory 'Among Us.exe')
+Copy-Item -LiteralPath (Join-Path $GameDirectory 'GameAssembly.dll') -Destination (Join-Path $hostDirectory 'GameAssembly.dll')
+Copy-Item -LiteralPath (Join-Path $GameDirectory 'GameAssembly.dll') -Destination (Join-Path $clientDirectory 'GameAssembly.dll')
 
-$localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
-$keyPath = Join-Path $localAppData 'AmongUsDeepSeekBots\api-key.txt'
-$keyBackup = Join-Path $env:TEMP ("deepbot-key-backup-" + [guid]::NewGuid().ToString('N'))
-$hadKey = Test-Path -LiteralPath $keyPath
-if ($hadKey) {
-    Copy-Item -LiteralPath $keyPath -Destination $keyBackup -Force
-}
+$keyPath = Join-Path $testRoot 'isolated-user-profile\api-key.txt'
 
 $dummyKey = 'db-test-key-102-not-a-secret'
 try {
     $env:DEEPBOT_INSTALL_API_BASE_URL = 'https://example.invalid/v1'
     $env:DEEPBOT_INSTALL_API_KEY = $dummyKey
+    $env:DEEPBOT_INSTALL_API_KEY_PATH = $keyPath
     $hostInstallProcess = Start-Process -FilePath (Join-Path $AssetDirectory 'AmongUs-DeepBot-Host-Installer.exe') -ArgumentList @('--silent', '--path', ('"' + $hostDirectory + '"')) -Wait -PassThru
     $hostInstallExit = $hostInstallProcess.ExitCode
     if ($hostInstallExit -ne 0) { throw "Host install failed: $hostInstallExit" }
 
-    Remove-Item Env:DEEPBOT_INSTALL_API_BASE_URL, Env:DEEPBOT_INSTALL_API_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:DEEPBOT_INSTALL_API_BASE_URL, Env:DEEPBOT_INSTALL_API_KEY, Env:DEEPBOT_INSTALL_API_KEY_PATH -ErrorAction SilentlyContinue
     $clientInstallProcess = Start-Process -FilePath (Join-Path $AssetDirectory 'AmongUs-DeepBot-Client-Installer.exe') -ArgumentList @('--silent', '--path', ('"' + $clientDirectory + '"')) -Wait -PassThru
     $clientInstallExit = $clientInstallProcess.ExitCode
     if ($clientInstallExit -ne 0) { throw "Client install failed: $clientInstallExit" }
@@ -89,6 +88,8 @@ try {
     New-Item -ItemType Directory -Force -Path $plainGameDirectory, (Join-Path $activeTorDirectory 'BepInEx\plugins') | Out-Null
     Copy-Item -LiteralPath (Join-Path $GameDirectory 'Among Us.exe') -Destination (Join-Path $plainGameDirectory 'Among Us.exe')
     Copy-Item -LiteralPath (Join-Path $GameDirectory 'Among Us.exe') -Destination (Join-Path $activeTorDirectory 'Among Us.exe')
+    Copy-Item -LiteralPath (Join-Path $GameDirectory 'GameAssembly.dll') -Destination (Join-Path $plainGameDirectory 'GameAssembly.dll')
+    Copy-Item -LiteralPath (Join-Path $GameDirectory 'GameAssembly.dll') -Destination (Join-Path $activeTorDirectory 'GameAssembly.dll')
     Copy-Item -LiteralPath (Join-Path $GameDirectory 'BepInEx\plugins\TheOtherRoles.dll') -Destination (Join-Path $activeTorDirectory 'BepInEx\plugins\TheOtherRoles.dll')
     Copy-Item -LiteralPath (Join-Path $GameDirectory 'BepInEx\plugins\AmongUsDeepSeekBots.dll') -Destination (Join-Path $activeTorDirectory 'BepInEx\plugins\AmongUsDeepSeekBots.dll')
     New-Item -ItemType File -Force -Path (Join-Path $activeTorDirectory 'BepInEx\LogOutput.log') | Out-Null
@@ -146,15 +147,5 @@ try {
     }
 }
 finally {
-    Remove-Item Env:DEEPBOT_INSTALL_API_BASE_URL, Env:DEEPBOT_INSTALL_API_KEY -ErrorAction SilentlyContinue
-    if ($hadKey) {
-        New-Item -ItemType Directory -Force -Path (Split-Path $keyPath) | Out-Null
-        Copy-Item -LiteralPath $keyBackup -Destination $keyPath -Force
-    }
-    elseif (Test-Path -LiteralPath $keyPath) {
-        Remove-Item -LiteralPath $keyPath -Force
-    }
-    if (Test-Path -LiteralPath $keyBackup) {
-        Remove-Item -LiteralPath $keyBackup -Force
-    }
+    Remove-Item Env:DEEPBOT_INSTALL_API_BASE_URL, Env:DEEPBOT_INSTALL_API_KEY, Env:DEEPBOT_INSTALL_API_KEY_PATH -ErrorAction SilentlyContinue
 }

@@ -2046,25 +2046,13 @@ internal static class TorRoleAdapter
 
     internal static bool CanUseVents(PlayerControl bot, TorRoleInfo role)
     {
-        if (!bot || bot.Data is null || IsHandcuffed(bot) || !EnsureLoaded() || _helpersType is null)
+        if (!HasNativeVentPermission(bot))
         {
             return false;
         }
 
         try
         {
-            _roleCanUseVentsMethod ??= _helpersType.GetMethod(
-                "roleCanUseVents",
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
-                null,
-                new[] { typeof(PlayerControl) },
-                null);
-            var nativeAllowsVenting = _roleCanUseVentsMethod?.Invoke(null, new object[] { bot }) is true;
-            if (!nativeAllowsVenting)
-            {
-                return false;
-            }
-
             return !string.Equals(role.Name, "Engineer", StringComparison.Ordinal) ||
                    IsTorEngineerVentReady(bot, out _);
         }
@@ -2073,6 +2061,40 @@ internal static class TorRoleAdapter
             _log?.LogWarning(
                 $"DeepBot TOR native vent permission failed: player={bot.Data?.PlayerName}({bot.PlayerId}), " +
                 $"role={role.Name}, error={ex.GetBaseException().Message}");
+            return false;
+        }
+    }
+
+    internal static bool HasNativeVentPermission(PlayerControl player)
+    {
+        if (!player || player.Data is null || player.Data.Disconnected || player.Data.IsDead || IsHandcuffed(player))
+        {
+            return false;
+        }
+
+        try
+        {
+            if (EnsureLoaded() && _helpersType is not null)
+            {
+                _roleCanUseVentsMethod ??= _helpersType.GetMethod(
+                    "roleCanUseVents",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static,
+                    null,
+                    new[] { typeof(PlayerControl) },
+                    null);
+                if (_roleCanUseVentsMethod is not null)
+                {
+                    return _roleCanUseVentsMethod.Invoke(null, new object[] { player }) is true;
+                }
+            }
+
+            return player.Data.Role?.CanVent == true;
+        }
+        catch (Exception ex)
+        {
+            _log?.LogWarning(
+                $"DeepBot TOR native vent permission lookup failed: " +
+                $"player={player.Data?.PlayerName}({player.PlayerId}), error={ex.GetBaseException().Message}");
             return false;
         }
     }
@@ -2751,7 +2773,7 @@ internal static class TorRoleAdapter
         if (Time.time < _nextVirtualTrapScanAt ||
             !EnsureLoaded() ||
             AmongUsClient.Instance is null ||
-            !AmongUsClient.Instance.AmHost)
+            !Plugin.AllowsWorldAuthority(AmongUsClient.Instance.AmHost))
         {
             return;
         }

@@ -9,6 +9,7 @@ internal static class BotEvolutionOnGameEndPatch
     [HarmonyPriority(Priority.First)]
     private static void Prefix()
     {
+        Plugin.Runtime?.PrepareGameEnding();
         // TOR clears its static role holders in its OnGameEnd postfix. Capture
         // each bot's true final role and private memory before that reset.
         Plugin.Runtime?.CaptureGameEnding();

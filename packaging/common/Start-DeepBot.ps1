@@ -37,6 +37,8 @@ if ([string]$manifest.Mode -eq 'Client' -and $botCountMatch.Groups[1].Value -ne 
     throw 'DeepBot Client cannot start because BotCount is not 0. Re-run the Client installer; only the Host may create bots.'
 }
 $compatibilityFiles = @(
+    @{ Path = 'Among Us.exe'; Expected = $manifest.GameExeSha256 },
+    @{ Path = 'GameAssembly.dll'; Expected = $manifest.GameAssemblySha256 },
     @{ Path = 'BepInEx\plugins\TheOtherRoles.dll'; Expected = $manifest.TorSha256 },
     @{ Path = 'BepInEx\plugins\Reactor.dll'; Expected = $manifest.ReactorSha256 },
     @{ Path = 'BepInEx\plugins\AmongUsDeepSeekBots.dll'; Expected = $manifest.DeepBotSha256 }

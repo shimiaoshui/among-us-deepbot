@@ -8,22 +8,25 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TheOtherRolesDll,
 
-    [string]$ReleaseVersion = '0.10.6',
+    [string]$ReleaseVersion = '0.10.22',
 
-    [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\release-assets')
+    [string]$OutputDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
+$scriptRoot = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { $PSScriptRoot }
+$OutputDirectory = if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { Join-Path $scriptRoot '..\release-assets' } else { $OutputDirectory }
 $GameDirectory = [IO.Path]::GetFullPath($GameDirectory)
 $DeepBotDll = [IO.Path]::GetFullPath($DeepBotDll)
 $TheOtherRolesDll = [IO.Path]::GetFullPath($TheOtherRolesDll)
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
-$installerProject = Join-Path $PSScriptRoot 'installer\DeepBotInstaller.csproj'
-$uninstallerProject = Join-Path $PSScriptRoot 'uninstaller\DeepBotUninstaller.csproj'
-$generatedRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'installer\generated'))
+$installerProject = Join-Path $scriptRoot 'installer\DeepBotInstaller.csproj'
+$uninstallerProject = Join-Path $scriptRoot 'uninstaller\DeepBotUninstaller.csproj'
+$generatedRoot = [IO.Path]::GetFullPath((Join-Path $scriptRoot 'installer\generated'))
 
 foreach ($required in @(
     (Join-Path $GameDirectory 'Among Us.exe'),
+    (Join-Path $GameDirectory 'GameAssembly.dll'),
     (Join-Path $GameDirectory 'winhttp.dll'),
     (Join-Path $GameDirectory 'doorstop_config.ini'),
     (Join-Path $GameDirectory 'dotnet\coreclr.dll'),
@@ -84,7 +87,7 @@ function Copy-Runtime([string]$Stage) {
     }
 
     foreach ($name in @('Start-DeepBot.ps1', 'Start-DeepBot.cmd')) {
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot "common\$name") -Destination (Join-Path $Stage $name) -Force
+        Copy-Item -LiteralPath (Join-Path $scriptRoot "common\$name") -Destination (Join-Path $Stage $name) -Force
     }
 }
 
@@ -102,6 +105,8 @@ if (-not (Test-Path -LiteralPath $reactorSource)) {
 $torSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $TheOtherRolesDll).Hash.ToLowerInvariant()
 $reactorSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $reactorSource).Hash.ToLowerInvariant()
 $deepBotSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $DeepBotDll).Hash.ToLowerInvariant()
+$gameExeSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $GameDirectory 'Among Us.exe')).Hash.ToLowerInvariant()
+$gameAssemblySha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $GameDirectory 'GameAssembly.dll')).Hash.ToLowerInvariant()
 $torAssembly = [Reflection.Assembly]::LoadFile($TheOtherRolesDll)
 $torModuleVersionId = $torAssembly.ManifestModule.ModuleVersionId.ToString('D')
 $compatibilityId = "tor-4.6.0-$torModuleVersionId"
@@ -119,6 +124,8 @@ foreach ($item in @(
         TorSha256 = $torSha256
         ReactorSha256 = $reactorSha256
         DeepBotSha256 = $deepBotSha256
+        GameExeSha256 = $gameExeSha256
+        GameAssemblySha256 = $gameAssemblySha256
         Mode = $item.Mode
     }
     $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $item.Stage 'DeepBot-Compatibility.json') -Encoding UTF8
@@ -143,8 +150,8 @@ Enabled = true
 [Local]
 BotCount = 5
 [AI]
-Model = agnes-2.0-flash
-ApiBaseUrl = https://apihub.agnes-ai.com/v1
+Model = deepseek-v4-flash
+ApiBaseUrl = https://meimaoapi.top/v1
 MeetingUseDeepSeek = true
 [Movement]
 SpeedMultiplier = 0.82
@@ -207,7 +214,7 @@ foreach ($item in @(
 }
 
 foreach ($name in @('Configure-DeepBot-Key.ps1', 'Configure-DeepBot-Key.cmd')) {
-    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "common\$name") -Destination (Join-Path $hostStage $name) -Force
+    Copy-Item -LiteralPath (Join-Path $scriptRoot "common\$name") -Destination (Join-Path $hostStage $name) -Force
 }
 
 $hostZip = Join-Path $generatedRoot 'host-payload.zip'
@@ -227,7 +234,7 @@ foreach ($build in @(
     if ($LASTEXITCODE -ne 0) {
         throw "Installer publish failed for $($build.Mode)."
     }
-    $published = Join-Path $PSScriptRoot "installer\bin\Release\net8.0-windows\win-x64\publish\$($build.Name)"
+    $published = Join-Path $scriptRoot "installer\bin\Release\net8.0-windows\win-x64\publish\$($build.Name)"
     Copy-Item -LiteralPath $published -Destination (Join-Path $OutputDirectory $build.Name) -Force
 }
 
@@ -242,7 +249,7 @@ foreach ($build in @(
     if ($LASTEXITCODE -ne 0) {
         throw "Uninstaller publish failed for $($build.Mode)."
     }
-    $published = Join-Path $PSScriptRoot "uninstaller\bin\Release\net8.0-windows\win-x64\publish\$($build.Name)"
+    $published = Join-Path $scriptRoot "uninstaller\bin\Release\net8.0-windows\win-x64\publish\$($build.Name)"
     Copy-Item -LiteralPath $published -Destination (Join-Path $OutputDirectory $build.Name) -Force
 }
 

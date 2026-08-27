@@ -18,7 +18,7 @@ internal static class VampireDelayedDeathPositionPatch
         out PositionState __state)
     {
         __state = default;
-        if (!TorRoleAdapter.IsPendingVampireDelayedKill(__instance, target))
+        if (!IsHostAuthority() || !TorRoleAdapter.IsPendingVampireDelayedKill(__instance, target))
         {
             return;
         }
@@ -34,7 +34,7 @@ internal static class VampireDelayedDeathPositionPatch
         PlayerControl target,
         PositionState __state)
     {
-        if (!__state.Active || !__instance)
+        if (!IsHostAuthority() || !__state.Active || !__instance)
         {
             return;
         }
@@ -65,6 +65,12 @@ internal static class VampireDelayedDeathPositionPatch
 
     internal static void MaintainPositionHolds()
     {
+        if (!IsHostAuthority())
+        {
+            PositionHolds.Clear();
+            return;
+        }
+
         foreach (var pair in PositionHolds.ToArray())
         {
             if (Time.time >= pair.Value.Until || MeetingHud.Instance || ExileController.Instance)
@@ -132,6 +138,14 @@ internal static class VampireDelayedDeathPositionPatch
 
     private readonly record struct PositionState(bool Active, Vector2 Origin);
     private readonly record struct PositionHold(Vector2 Origin, float Until);
+
+    internal static bool IsHostAuthority()
+    {
+        var client = AmongUsClient.Instance;
+        return client &&
+               client.NetworkMode == NetworkModes.LocalGame &&
+               Plugin.AllowsWorldAuthority(client.AmHost);
+    }
 }
 
 [HarmonyPatch(typeof(KillAnimation), nameof(KillAnimation.CoPerformKill))]
@@ -141,7 +155,8 @@ internal static class VampireDelayedKillAnimationPatch
 {
     private static void Prefix(ref PlayerControl source, PlayerControl target)
     {
-        if (!TorRoleAdapter.IsPendingVampireDelayedKill(source, target))
+        if (!VampireDelayedDeathPositionPatch.IsHostAuthority() ||
+            !TorRoleAdapter.IsPendingVampireDelayedKill(source, target))
         {
             return;
         }
