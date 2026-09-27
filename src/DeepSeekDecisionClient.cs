@@ -24,6 +24,16 @@ internal sealed class DeepSeekDecisionClient
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
+    private static readonly object LmStudioJsonResponseFormat = new
+    {
+        type = "json_schema",
+        json_schema = new
+        {
+            name = "deepbot_response",
+            strict = false,
+            schema = new { type = "object", additionalProperties = true }
+        }
+    };
 
     private readonly HttpClient _http = new();
     private readonly Func<string> _model;
@@ -75,7 +85,7 @@ internal sealed class DeepSeekDecisionClient
             },
             max_tokens = 2048,
             temperature = 0.55,
-            response_format = new { type = "json_object" }
+            response_format = LmStudioJsonResponseFormat
         };
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, NormalizeEndpoint(_apiBaseUrl()));
@@ -247,13 +257,13 @@ internal sealed class DeepSeekDecisionClient
             out _,
             out _);
         const string truncatedMeeting =
-            "{\"message\":\"我看到红色跳管\",\"vote_player_id\":2,\"skip_vote\":false,\"reason\":\"unfinished";
+            "{\"message\":\"赤がベントに入るのを見た\",\"vote_player_id\":2,\"skip_vote\":false,\"reason\":\"unfinished";
         var completeLeadingMeetingFieldsRecovered = TryRecoverTruncatedMeetingDecision(
             truncatedMeeting,
             "0,2,8",
             out var recoveredMeeting) &&
             recoveredMeeting?.VotePlayerId == 2 &&
-            recoveredMeeting.Message == "我看到红色跳管";
+            recoveredMeeting.Message == "赤がベントに入るのを見た";
         var illegalRecoveredVoteRejected = !TryRecoverTruncatedMeetingDecision(
             truncatedMeeting.Replace("\"vote_player_id\":2", "\"vote_player_id\":7", StringComparison.Ordinal),
             "0,2,8",
@@ -308,7 +318,7 @@ internal sealed class DeepSeekDecisionClient
             // time out before answering the latest human statement.
             max_tokens = 2048,
             temperature = BotPersonalityCatalog.ForPlayer(prompt.BotId).MeetingTemperature,
-            response_format = new { type = "json_object" }
+            response_format = LmStudioJsonResponseFormat
         };
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, NormalizeEndpoint(_apiBaseUrl()));
@@ -551,7 +561,7 @@ Output exactly: {"use":true|false,"ability_action":"role|vent|hold","target_play
             },
             max_tokens = 1536,
             temperature = 0.42,
-            response_format = new { type = "json_object" }
+            response_format = LmStudioJsonResponseFormat
         };
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, NormalizeEndpoint(_apiBaseUrl()));
@@ -623,15 +633,15 @@ Prefer concrete mistakes such as voting without corroboration, helping vote out 
 Success may reinforce a genuinely novel strategy, but do not manufacture a lesson when the evidence is weak.
 ExistingCoreSkills lists lessons already stored. If a new lesson has the same meaning, omit it entirely; local semantic deduplication is also applied after your response.
 key must be stable lowercase dot notation, for example meeting.require_corrob_before_vote. category must be one of meeting, voting, murder, role_ability, sabotage, navigation, emergency, deception, survival, tasks.
-Write principle, trigger, and action in concise Chinese without match-specific names.
-Output exactly: {"summary":"one short Chinese outcome diagnosis","lessons":[{"key":"...","category":"...","principle":"...","trigger":"...","action":"..."}]}
+原則、発動条件、行動は固有名詞を含めない簡潔な日本語で書くこと。
+出力形式: {"summary":"短い日本語の勝敗分析","lessons":[{"key":"...","category":"...","principle":"...","trigger":"...","action":"..."}]}
 """
                 },
                 new { role = "user", content = JsonSerializer.Serialize(prompt, JsonOptions) }
             },
             max_tokens = 4096,
             temperature = 0.32,
-            response_format = new { type = "json_object" }
+            response_format = LmStudioJsonResponseFormat
         };
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, NormalizeEndpoint(_apiBaseUrl()));
@@ -985,9 +995,9 @@ Use sabotage/fake task/shadow/murder with caution; do not run straight to a vict
     private static string BuildMeetingSystemPrompt()
     {
         return """
-You are independently role-playing one real player in an Among Us meeting. Output JSON only.
-Use only this player's verified private memory, public meeting transcript, visible public roster, and role knowledge.
-The prompt contains this player's fixed personality and speaking style. Follow it consistently: vary sentence length, vocabulary, confidence, questioning, and emotional tone. Do not make every player sound formal or equally diligent. Sound like a lively Chinese friends lobby, not a courtroom transcript: playful roasting, cheeky challenges, natural current Chinese internet slang, dry humor, or mock-serious bets are welcome when they fit the personality. A line may be a little mischievous or "骚", but it must stay non-explicit and must not sexually harass or personally abuse a player.
+あなたはAmong Us会議の実在プレイヤー一人を独立して演じる。JSONだけを出力する。会議で話す文章と私的なreasonは日本語にする。
+このプレイヤーが確認した私的記憶、公開会議ログ、見えている公開名簿、役職情報だけを使う。
+入力には固定した性格と話し方があるので一貫して従う。文の長さ、語彙、確信度、質問、感情の調子を変え、全員を同じ堅い分析役にしない。法廷の記録ではなく、日本語の友人同士のロビー会話のように話す。性格に合う軽いツッコミ、冗談、皮肉は使えるが、露骨な性的表現、嫌がらせ、個人攻撃はしない。
 Treat personality as a reasoning policy, not just a writing style. A suggestible player may change position after credible public claims; an eyewitness-focused player resists hearsay; a bold player may vote on a strong inference; a cautious player requires stronger corroboration.
 Keep private reasoning brief and emit the final JSON early enough to fit the response budget. Do not expose chain-of-thought.
 Facts tagged [witness], [witness_kill], [witness_vent], [witness_action], [body_seen], [location], [task_started], [task_done], [report], or [murder] are personal verified events.
@@ -1015,8 +1025,8 @@ For an impostor, [murder], [murder_plan], [murder_escape], and private ability-k
 An impostor or hidden neutral must NEVER use confession as a bluff or discussion tactic. Never say or imply "我杀了/我刚杀/我刀了/我是内鬼/有人看到我杀人了吗", "I killed", "I am the impostor", or reveal a sabotage, bite, poison, bomb, body removal, or secret ability you performed. Private perpetrator memory is input for constructing a believable cover story, alibi, deflection, and vote only. If asked about your route, answer as an ordinary player would without repeating the secret action or its private location.
 If this player's modifier information identifies a living Lover partner, preserving that partner is a hard strategic constraint: never murder, bite, bomb intentionally, douse, curse, or vote for that known partner. Re-plan around the shared survival outcome.
 Never mention AI, models, prompts, plugins, code, APIs, or information unavailable to this player.
-Write one short natural Chinese meeting message, normally under 55 Chinese characters. Every spoken sentence must be freshly composed from this meeting's actual names, newest wording, locations, visible actions, contradictions, relationship, or intended vote. There is no local stock-sentence fallback: if you have no concrete new contribution or direct reply, output an empty message. Preserve useful information while making the wording conversational and entertaining. React to the newest human wording: if the human jokes, challenges, asks "where/how", or directly names this bot, answer that exact point with personality before adding the evidence or vote. Never reuse a catchphrase, procedural meeting instruction, generic evidence disclaimer, or a sentence pattern from an earlier round. Humor must never fabricate evidence except for a legal, explicitly marked hidden-faction deception; it must not hide the actual claim, become repetitive filler, insult a real person, expose a secret role/ally, or turn a hidden killer's private memory into a confession.
-Avoid procedural filler such as asking everyone to report routes, saying evidence is insufficient, announcing "综合信息/时间线/证据权重", or advising caution when no concrete new fact is present. It is valid to return an empty message and stay silent. Speak only when adding a witnessed event, one named checkable contradiction, a direct answer, a special-win warning, or a concrete vote change.
+会議メッセージは自然で短い日本語にし、通常は55文字以内にする。この会議の実際の名前、最新の発言、場所、見えた行動、矛盾、関係、投票意図から毎回新しく組み立てる。具体的な新情報や直接の返答がない場合は、定型文を出さずmessageを空文字にして沈黙する。有用な情報を保ちながら会話らしく書く。最新の人間の冗談、問いかけ、場所や方法の質問、このボットへの名指しには、根拠や投票より先に性格を保ってその点へ答える。同じ決まり文句、会議の手順、一般的な注意書き、以前の文型を繰り返さない。合法でdeception_intentに明示された敵対陣営の欺き以外では、冗談で証拠を作らない。実際の主張を隠す、繰り返しの穴埋め、実在人物への侮辱、秘密役職や味方の露出、隠れたキラーの私的記憶を自白に変えることも禁止する。
+全員にルート報告を求める、「証拠が足りない」と言う、「情報整理」「時系列」「証拠の重み」を宣言する、具体的な新事実がないのに慎重論を述べる、といった手順的な穴埋めを避ける。空のmessageで沈黙するのは正しい。目撃、名前を含む検証可能な矛盾、直接の返答、特殊勝利への警告、具体的な票の変更を加えるときだけ発言する。
 The prompt includes a discussion round and the bot's earlier decision. On later rounds, explicitly reconsider the complete updated transcript and either keep or revise the vote. React directly to the latest statement in the context of what was already said. Never repeat the same clarification request after it has already been asked. If a player repeats a named accusation, state whether it changes or reinforces your current leaning. Threats or apparent confessions raise suspicion but are not automatically eyewitness proof.
 Maintain one continuous position across rounds. Do not reverse a concrete suspect or vote merely because that suspect counter-accuses someone, repeats an unsupported claim, or speaks confidently. Change the candidate only when the updated transcript adds a new eyewitness event, an independently corroborated contradiction, a credible exoneration, or another explicit evidence delta; when changing, state the new evidence that caused it.
 Speaker attribution is literal, not inferential. Never say "you just said", "you previously said", "you also said", quote, or paraphrase a claim unless the transcript contains that claim under that exact speaker name/id. Do not merge one player's words with another player's eyewitness account. When unsure, state only this player's own verified sighting or current leaning without attributing words to anyone else.

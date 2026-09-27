@@ -21,18 +21,21 @@ internal sealed class BotSocialDirector
 
     private static readonly string[] SuspicionWords =
     [
+        "怪しい", "疑い", "疑う", "犯人", "インポスター", "キル", "殺した", "投票", "投げる",
         "可疑", "怀疑", "觉得", "认为", "指认", "凶手", "内鬼", "击杀", "杀", "刀",
         "投", "票", "就是", "认狼", "自爆", "sus", "suspicious", "impostor", "kill"
     ];
 
     private static readonly string[] SelfIncriminatingWords =
     [
+        "全員殺す", "みんな殺す", "自分がインポスター", "俺がインポスター", "私がインポスター",
         "我要把你们全杀", "我要杀你们", "我会杀你们", "把你们全杀", "杀掉你们",
         "我是内鬼", "我就是内鬼", "我认狼", "认狼", "自爆"
     ];
 
     private static readonly string[] ExonerationWords =
     [
+        "白い", "シロ", "無実", "インポスターじゃない", "犯人じゃない", "信じられる", "信用できる", "疑っていない",
         "清白", "洗清", "排除", "不是内鬼", "不是凶手", "可以信", "可信", "没嫌疑", "无嫌疑",
         "innocent", "cleared", "clear", "not impostor", "safe"
     ];
@@ -1432,7 +1435,7 @@ internal sealed class BotSocialDirector
         {
             Message = protectedMention is null
                 ? decision.Message
-                : "这条说法没有给出可核对的现场目击，我先看尸体附近的公开线索。",
+                : "この話には確認できる現場目撃がない。まず死体付近の公開情報を見る。",
             VotePlayerId = protectedVote ? null : decision.VotePlayerId,
             SkipVote = protectedVote || decision.SkipVote,
             Reason = "Protected ally guard: private teammate identity or ability knowledge cannot be used for public accusation or exile.",
@@ -1633,10 +1636,10 @@ internal sealed class BotSocialDirector
             {
                 return personality.Name switch
                 {
-                    "急性子" => $"{targetName}已经死了，这轮投不了。你是说谁杀了他？",
-                    "社交派" => $"{targetName}已经死了呀。你是怀疑谁杀了他，还是名字说错了？",
-                    "懒散派" => $"等等，{targetName}都死了，没法投。你具体指谁？",
-                    _ => $"{targetName}已经死亡，不能成为本轮投票目标。请说清你的指认依据。"
+                    "急性子" => $"{targetName}はもう死んでいて今回は投票できない。誰を疑っている？",
+                    "社交派" => $"{targetName}はもう死んでいる。誰がキルしたと疑っているのか、名前を確認したい。",
+                    "懒散派" => $"待って、{targetName}には投票できない。具体的に誰のこと？",
+                    _ => $"{targetName}は死亡しており、今回の投票対象にはできない。指摘の根拠を具体的に教えてほしい。"
                 };
             }
 
@@ -1644,22 +1647,22 @@ internal sealed class BotSocialDirector
             {
                 if (_memory.TryGetLatestWitnessedKiller(bot.PlayerId, out var killerId) && killerId == target.PlayerId)
                 {
-                    return $"不对，我亲眼看见{targetName}杀人，这条洗白和我的目击冲突。";
+                    return $"違う。{targetName}がキルするのを自分で見た。この白判定は自分の目撃と矛盾する。";
                 }
 
                 return target.PlayerId == bot.PlayerId
-                    ? "收到，但别只凭身份猜测；请说你信我的具体依据。"
-                    : $"你是把{targetName}当船员。依据是路线互证，还是亲眼看到他做事？";
+                    ? "分かった。ただし役職だけで決めつけず、信じる具体的な根拠を教えてほしい。"
+                    : $"{targetName}をクルーだと見ている？ルートの照合が根拠か、自分で行動を見たのか教えてほしい。";
             }
 
             if (target.PlayerId == bot.PlayerId)
             {
                 return personality.Name switch
                 {
-                    "急性子" => "你在指我？把地点、时间和你看到的动作直接说清楚。",
-                    "社交派" => "你怀疑我吗？可以，把你看到的路线说出来，我们逐段对。",
-                    "懒散派" => "投我？先说说我哪里露馅了，别只报个名字啊。",
-                    _ => "你在指认我？请把具体地点、时间和目击内容说清楚。"
+                    "急性子" => "自分を指している？場所、時間、見た行動をはっきり言って。",
+                    "社交派" => "自分を疑っている？見たルートを言ってくれれば、一つずつ照合する。",
+                    "懒散派" => "自分に投票？名前だけじゃなく、どこが怪しかったか教えて。",
+                    _ => "自分を指摘している？場所、時間、目撃内容を具体的に説明してほしい。"
                 };
             }
 
@@ -1668,48 +1671,48 @@ internal sealed class BotSocialDirector
             {
                 return personality.Name switch
                 {
-                    "急性子" => $"我目前也偏投{targetName}，这条指认算加重疑点。",
-                    "果断派" => $"我已把{targetName}列为首要嫌疑，这轮愿意直接押他。",
-                    "社交派" => $"我现在也更怀疑{targetName}，还有相反路线或不在场证明吗？",
-                    "谨慎派" => $"对{targetName}的疑点在累积，但我仍区分转述与亲眼证据。",
-                    "懒散派" => $"行，{targetName}现在确实最可疑，我暂时票他。",
-                    _ => $"这条指认强化了我对{targetName}的怀疑，我会据此调整投票。"
+                    "急性子" => $"自分も{targetName}に入れそうだ。この指摘で疑いが増えた。",
+                    "果断派" => $"{targetName}を最優先の容疑者にした。今回はそのまま投票できる。",
+                    "社交派" => $"自分も{targetName}をより疑っている。反対のルートやアリバイはある？",
+                    "谨慎派" => $"{targetName}への疑いは重なっているが、伝聞と自分の目撃は分けて考える。",
+                    "懒散派" => $"了解。今は{targetName}が一番怪しいので、ひとまず投票する。",
+                    _ => $"この指摘で{targetName}への疑いが強くなった。投票判断にも反映する。"
                 };
             }
 
             return personality.Name switch
             {
-                "急性子" => $"先记{targetName}，但你马上补地点和时间。",
-                "果断派" => $"你指认{targetName}，给我一个具体动作，我就敢下票。",
-                "社交派" => $"你怀疑{targetName}？还有谁见过他，大家把路线接上。",
-                "谨慎派" => $"我听到你指认{targetName}了，但我需要具体证据才会改票。",
-                "懒散派" => $"行，{targetName}先记一笔，不过光报名字还不够。",
-                _ => $"你是在指认{targetName}吗？请补充具体证据。"
+                "急性子" => $"{targetName}は記録した。すぐに場所と時間も言って。",
+                "果断派" => $"{targetName}を指摘するなら、具体的な行動があれば投票できる。",
+                "社交派" => $"{targetName}を疑っている？ほかに見た人がいればルートをつなげたい。",
+                "谨慎派" => $"{targetName}への指摘は聞いたが、票を変えるには具体的な根拠が必要だ。",
+                "懒散派" => $"{targetName}は記録するが、名前だけでは足りない。",
+                _ => $"{targetName}を指摘している？具体的な根拠を追加してほしい。"
             };
         }
 
         if (SelfIncriminatingWords.Any(word => humanText.Contains(word, StringComparison.OrdinalIgnoreCase)))
         {
             var speaker = FindPlayer(humanSourceId);
-            var speakerName = speaker?.Data?.PlayerName ?? "你";
+            var speakerName = speaker?.Data?.PlayerName ?? "その発言者";
             return personality.Name switch
             {
-                "急性子" => $"{speakerName}这句威胁我记下了；像认狼，但还要结合路线。",
-                "果断派" => $"{speakerName}这句很可疑，我先把票往他那边压。",
-                "社交派" => $"{speakerName}，你这是玩笑还是认狼？先把刚才路线说清楚。",
-                "谨慎派" => $"这句威胁值得警惕，不过我不会只凭一句话定罪。",
-                "懒散派" => $"这种话挺招怀疑的，{speakerName}先进入观察名单吧。",
-                _ => $"{speakerName}的威胁性发言会增加嫌疑，但仍需与路线核对。"
+                "急性子" => $"{speakerName}のその脅しは記録した。自白にも見えるが、ルートも確認する。",
+                "果断派" => $"{speakerName}の発言はかなり怪しい。票をそちらに寄せる。",
+                "社交派" => $"{speakerName}、冗談なのか自白なのか。まずさっきのルートを説明して。",
+                "谨慎派" => "この脅しは警戒するが、一言だけで決めつけない。",
+                "懒散派" => $"その言い方は疑われる。{speakerName}を観察しておこう。",
+                _ => $"{speakerName}の脅しは疑いを増やすが、ルートとも照合する。"
             };
         }
 
         return personality.Name switch
         {
-            "急性子" => "这句话暂时指向不明，我先按已有路线和嫌疑判断。",
-            "社交派" => "我听到了；如果是新线索，补上对象就能和前面的路线对照。",
-            "谨慎派" => "对象不明确，这句话暂不改变我的证据权重。",
-            "懒散派" => "这句没具体目标，我先不跟着改票。",
-            _ => "这条信息对象不明确，我会保留原有判断。"
+            "急性子" => "この発言は対象が不明だ。今あるルートと疑いで判断する。",
+            "社交派" => "聞いた。新しい手がかりなら対象を足せば、前のルートと照合できる。",
+            "谨慎派" => "対象が不明なので、この発言で根拠の重みは変えない。",
+            "懒散派" => "具体的な対象がないから、これで票は変えない。",
+            _ => "この情報は対象が不明なので、今の判断を保つ。"
         };
     }
 
@@ -1720,11 +1723,11 @@ internal sealed class BotSocialDirector
         {
             return personality.Name switch
             {
-                "急性子" => $"{_lastReportNode ?? "附近"}有尸体，凶手溜得挺快；我没看清脸。",
-                "社交派" => $"{_lastReportNode ?? "附近"}躺了一个，我只负责报警，不负责编凶手。",
-                "谨慎派" => $"尸体在{_lastReportNode ?? "附近"}，凶手没给我签名，暂时认不出。",
-                "懒散派" => $"{_lastReportNode ?? "附近"}有尸体，我真没看见谁下的手，别硬塞给我。",
-                _ => $"我在{_lastReportNode ?? "附近"}发现尸体，没亲眼看到凶手。"
+                "急性子" => $"{_lastReportNode ?? "近く"}に死体がある。犯人の顔は見ていない。",
+                "社交派" => $"{_lastReportNode ?? "近く"}に死体がある。自分は通報しただけで、犯人は見ていない。",
+                "谨慎派" => $"死体は{_lastReportNode ?? "近く"}にある。犯人はまだ分からない。",
+                "懒散派" => $"{_lastReportNode ?? "近く"}に死体がある。誰がやったかは見ていない。",
+                _ => $"{_lastReportNode ?? "近く"}で死体を見つけた。犯人を自分で見たわけではない。"
             };
         }
 
@@ -1740,12 +1743,12 @@ internal sealed class BotSocialDirector
             {
                 return personality.Name switch
                 {
-                    "急性子" => $"{target.Data.PlayerName}味儿有点重，路线赶紧交一下。",
-                    "果断派" => $"我先押{target.Data.PlayerName}，能不能翻盘看你解释。",
-                    "社交派" => $"{target.Data.PlayerName}来，麦给你，刚才到底在哪？",
-                    "谨慎派" => $"{target.Data.PlayerName}身上有疑点，不过我先不把锅焊死。",
-                    "懒散派" => $"{target.Data.PlayerName}有点怪，我先记账，暂时不硬票。",
-                    _ => $"我现在更怀疑{target.Data.PlayerName}，等他回应。"
+                    "急性子" => $"{target.Data.PlayerName}は少し怪しい。ルートをすぐ説明して。",
+                    "果断派" => $"まず{target.Data.PlayerName}に賭ける。説明で変わるか見たい。",
+                    "社交派" => $"{target.Data.PlayerName}、さっきはどこにいた？",
+                    "谨慎派" => $"{target.Data.PlayerName}には疑いがあるが、まだ決めつけない。",
+                    "懒散派" => $"{target.Data.PlayerName}は少し変だ。記録するが、まだ強く投票しない。",
+                    _ => $"今は{target.Data.PlayerName}をより疑っている。返答を待つ。"
                 };
             }
         }
@@ -1754,24 +1757,24 @@ internal sealed class BotSocialDirector
         {
             return personality.Name switch
             {
-                "急性子" => "有位置说位置，有目击说目击，别搁这写散文。",
-                "果断派" => "谁有具体人和地点就端上来，我准备下注。",
-                "社交派" => "最后见过死者的来接麦，别让尸体白躺。",
-                "谨慎派" => "亲眼和听说分开讲，别把瓜皮当瓜瓤。",
-                "懒散派" => "我先吃会儿瓜，有真目击再叫我投。",
-                _ => "有具体目击就说，空喊名字不算。"
+                "急性子" => "場所があるなら場所を、目撃があるなら目撃を言って。",
+                "果断派" => "具体的な人と場所があるなら出してほしい。投票の材料にする。",
+                "社交派" => "最後に死者を見た人は教えてほしい。",
+                "谨慎派" => "自分の目撃と伝聞は分けて話してほしい。",
+                "懒散派" => "本当の目撃が出たら投票を考える。",
+                _ => "具体的な目撃があるなら言ってほしい。名前だけでは根拠にならない。"
             };
         }
 
         var location = SkeldPathGraph.Instance.NearestNode(bot.GetTruePosition()).Name;
         return personality.Name switch
         {
-            "急性子" => $"我刚在{location}，路过的自己举手，省点审讯费。",
-            "果断派" => $"我在{location}，谁和这段路线冲突我就先押谁。",
-            "社交派" => $"我在{location}附近，路过的朋友来对个暗号。",
-            "谨慎派" => $"我只能确认自己在{location}，别的信息先不脑补。",
-            "懒散派" => $"我刚在{location}晃悠，瓜没吃到，尸体倒遇上了。",
-            _ => $"我刚在{location}附近，只按自己看到的判断。"
+            "急性子" => $"自分は{location}にいた。通った人がいれば教えて。",
+            "果断派" => $"自分は{location}にいた。このルートと矛盾する人を先に疑う。",
+            "社交派" => $"自分は{location}付近にいた。通った人がいれば確認したい。",
+            "谨慎派" => $"自分が{location}にいたことだけは確認できる。ほかは推測しない。",
+            "懒散派" => $"さっきは{location}を歩いていた。死体以外は特に見ていない。",
+            _ => $"自分は{location}付近にいた。自分が見たことだけで判断する。"
         };
     }
 
@@ -1864,12 +1867,12 @@ internal sealed class BotSocialDirector
     {
         if (TryGetActionableWitnessedKiller(bot, out var witnessedKiller))
         {
-            return $"我亲眼看到{witnessedKiller!.Data!.PlayerName}杀了人，这能证明其拥有杀人能力；我会投他。";
+            return $"{witnessedKiller!.Data!.PlayerName}がキルするのを自分で見た。今回は投票する。";
         }
 
         if (_lastReporterId == bot.PlayerId)
         {
-            return $"我在{_lastReportNode ?? "附近"}发现尸体，没看清是谁动的手。";
+            return $"{_lastReportNode ?? "近く"}で死体を見つけた。誰がやったかは見ていない。";
         }
 
         var topAccused = _accusations
@@ -1882,17 +1885,17 @@ internal sealed class BotSocialDirector
             var target = FindPlayer(topAccused.Key);
             if (target?.Data is not null)
             {
-                return $"我也注意到{target.Data.PlayerName}，但目前证据还不够。";
+                return $"{target.Data.PlayerName}は気になっているが、まだ決め手には足りない。";
             }
         }
 
         if (_transcript.Any(entry => entry.PlayerId != bot.PlayerId))
         {
-            return "先把各自路线说清楚，没有硬证据就别乱票。";
+            return "具体的な新情報が出るまで、今回は黙っておく。";
         }
 
         var location = SkeldPathGraph.Instance.NearestNode(bot.GetTruePosition()).Name;
-        return $"我会按自己在{location}附近看到的情况判断。";
+        return $"{location}付近で自分が見たことを基準に判断する。";
     }
 
     private bool TryGetActionableWitnessedKiller(PlayerControl bot, out PlayerControl witnessedKiller)
@@ -2187,7 +2190,7 @@ internal sealed class BotSocialDirector
                 $"bot={bot.Data?.PlayerName}({bot.PlayerId}), target={target.Data?.PlayerName}({target.PlayerId}).");
             return decision with
             {
-                Message = $"{target.Data!.PlayerName}自己说是小丑；没硬证据就投他等于送胜利，我不跟这票。",
+                Message = $"{target.Data!.PlayerName}は自分でジェスターだと言った。確かな根拠なしに投票すると勝利を渡すので、この票には乗らない。",
                 VotePlayerId = null,
                 SkipVote = true,
                 Reason = $"Faction win protected: public Jester self-claim by playerId={target.PlayerId} and no personal kill witness.",
@@ -2229,8 +2232,8 @@ internal sealed class BotSocialDirector
 
         var contact = _memory.GetPersonalContactEvidence(bot.PlayerId, target.PlayerId);
         var message = contact.IsRecent && contact.ContinuousSeconds >= 10f
-            ? $"我刚连续看着{target.Data!.PlayerName}约{Mathf.RoundToInt(contact.ContinuousSeconds)}秒，那段没见他动手；这票先撤。"
-            : $"我对{target.Data!.PlayerName}有疑点，但按我的判断这轮还没到下注线。";
+            ? $"{target.Data!.PlayerName}を約{Mathf.RoundToInt(contact.ContinuousSeconds)}秒ずっと見ていたが、その間にキルは見ていない。この票はいったん下げる。"
+            : $"{target.Data!.PlayerName}には疑いがあるが、自分の基準では今回はまだ投票する段階ではない。";
         _log.LogWarning(
             $"DeepBot grounded vote guard blocked unsupported crew vote: meeting={_meetingSerial}, " +
             $"bot={bot.Data?.PlayerName}({bot.PlayerId}), target={target.Data?.PlayerName}({target.PlayerId}), " +
@@ -2286,7 +2289,7 @@ internal sealed class BotSocialDirector
             $"roleEvidence={unsupportedClear.RoleEvidence.HostilityScore:0.00}.");
         return decision with
         {
-            Message = $"{name}上一轮的疑点还在；这轮没有新反证，我不会直接把他洗清。",
+            Message = $"{name}への前回の疑いは残っている。今回は新しい反証がないので、すぐに白とはしない。",
             FollowPlayerId = unsupportedClear.Player.PlayerId,
             FollowIntent = "suspect",
             Reason = $"Cross-meeting suspicion retained for playerId={unsupportedClear.Player.PlayerId}; no explicit counter-evidence supported exoneration.",
@@ -2358,7 +2361,7 @@ internal sealed class BotSocialDirector
             $"personallyWitnessedNewTarget={personallyWitnessedNewTarget}.");
         return previous with
         {
-            Message = $"我仍然更怀疑{targetName}；刚才只是重复指控，没有足够的新证据让我改票。",
+            Message = $"まだ{targetName}をより疑っている。さっきの話は告発の繰り返しだけで、票を変える新しい根拠にはならない。",
             Reason = $"Stance preserved: no evidence delta justified changing from playerId={previousTargetId.Value}.",
             Confidence = Mathf.Max(previous.Confidence, Mathf.Min(received.Confidence, previous.Confidence + 0.05f))
         };
@@ -2432,8 +2435,8 @@ internal sealed class BotSocialDirector
         var unsupportedExonerationBlocked = ShouldBlockUnsupportedExoneration(0.62f, 0f, 0f) &&
                                             !ShouldBlockUnsupportedExoneration(0.62f, -0.30f, 0f);
         var freshVentFallbackIsConcrete =
-            BuildObservedActionFallback("粉色", "enter a vent", false).Contains("进管", StringComparison.Ordinal) &&
-            !BuildObservedActionFallback("粉色", "enter a vent", false).Contains("还没", StringComparison.Ordinal);
+            BuildObservedActionFallback("Pink", "enter a vent", false).Contains("ベントに入った", StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(BuildObservedActionFallback("Pink", "enter a vent", false));
         var personalityVoteThresholdsDiffer =
             GetCrewDecisionThreshold(BotPersonalityCatalog.ForPlayer(1)) <
             GetCrewDecisionThreshold(BotPersonalityCatalog.ForPlayer(4));
@@ -2581,8 +2584,8 @@ internal sealed class BotSocialDirector
                 }
 
                 return ready
-                    ? $"刚才对{name}的具体指认影响了我的判断，我这票投他。"
-                    : $"刚才有人指认{name}，我先记作嫌疑，不当成实锤。";
+                    ? $"さっきの{name}への具体的な指摘で判断が変わった。今回は{name}に投票する。"
+                    : $"さっき{name}への指摘があったので、ひとまず疑いとして記録する。確定ではない。";
             }
 
             if (top.Prior <= 0.01f)
@@ -2593,20 +2596,20 @@ internal sealed class BotSocialDirector
             return ready
                 ? personality.Name switch
                 {
-                    "急性子" => $"{name}这味儿没散，我先一票送检。",
-                    "果断派" => $"{name}没把疑点洗掉，我这把就押他。",
-                    "社交派" => $"{name}的故事我没听圆，这票我先点他。",
-                    "谨慎派" => $"我没完全确定，但{name}这口锅还没卸掉。",
-                    "懒散派" => $"懒得绕了，{name}最怪，我先投他。",
-                    _ => $"我这轮更怀疑{name}，投他。"
+                    "急性子" => $"{name}への違和感が消えない。先に一票入れる。",
+                    "果断派" => $"{name}は疑いを晴らせていない。今回は賭けて投票する。",
+                    "社交派" => $"{name}の話はまだつながっていない。この票は{name}に入れる。",
+                    "谨慎派" => $"確信はないが、{name}への疑いはまだ外れない。",
+                    "懒散派" => $"回りくどいのはやめよう。{name}が一番怪しいから投票する。",
+                    _ => $"今回は{name}をより疑っている。{name}に投票する。"
                 }
                 : personality.Name switch
                 {
-                    "急性子" => $"{name}还是可疑，我先盯他，不算洗清。",
-                    "社交派" => $"我还怀疑{name}，有反证就直接说。",
-                    "谨慎派" => $"{name}的疑点还在，但这轮我先不定票。",
-                    "懒散派" => $"{name}有点怪，我先记着。",
-                    _ => $"我对{name}的怀疑还没消失。"
+                    "急性子" => $"{name}はまだ怪しい。見ておくが、白とはしない。",
+                    "社交派" => $"まだ{name}を疑っている。反証があるなら言ってほしい。",
+                    "谨慎派" => $"{name}への疑いは残るが、今回は票を決めない。",
+                    "懒散派" => $"{name}は少し変だ。覚えておく。",
+                    _ => $"{name}への疑いはまだ消えていない。"
                 };
         }
 
@@ -2623,19 +2626,19 @@ internal sealed class BotSocialDirector
         if (observation.Contains("vent", StringComparison.OrdinalIgnoreCase))
         {
             return readyToVote
-                ? $"我亲眼看{name}进管了。职业可能不止一种，但这票我押他。"
-                : $"{name}当我面进管了；先记能力，别急着把职业焊死。";
+                ? $"{name}がベントに入るのを自分で見た。役職の可能性は複数あるが、今回は投票する。"
+                : $"{name}が目の前でベントに入った。能力として記録するが、役職は決めつけない。";
         }
 
         if (observation.Contains("kill", StringComparison.OrdinalIgnoreCase) ||
             observation.Contains("murder", StringComparison.OrdinalIgnoreCase))
         {
-            return $"{name}当我面开刀，演都不演了；我投他。";
+            return $"{name}が目の前でキルした。今回は{name}に投票する。";
         }
 
         return readyToVote
-            ? $"我亲眼看{name}用了可疑能力，这票先押他。"
-            : $"{name}当我面掏了特殊能力；先记账，不乱猜职业。";
+            ? $"{name}が怪しい能力を使うのを自分で見た。今回は投票する。"
+            : $"{name}が目の前で特殊能力を使った。記録するが、役職は決めつけない。";
     }
 
     private static string BuildWitnessedKillMeetingLine(PlayerControl bot, PlayerControl killer)
@@ -2645,33 +2648,33 @@ internal sealed class BotSocialDirector
         {
             "急性子" => new[]
             {
-                $"{name}当我面开刀，演都懒得演了；投他。",
-                $"别盘了，我亲眼看{name}下刀，这票送他起飞。"
+                $"{name}が目の前でキルした。迷わず投票する。",
+                $"考えるまでもない。{name}がキルするのを見たので投票する。"
             },
             "果断派" => new[]
             {
-                $"{name}的刀我亲眼验过，保真；这票押他。",
-                $"我看到{name}开刀，赔率都省了，直接投。"
+                $"{name}のキルは自分で確認した。今回は{name}に投票する。",
+                $"{name}がキルするのを見た。迷わず投票する。"
             },
             "社交派" => new[]
             {
-                $"{name}，你这刀法挺社牛，我就在旁边；投你。",
-                $"我亲眼看{name}下刀，来，话筒给你表演。"
+                $"{name}、そのキルは隣で見ていた。今回は投票する。",
+                $"{name}がキルするのを自分で見た。説明を聞く前に投票する。"
             },
             "谨慎派" => new[]
             {
-                $"这次不用脑补：我亲眼看到{name}下刀，投他。",
-                $"{name}当面开刀，这条不是瓜，是我亲眼所见。"
+                $"推測ではない。{name}がキルするのを自分で見たので投票する。",
+                $"{name}が目の前でキルした。これは自分の目撃なので投票する。"
             },
             "懒散派" => new[]
             {
-                $"本来想摸鱼，结果{name}当面开刀；只能投了。",
-                $"{name}刀都亮我脸上了，懒得绕，投他。"
+                $"静かにしていたかったが、{name}のキルを目の前で見た。投票する。",
+                $"{name}が目の前でキルした。回りくどくせず投票する。"
             },
             _ => new[]
             {
-                $"我亲眼看{name}开刀，这味不用闻了，投他。",
-                $"直觉先放一边：{name}的刀我真看见了，投。"
+                $"{name}がキルするのを自分で見た。投票する。",
+                $"直感ではなく目撃だ。{name}に投票する。"
             }
         };
         return variants[UnityEngine.Random.Range(0, variants.Length)];
@@ -2685,25 +2688,25 @@ internal sealed class BotSocialDirector
         bool readyToVote,
         bool matchesPrior)
     {
-        var priorText = matchesPrior ? "，也和我之前的疑点对得上" : string.Empty;
+        var priorText = matchesPrior ? "。以前からの疑いとも一致する" : string.Empty;
         if (!readyToVote)
         {
             return personality.Name switch
             {
-                "急性子" => $"{sourceName}说亲眼看到{targetName}{action}{priorText}；我先盯住{targetName}，但这不是我亲眼所见。",
-                "社交派" => $"{sourceName}指认自己看到{targetName}{action}{priorText}；我会把这条算进判断，但还想听{targetName}回应。",
-                "谨慎派" => $"{sourceName}说看到{targetName}{action}{priorText}；这是具体口供，不是我的亲眼证据，这轮先保留。",
-                _ => $"{sourceName}说看到{targetName}{action}{priorText}；我记下了，但不会把转述当实锤。"
+                "急性子" => $"{sourceName}は{targetName}が{action}したのを見たと言った{priorText}。{targetName}を見ておくが、自分の目撃ではない。",
+                "社交派" => $"{sourceName}は{targetName}が{action}したのを見たと指摘した{priorText}。判断には入れるが、{targetName}の返答も聞きたい。",
+                "谨慎派" => $"{sourceName}は{targetName}が{action}したのを見たと言った{priorText}。具体的な証言だが、自分の目撃ではないので今回は保留する。",
+                _ => $"{sourceName}は{targetName}が{action}したのを見たと言った{priorText}。記録するが、伝聞を確定とはしない。"
             };
         }
 
         return personality.Name switch
         {
-            "急性子" => $"{sourceName}说亲眼看到{targetName}{action}{priorText}，我这票投{targetName}。",
-            "果断派" => $"{sourceName}说看到{targetName}{action}{priorText}，够我下注了，投{targetName}。",
-            "社交派" => $"{sourceName}的目击把矛头指向{targetName}{priorText}，我倾向跟这条具体信息投{targetName}。",
-            "谨慎派" => $"我没有亲眼看到，但{sourceName}对{targetName}{action}的描述足够具体{priorText}；这次我投{targetName}。",
-            _ => $"{sourceName}说看到{targetName}{action}{priorText}，目前{targetName}最可疑，我投他。"
+            "急性子" => $"{sourceName}は{targetName}が{action}したのを見たと言った{priorText}。今回は{targetName}に投票する。",
+            "果断派" => $"{sourceName}の{targetName}への目撃で賭けるには十分だ{priorText}。{targetName}に投票する。",
+            "社交派" => $"{sourceName}の目撃は{targetName}を指している{priorText}。この具体的な情報を信じて{targetName}に投票する。",
+            "谨慎派" => $"自分では見ていないが、{sourceName}の{targetName}が{action}したという説明は具体的だ{priorText}。今回は{targetName}に投票する。",
+            _ => $"{sourceName}は{targetName}が{action}したのを見たと言った{priorText}。現時点では{targetName}が最も怪しいので投票する。"
         };
     }
 
@@ -2713,23 +2716,23 @@ internal sealed class BotSocialDirector
             text.Contains("刀", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("kill", StringComparison.OrdinalIgnoreCase))
         {
-            return "杀人";
+            return "キル";
         }
 
         if (text.Contains("跳管", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("进管", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("vent", StringComparison.OrdinalIgnoreCase))
         {
-            return "进通风管";
+            return "ベントに入る";
         }
 
         if (text.Contains("变形", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("morph", StringComparison.OrdinalIgnoreCase))
         {
-            return "变形";
+            return "変身";
         }
 
-        return "使用特殊能力";
+        return "特殊能力を使う";
     }
 
     private static bool IsExplicitAccusation(string text)
@@ -3363,13 +3366,13 @@ internal sealed class BotSocialDirector
             clean = clean[..90];
         }
 
-        var readableForbidden = new[] { "AI", "人工智能", "模型", "提示词", "插件", "API", "代码" };
+        var readableForbidden = new[] { "AI", "人工知能", "人工智能", "モデル", "模型", "プロンプト", "提示词", "プラグイン", "插件", "API", "コード", "代码" };
         if (readableForbidden.Any(word => clean.Contains(word, StringComparison.OrdinalIgnoreCase)))
         {
             return string.Empty;
         }
 
-        var forbidden = new[] { "AI", "人工智能", "模型", "提示词", "插件", "API", "代码" };
+        var forbidden = new[] { "AI", "人工知能", "人工智能", "モデル", "模型", "プロンプト", "提示词", "プラグイン", "插件", "API", "コード", "代码" };
         return forbidden.Any(word => clean.Contains(word, StringComparison.OrdinalIgnoreCase))
             ? string.Empty
             : clean;
