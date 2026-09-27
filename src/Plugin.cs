@@ -51,6 +51,7 @@ public sealed class Plugin : BasePlugin
         }
 
         _harmony.PatchAll(typeof(Plugin).Assembly);
+        VirtualBotPlayerDataWaitPatch.TryApply(_harmony);
         LogSpawnPatchTarget();
         LogLateJoinPatchTarget();
         LogAuthoritySelfTest();
