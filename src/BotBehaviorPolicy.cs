@@ -7,10 +7,10 @@ internal static class BotBehaviorPolicy
 {
     private static readonly string[][] PlayerColorAliases =
     [
-        ["红", "红色", "red"],
-        ["蓝", "蓝色", "深蓝", "blue"],
-        ["绿", "绿色", "深绿", "green"],
-        ["粉", "粉色", "粉红", "粉红色", "pink"],
+        ["赤", "赤色", "紅", "紅色", "红", "红色", "red"],
+        ["青", "青色", "青緑", "蓝", "蓝色", "深蓝", "blue"],
+        ["緑", "緑色", "绿", "绿色", "深绿", "green"],
+        ["ピンク", "桃", "桃色", "粉", "粉色", "粉红", "粉红色", "pink"],
         ["橙", "橙色", "橘色", "orange"],
         ["黄", "黄色", "yellow"],
         ["黑", "黑色", "black"],
@@ -334,6 +334,7 @@ internal static class BotBehaviorPolicy
         }
 
         if (ContainsIndexedAlias(compactText, "player", playerId) ||
+            ContainsIndexedAlias(compactText, "プレイヤー", playerId) ||
             ContainsIndexedAlias(compactText, "玩家", playerId) ||
             ContainsChinesePlayerNumber(compactText, playerId))
         {
@@ -385,6 +386,7 @@ internal static class BotBehaviorPolicy
         AddIndex(indexes, compactText, displayName);
         AddIndex(indexes, compactText, localizedColorName);
         AddIndex(indexes, compactText, $"player{playerId}");
+        AddIndex(indexes, compactText, $"プレイヤー{playerId}");
         AddIndex(indexes, compactText, $"玩家{playerId}");
         AddIndex(indexes, compactText, $"{playerId}号");
         AddIndex(indexes, compactText, $"{ToChinesePlayerNumber(playerId)}号");
@@ -567,6 +569,7 @@ internal static class BotBehaviorPolicy
 
         string[] unsupportedFactPhrases =
         [
+            "お前が殺した", "お前がキルした", "お前が今殺した", "お前がやった", "お前が殺すのを見た",
             "你杀人的", "把你杀人", "你的杀人", "你杀了", "你刀了", "你刚杀", "你行凶",
             "你动刀", "你杀完", "亲眼看见你", "亲眼看到你", "我看见你杀", "我看到你杀"
         ];
@@ -587,6 +590,7 @@ internal static class BotBehaviorPolicy
 
         string[] directRoleConfessions =
         [
+            "自分はインポスター", "俺はインポスター", "私はインポスター", "私がインポスター", "自分がインポスター",
             "我是内鬼", "我就是内鬼", "我是狼", "我就是狼", "我认狼", "我自爆",
             "i am the impostor", "i'm the impostor", "im the impostor", "i am impostor",
             "i'm impostor", "im impostor"
@@ -604,6 +608,7 @@ internal static class BotBehaviorPolicy
 
         string[] firstPersonSecretActions =
         [
+            "自分が殺した", "俺が殺した", "私が殺した", "キルした", "今キルした", "自分が毒を", "自分が爆弾を", "死体を片付けた",
             "我杀了", "我刚杀", "我杀掉", "我刀了", "我刚刀", "我动的手", "我行凶",
             "我咬了", "我下毒", "我毒了", "我炸了", "我放了炸弹", "我清了尸体",
             "我清尸", "我吃了尸体", "我腐蚀了", "我破坏了", "我关了灯", "我拉了电",
@@ -647,6 +652,7 @@ internal static class BotBehaviorPolicy
 
         string[] phrases =
         [
+            "殺したあとのルート", "キル後のルート", "犯行ルート", "殺害ルート", "犯人のルート",
             "杀人的路线", "杀人路线", "杀完人的路线", "作案路线", "行凶路线", "凶手路线"
         ];
         return phrases.Any(phrase => line.Contains(phrase, StringComparison.OrdinalIgnoreCase));

@@ -6,8 +6,10 @@ internal static class MeetingBehaviorDirectives
 {
     private static readonly string[] TaskRushPhrases =
     [
+        "タスク急いで", "早くタスク", "タスクを進めて", "タスクやって", "タスク優先",
+        "サボらないで", "急いで仕事して", "finish tasks", "do tasks",
         "快点做任务", "赶紧做任务", "抓紧做任务", "去做任务", "任务快做",
-        "别摸鱼", "别偷懒", "加快任务", "finish tasks", "do tasks"
+        "别摸鱼", "别偷懒", "加快任务"
     ];
 
     private static readonly HashSet<byte> TargetedTaskRushBots = [];

@@ -15,7 +15,7 @@ public sealed class Plugin : BasePlugin
 {
     public const string PluginGuid = "local.amongus.deepseekbots";
     public const string PluginName = "Among Us DeepSeek Bots";
-    public const string PluginVersion = "0.10.22-model-only-meeting-speech";
+    public const string PluginVersion = "0.10.22-jp-local1";
 
     private readonly Harmony _harmony = new(PluginGuid);
 
